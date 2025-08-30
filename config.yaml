@@ -1,0 +1,29 @@
+# Zilstream Indexer Configuration
+
+server:
+  port: 8080
+  metrics_port: 9090
+
+chain:
+  name: "zilliqa"
+  chain_id: 32769
+  rpc_endpoint: "https://api.zilliqa.com"
+  block_time: 1s
+  start_block: 0 # Set to 0 to start from latest
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "zilstream"
+  user: "melvin"
+  password: ""
+  ssl_mode: "disable"
+  max_connections: 10
+
+processor:
+  batch_size: 100
+  workers: 5
+
+logging:
+  level: "debug" # debug, info, warn, error
+  format: "console" # json or console

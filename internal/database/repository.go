@@ -1,0 +1,209 @@
+package database
+
+import (
+	"context"
+	"fmt"
+	"math/big"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// BlockRepository handles block-related database operations
+type BlockRepository struct {
+	db *Database
+}
+
+func NewBlockRepository(db *Database) *BlockRepository {
+	return &BlockRepository{db: db}
+}
+
+// Insert inserts a single block into the database
+func (r *BlockRepository) Insert(ctx context.Context, block *Block) error {
+	query := `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_limit, gas_used, transaction_count)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (number) DO NOTHING`
+
+	_, err := r.db.pool.Exec(ctx, query,
+		block.Number,
+		block.Hash,
+		block.ParentHash,
+		block.Timestamp,
+		block.GasLimit,
+		block.GasUsed,
+		block.TransactionCount,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to insert block: %w", err)
+	}
+
+	return nil
+}
+
+// InsertBatch inserts multiple blocks in a single batch
+func (r *BlockRepository) InsertBatch(ctx context.Context, blocks []*Block) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+	query := `
+		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_limit, gas_used, transaction_count)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (number) DO NOTHING`
+
+	for _, block := range blocks {
+		batch.Queue(query,
+			block.Number,
+			block.Hash,
+			block.ParentHash,
+			block.Timestamp,
+			block.GasLimit,
+			block.GasUsed,
+			block.TransactionCount,
+		)
+	}
+
+	br := r.db.pool.SendBatch(ctx, batch)
+	defer br.Close()
+
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			return fmt.Errorf("failed to insert block %d: %w", blocks[i].Number, err)
+		}
+	}
+
+	return nil
+}
+
+// GetByNumber retrieves a block by its number
+func (r *BlockRepository) GetByNumber(ctx context.Context, number uint64) (*Block, error) {
+	var block Block
+	query := `
+		SELECT number, hash, parent_hash, timestamp, gas_limit, gas_used, transaction_count, created_at
+		FROM blocks
+		WHERE number = $1`
+
+	err := r.db.pool.QueryRow(ctx, query, number).Scan(
+		&block.Number,
+		&block.Hash,
+		&block.ParentHash,
+		&block.Timestamp,
+		&block.GasLimit,
+		&block.GasUsed,
+		&block.TransactionCount,
+		&block.CreatedAt,
+	)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get block by number: %w", err)
+	}
+
+	return &block, nil
+}
+
+// TransactionRepository handles transaction-related database operations
+type TransactionRepository struct {
+	db *Database
+}
+
+func NewTransactionRepository(db *Database) *TransactionRepository {
+	return &TransactionRepository{db: db}
+}
+
+// InsertBatch inserts multiple transactions in a single batch
+func (r *TransactionRepository) InsertBatch(ctx context.Context, transactions []*Transaction) error {
+	if len(transactions) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+	query := `
+		INSERT INTO transactions (
+			hash, block_number, transaction_index, from_address, to_address,
+			value, gas_price, gas_limit, gas_used, nonce, input, status,
+			transaction_type, original_type_hex
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		ON CONFLICT (hash) DO NOTHING`
+
+	for _, tx := range transactions {
+		batch.Queue(query,
+			tx.Hash,
+			tx.BlockNumber,
+			tx.TransactionIndex,
+			tx.FromAddress,
+			tx.ToAddress,
+			BigIntToNumeric(tx.Value),
+			BigIntToNumeric(tx.GasPrice),
+			tx.GasLimit,
+			tx.GasUsed,
+			tx.Nonce,
+			tx.Input,
+			tx.Status,
+			tx.TransactionType,
+			tx.OriginalTypeHex,
+		)
+	}
+
+	br := r.db.pool.SendBatch(ctx, batch)
+	defer br.Close()
+
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			return fmt.Errorf("failed to insert transaction %s: %w", transactions[i].Hash, err)
+		}
+	}
+
+	return nil
+}
+
+// GetByHash retrieves a transaction by its hash
+func (r *TransactionRepository) GetByHash(ctx context.Context, hash string) (*Transaction, error) {
+	var tx Transaction
+	var valueStr, gasPriceStr *string
+
+	query := `
+		SELECT hash, block_number, transaction_index, from_address, to_address,
+		       value, gas_price, gas_limit, gas_used, nonce, input, status, created_at
+		FROM transactions
+		WHERE hash = $1`
+
+	err := r.db.pool.QueryRow(ctx, query, hash).Scan(
+		&tx.Hash,
+		&tx.BlockNumber,
+		&tx.TransactionIndex,
+		&tx.FromAddress,
+		&tx.ToAddress,
+		&valueStr,
+		&gasPriceStr,
+		&tx.GasLimit,
+		&tx.GasUsed,
+		&tx.Nonce,
+		&tx.Input,
+		&tx.Status,
+		&tx.CreatedAt,
+	)
+
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get transaction by hash: %w", err)
+	}
+
+	// Convert string values back to big.Int
+	if valueStr != nil {
+		tx.Value = new(big.Int)
+		tx.Value.SetString(*valueStr, 10)
+	}
+	if gasPriceStr != nil {
+		tx.GasPrice = new(big.Int)
+		tx.GasPrice.SetString(*gasPriceStr, 10)
+	}
+
+	return &tx, nil
+}
