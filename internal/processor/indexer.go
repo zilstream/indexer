@@ -59,6 +59,7 @@ func NewIndexer(cfg *config.Config, logger zerolog.Logger) (*Indexer, error) {
 		MaxWorkers: cfg.Processor.Workers,
 		RetryDelay: 5 * time.Second,
 		MaxRetries: 3,
+		StartBlock: cfg.Chain.StartBlock,
 	}
 	syncManager := syncMgr.NewManager(db, rpcClient, blockProcessor, logger, syncConfig)
 	
@@ -170,6 +171,10 @@ func (i *Indexer) checkAndRunFastSync() error {
 	startBlock := lastIndexedBlock
 	if startBlock == 0 && i.config.Chain.StartBlock > 0 {
 		startBlock = i.config.Chain.StartBlock
+		// If we're starting from a specific block, update the database so we don't try to sync earlier blocks
+		if err := i.db.UpdateLastBlockNumber(ctx, startBlock-1, ""); err != nil {
+			i.logger.Warn().Err(err).Uint64("block", startBlock-1).Msg("Failed to set initial block number")
+		}
 	}
 	if startBlock == 0 {
 		startBlock = 1 // Start from block 1 if not specified

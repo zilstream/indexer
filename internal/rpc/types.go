@@ -176,6 +176,25 @@ func (rt *RawTransaction) ToTransaction() *types.Transaction {
 		gasPrice = big.NewInt(0)
 	}
 
+	// For Zilliqa pre-EVM transactions, V, R, S might be nil or invalid
+	// Set default values if they're missing
+	var v, r, s *big.Int
+	if rt.V != nil {
+		v = (*big.Int)(rt.V)
+	} else {
+		v = big.NewInt(0)
+	}
+	if rt.R != nil {
+		r = (*big.Int)(rt.R)
+	} else {
+		r = big.NewInt(0)
+	}
+	if rt.S != nil {
+		s = (*big.Int)(rt.S)
+	} else {
+		s = big.NewInt(1) // Set to 1 instead of 0 to avoid invalid signature error
+	}
+
 	// Create legacy transaction structure
 	// Pre-EVM Zilliqa transactions can be processed as legacy EVM transactions
 	return types.NewTx(&types.LegacyTx{
@@ -185,9 +204,9 @@ func (rt *RawTransaction) ToTransaction() *types.Transaction {
 		Gas:      uint64(rt.Gas),
 		GasPrice: gasPrice,
 		Data:     rt.Input,
-		V:        (*big.Int)(rt.V),
-		R:        (*big.Int)(rt.R),
-		S:        (*big.Int)(rt.S),
+		V:        v,
+		R:        r,
+		S:        s,
 	})
 }
 

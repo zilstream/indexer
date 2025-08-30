@@ -36,6 +36,7 @@ type Manager struct {
 	maxWorkers   int
 	retryDelay   time.Duration
 	maxRetries   int
+	startBlock   uint64
 }
 
 type BlockRange struct {
@@ -48,6 +49,7 @@ type Config struct {
 	MaxWorkers int
 	RetryDelay time.Duration
 	MaxRetries int
+	StartBlock uint64 // Minimum block to sync from
 }
 
 func NewManager(
@@ -66,6 +68,7 @@ func NewManager(
 		maxWorkers:  config.MaxWorkers,
 		retryDelay:  config.RetryDelay,
 		maxRetries:  config.MaxRetries,
+		startBlock:  config.StartBlock,
 		gaps:        make([]BlockRange, 0),
 	}
 }
@@ -119,11 +122,27 @@ func (m *Manager) initializeSyncState(ctx context.Context) error {
 	}
 	
 	if lastBlock != nil {
-		m.lastSyncedBlock = lastBlock.Number
-		m.logger.Info().Uint64("block", m.lastSyncedBlock).Msg("Resuming from last synced block")
+		// If we have a start block configured and the last synced block is before it,
+		// start from the start block instead
+		if m.startBlock > 0 && lastBlock.Number < m.startBlock {
+			m.lastSyncedBlock = m.startBlock - 1
+			m.logger.Info().
+				Uint64("last_db_block", lastBlock.Number).
+				Uint64("start_block", m.startBlock).
+				Msg("Last synced block is before start block, starting from configured start block")
+		} else {
+			m.lastSyncedBlock = lastBlock.Number
+			m.logger.Info().Uint64("block", m.lastSyncedBlock).Msg("Resuming from last synced block")
+		}
 	} else {
-		m.lastSyncedBlock = 0
-		m.logger.Info().Msg("Starting fresh sync from genesis")
+		// If no blocks synced yet, start from configured start block
+		if m.startBlock > 0 {
+			m.lastSyncedBlock = m.startBlock - 1 // Set to one before start block
+			m.logger.Info().Uint64("block", m.startBlock).Msg("Starting from configured start block")
+		} else {
+			m.lastSyncedBlock = 0
+			m.logger.Info().Msg("Starting fresh sync from genesis")
+		}
 	}
 	
 	// Get latest chain block
@@ -153,7 +172,17 @@ func (m *Manager) detectGaps(ctx context.Context) ([]BlockRange, error) {
 		return nil, nil // No gaps if we haven't started syncing
 	}
 	
-	gaps, err := m.db.FindMissingBlocks(ctx, 0, m.lastSyncedBlock)
+	// Only look for gaps from our configured start block onwards
+	minBlock := uint64(0)
+	if m.startBlock > 0 {
+		minBlock = m.startBlock
+		// If lastSyncedBlock is before our start block, no gaps to detect
+		if m.lastSyncedBlock < m.startBlock {
+			return nil, nil
+		}
+	}
+	
+	gaps, err := m.db.FindMissingBlocks(ctx, minBlock, m.lastSyncedBlock)
 	if err != nil {
 		return nil, err
 	}
@@ -355,6 +384,21 @@ func (m *Manager) fillGaps(ctx context.Context) error {
 	gap := m.gaps[0]
 	m.gaps = m.gaps[1:]
 	m.mu.Unlock()
+	
+	// Skip gaps that are entirely before our start block
+	if m.startBlock > 0 && gap.End < m.startBlock {
+		m.logger.Debug().
+			Uint64("start", gap.Start).
+			Uint64("end", gap.End).
+			Uint64("start_block", m.startBlock).
+			Msg("Skipping gap before start block")
+		return nil
+	}
+	
+	// Adjust gap start if it's before our start block
+	if m.startBlock > 0 && gap.Start < m.startBlock {
+		gap.Start = m.startBlock
+	}
 	
 	m.logger.Info().
 		Uint64("start", gap.Start).

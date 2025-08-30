@@ -20,12 +20,14 @@ type BulkWriter struct {
 	// Buffering
 	blockBuffer       []*Block
 	transactionBuffer []*Transaction
+	eventLogBuffer    []*EventLog
 	bufferSize        int
 	mu                sync.Mutex
 	
 	// Metrics
 	totalBlocks       int64
 	totalTransactions int64
+	totalEventLogs    int64
 	totalCopyTime     time.Duration
 }
 
@@ -37,6 +39,7 @@ func NewBulkWriter(pool *pgxpool.Pool, bufferSize int, logger zerolog.Logger) *B
 		bufferSize:        bufferSize,
 		blockBuffer:       make([]*Block, 0, bufferSize),
 		transactionBuffer: make([]*Transaction, 0, bufferSize*10), // Assume avg 10 tx per block
+		eventLogBuffer:    make([]*EventLog, 0, bufferSize*20),    // Assume avg 20 logs per block
 	}
 }
 
@@ -70,6 +73,21 @@ func (w *BulkWriter) AddTransaction(tx *Transaction) error {
 	return nil
 }
 
+// AddEventLog adds an event log to the buffer
+func (w *BulkWriter) AddEventLog(log *EventLog) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	
+	w.eventLogBuffer = append(w.eventLogBuffer, log)
+	
+	// Auto-flush if buffer is full
+	if len(w.eventLogBuffer) >= w.bufferSize*20 {
+		return w.flushEventLogsLocked(context.Background())
+	}
+	
+	return nil
+}
+
 // Flush flushes all buffers
 func (w *BulkWriter) Flush(ctx context.Context) error {
 	w.mu.Lock()
@@ -82,6 +100,11 @@ func (w *BulkWriter) Flush(ctx context.Context) error {
 	
 	// Then flush transactions
 	if err := w.flushTransactionsLocked(ctx); err != nil {
+		return err
+	}
+	
+	// Finally flush event logs
+	if err := w.flushEventLogsLocked(ctx); err != nil {
 		return err
 	}
 	
@@ -389,6 +412,160 @@ func (w *BulkWriter) upsertTransactionChunk(ctx context.Context, txs []*Transact
 	return nil
 }
 
+// flushEventLogsLocked flushes the event log buffer (must be called with lock held)
+func (w *BulkWriter) flushEventLogsLocked(ctx context.Context) error {
+	if len(w.eventLogBuffer) == 0 {
+		return nil
+	}
+	
+	start := time.Now()
+	
+	// Use COPY for bulk insert
+	copyCount, err := w.pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"event_logs"},
+		[]string{
+			"block_number",
+			"block_hash",
+			"transaction_hash",
+			"transaction_index",
+			"log_index",
+			"address",
+			"topics",
+			"data",
+			"removed",
+			"created_at",
+		},
+		pgx.CopyFromSlice(len(w.eventLogBuffer), func(i int) ([]interface{}, error) {
+			log := w.eventLogBuffer[i]
+			// Convert topics to JSONB
+			topicsJSON := `[]`
+			if len(log.Topics) > 0 {
+				topics := make([]string, len(log.Topics))
+				for j, topic := range log.Topics {
+					topics[j] = fmt.Sprintf(`"%s"`, topic)
+				}
+				topicsJSON = fmt.Sprintf(`[%s]`, strings.Join(topics, ","))
+			}
+			return []interface{}{
+				log.BlockNumber,
+				log.BlockHash,
+				log.TransactionHash,
+				log.TransactionIndex,
+				log.LogIndex,
+				log.Address,
+				topicsJSON,
+				log.Data,
+				log.Removed,
+				log.CreatedAt,
+			}, nil
+		}),
+	)
+	
+	if err != nil {
+		// Handle conflicts by falling back to upsert
+		if strings.Contains(err.Error(), "duplicate key") {
+			return w.upsertEventLogsLocked(ctx)
+		}
+		return fmt.Errorf("failed to copy event logs: %w", err)
+	}
+	
+	elapsed := time.Since(start)
+	w.totalCopyTime += elapsed
+	w.totalEventLogs += copyCount
+	
+	w.logger.Debug().
+		Int64("count", copyCount).
+		Dur("elapsed", elapsed).
+		Float64("logs_per_sec", float64(copyCount)/elapsed.Seconds()).
+		Msg("Bulk inserted event logs")
+	
+	// Clear buffer
+	w.eventLogBuffer = w.eventLogBuffer[:0]
+	
+	return nil
+}
+
+// upsertEventLogsLocked performs upsert for event logs that already exist
+func (w *BulkWriter) upsertEventLogsLocked(ctx context.Context) error {
+	if len(w.eventLogBuffer) == 0 {
+		return nil
+	}
+	
+	// For large batches, split into smaller chunks
+	chunkSize := 100
+	for i := 0; i < len(w.eventLogBuffer); i += chunkSize {
+		end := i + chunkSize
+		if end > len(w.eventLogBuffer) {
+			end = len(w.eventLogBuffer)
+		}
+		
+		chunk := w.eventLogBuffer[i:end]
+		if err := w.upsertEventLogChunk(ctx, chunk); err != nil {
+			return err
+		}
+	}
+	
+	// Clear buffer
+	w.eventLogBuffer = w.eventLogBuffer[:0]
+	
+	return nil
+}
+
+// upsertEventLogChunk upserts a chunk of event logs
+func (w *BulkWriter) upsertEventLogChunk(ctx context.Context, logs []*EventLog) error {
+	query := `
+		INSERT INTO event_logs (
+			block_number, block_hash, transaction_hash, transaction_index, log_index,
+			address, topics, data, removed, created_at
+		) VALUES `
+	
+	values := make([]interface{}, 0, len(logs)*10)
+	placeholders := make([]string, 0, len(logs))
+	
+	for i, log := range logs {
+		base := i * 10
+		placeholders = append(placeholders, fmt.Sprintf(
+			"($%d, $%d, $%d, $%d, $%d, $%d, $%d::jsonb, $%d, $%d, $%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
+		))
+		
+		// Convert topics to JSON string
+		topicsJSON := `[]`
+		if len(log.Topics) > 0 {
+			topics := make([]string, len(log.Topics))
+			for j, topic := range log.Topics {
+				topics[j] = fmt.Sprintf(`"%s"`, topic)
+			}
+			topicsJSON = fmt.Sprintf(`[%s]`, strings.Join(topics, ","))
+		}
+		
+		values = append(values,
+			log.BlockNumber,
+			log.BlockHash,
+			log.TransactionHash,
+			log.TransactionIndex,
+			log.LogIndex,
+			log.Address,
+			topicsJSON,
+			log.Data,
+			log.Removed,
+			log.CreatedAt,
+		)
+	}
+	
+	query += strings.Join(placeholders, ", ")
+	query += ` ON CONFLICT (block_number, transaction_index, log_index) DO UPDATE SET
+		removed = EXCLUDED.removed`
+	
+	_, err := w.pool.Exec(ctx, query, values...)
+	if err != nil {
+		return fmt.Errorf("failed to upsert event log chunk: %w", err)
+	}
+	
+	return nil
+}
+
 // GetMetrics returns writer metrics
 func (w *BulkWriter) GetMetrics() map[string]interface{} {
 	w.mu.Lock()
@@ -402,10 +579,12 @@ func (w *BulkWriter) GetMetrics() map[string]interface{} {
 	return map[string]interface{}{
 		"total_blocks":       w.totalBlocks,
 		"total_transactions": w.totalTransactions,
+		"total_event_logs":   w.totalEventLogs,
 		"total_copy_time":    w.totalCopyTime.String(),
 		"avg_copy_time":      avgCopyTime.String(),
 		"blocks_buffered":    len(w.blockBuffer),
 		"tx_buffered":        len(w.transactionBuffer),
+		"logs_buffered":      len(w.eventLogBuffer),
 	}
 }
 

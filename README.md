@@ -116,14 +116,13 @@ processor:
 - ✅ **Stage 1**: Basic block and transaction indexing
 - ✅ **Stage 2**: Gap detection and recovery mechanisms
 - ✅ **Stage 2.5**: Ultra-fast historical sync with batch processing
+- ✅ **Stage 3**: Event log processing and indexing
 - ✅ Zilliqa pre-EVM transaction support
 - ✅ Health and metrics endpoints
 - ✅ Configurable rate limiting
 - ✅ Automatic sync mode switching
 
 ## Upcoming Features
-
-- **Stage 3**: Event log processing
 - **Stage 4**: Module system
 - **Stage 5**: ERC-20 token indexing
 - **Stage 6**: Uniswap V2/V3 support
@@ -131,10 +130,11 @@ processor:
 
 ## Database Schema
 
-The indexer uses three main tables:
+The indexer uses four main tables:
 
 - `blocks`: Block data including hash, timestamp, gas usage
 - `transactions`: Transaction details with from/to addresses, value, gas
+- `event_logs`: Smart contract event logs with topics and data
 - `indexer_state`: Tracks synchronization progress
 
 ## Monitoring

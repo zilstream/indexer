@@ -9,7 +9,7 @@ chain:
   chain_id: 32769
   rpc_endpoint: "https://api.zilliqa.com"
   block_time: 1s
-  start_block: 0 # Set to 0 to start from latest
+  start_block: 8497800 # Start from more recent block to find contract transactions
 
 database:
   host: "localhost"

@@ -48,6 +48,21 @@ const (
 	TxTypeZilliqaBase = 1000 // Zilliqa-specific types start from 1000
 )
 
+// EventLog represents a smart contract event log in the database
+type EventLog struct {
+	ID               int64     `db:"id"`
+	BlockNumber      uint64    `db:"block_number"`
+	BlockHash        string    `db:"block_hash"`
+	TransactionHash  string    `db:"transaction_hash"`
+	TransactionIndex int       `db:"transaction_index"`
+	LogIndex         int       `db:"log_index"`
+	Address          string    `db:"address"`
+	Topics           []string  `db:"topics"`      // Will be stored as JSONB
+	Data             string    `db:"data"`
+	Removed          bool      `db:"removed"`
+	CreatedAt        time.Time `db:"created_at"`
+}
+
 // IndexerState represents the current state of the indexer
 type IndexerState struct {
 	ID              int       `db:"id"`

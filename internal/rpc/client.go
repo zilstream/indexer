@@ -131,11 +131,15 @@ func (c *Client) GetBlockWithTransactions(ctx context.Context, number uint64) (*
 	// First try standard method
 	block, err := c.client.BlockByNumber(ctx, big.NewInt(int64(number)))
 	if err != nil {
-		// If we get a "transaction type not supported" error, use raw RPC to handle Zilliqa transactions
-		if strings.Contains(err.Error(), "transaction type not supported") {
+		// If we get transaction-related errors, use raw RPC to handle Zilliqa transactions
+		errStr := err.Error()
+		if strings.Contains(errStr, "transaction type not supported") ||
+		   strings.Contains(errStr, "invalid transaction v, r, s values") ||
+		   strings.Contains(errStr, "invalid signature values") {
 			c.logger.Debug().
 				Uint64("block", number).
-				Msg("Block contains Zilliqa transaction type, using raw RPC")
+				Str("error", errStr).
+				Msg("Block contains problematic transaction, using raw RPC")
 			
 			return c.GetBlockWithRawRPC(ctx, number)
 		}

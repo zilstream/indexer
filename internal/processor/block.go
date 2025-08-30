@@ -13,51 +13,31 @@ import (
 
 // BlockProcessor handles the processing of blocks
 type BlockProcessor struct {
-	rpcClient *rpc.Client
-	db        *database.Database
-	blockRepo *database.BlockRepository
-	logger    zerolog.Logger
+	rpcClient      *rpc.Client
+	db             *database.Database
+	blockRepo      *database.BlockRepository
+	eventProcessor *EventProcessor
+	logger         zerolog.Logger
 }
 
 // NewBlockProcessor creates a new block processor
 func NewBlockProcessor(rpcClient *rpc.Client, db *database.Database, logger zerolog.Logger) *BlockProcessor {
 	return &BlockProcessor{
-		rpcClient: rpcClient,
-		db:        db,
-		blockRepo: database.NewBlockRepository(db),
-		logger:    logger,
+		rpcClient:      rpcClient,
+		db:             db,
+		blockRepo:      database.NewBlockRepository(db),
+		eventProcessor: NewEventProcessor(rpcClient, db, logger),
+		logger:         logger,
 	}
 }
 
-// ProcessBlock processes a single block
+// ProcessBlock processes a single block with its transactions and events
 func (p *BlockProcessor) ProcessBlock(ctx context.Context, blockNumber uint64) error {
-	// Fetch block from RPC
-	block, err := p.rpcClient.GetBlockWithTransactions(ctx, blockNumber)
-	if err != nil {
-		return fmt.Errorf("failed to fetch block %d: %w", blockNumber, err)
-	}
-
-	// Convert to database model
-	dbBlock := p.convertBlock(block)
-
-	// Insert block into database
-	if err := p.blockRepo.Insert(ctx, dbBlock); err != nil {
-		return fmt.Errorf("failed to insert block %d: %w", blockNumber, err)
-	}
-
-	// Update indexer state
-	if err := p.db.UpdateLastBlockNumber(ctx, blockNumber, block.Hash().Hex()); err != nil {
-		return fmt.Errorf("failed to update last block number: %w", err)
-	}
-
-	p.logger.Info().
-		Uint64("number", blockNumber).
-		Str("hash", block.Hash().Hex()).
-		Int("transactions", len(block.Transactions())).
-		Uint64("gas_used", block.GasUsed()).
-		Msg("Block processed")
-
-	return nil
+	// Create a transaction processor for this operation
+	txProcessor := NewTransactionProcessor(p.rpcClient, p.db, p.logger)
+	
+	// Use the full processing method
+	return p.ProcessBlockWithTransactions(ctx, blockNumber, txProcessor)
 }
 
 // ProcessBlockWithTransactions processes a block and its transactions together
@@ -77,8 +57,9 @@ func (p *BlockProcessor) ProcessBlockWithTransactions(ctx context.Context, block
 		}
 
 		// Process transactions if any
+		var receipts []*types.Receipt
 		if len(block.Transactions()) > 0 {
-			receipts, err := p.rpcClient.GetBlockReceipts(ctx, blockNumber)
+			receipts, err = p.rpcClient.GetBlockReceipts(ctx, blockNumber)
 			if err != nil {
 				return fmt.Errorf("failed to get block receipts: %w", err)
 			}
@@ -89,6 +70,11 @@ func (p *BlockProcessor) ProcessBlockWithTransactions(ctx context.Context, block
 			transactions := txProcessor.convertTransactionsWithMeta(block, receipts, metadata)
 			if err := txProcessor.insertBatchTx(ctx, tx, transactions); err != nil {
 				return fmt.Errorf("failed to insert transactions: %w", err)
+			}
+			
+			// Process event logs from receipts
+			if err := p.eventProcessor.ProcessBlockLogs(ctx, block, receipts); err != nil {
+				return fmt.Errorf("failed to process event logs: %w", err)
 			}
 		}
 
