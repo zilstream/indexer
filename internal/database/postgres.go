@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,10 +12,15 @@ import (
 	"github.com/zilstream/indexer/internal/config"
 )
 
+var ErrNotFound = errors.New("not found")
+
 type Database struct {
 	pool   *pgxpool.Pool
 	logger zerolog.Logger
 }
+
+// Alias for external packages
+type DB = Database
 
 func New(ctx context.Context, cfg *config.DatabaseConfig, logger zerolog.Logger) (*Database, error) {
 	connString := cfg.ConnectionString()
@@ -119,5 +125,102 @@ func (db *Database) UpdateLastBlockNumber(ctx context.Context, blockNumber uint6
 		return fmt.Errorf("failed to update last block number: %w", err)
 	}
 
+	return nil
+}
+
+// GetLastBlock returns the last indexed block
+func (db *Database) GetLastBlock(ctx context.Context) (*Block, error) {
+	var block Block
+	query := `
+		SELECT number, hash, parent_hash, timestamp, gas_limit, gas_used, base_fee_per_gas
+		FROM blocks
+		ORDER BY number DESC
+		LIMIT 1`
+	
+	err := db.pool.QueryRow(ctx, query).Scan(
+		&block.Number,
+		&block.Hash,
+		&block.ParentHash,
+		&block.Timestamp,
+		&block.GasLimit,
+		&block.GasUsed,
+		&block.BaseFeePerGas,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get last block: %w", err)
+	}
+
+	return &block, nil
+}
+
+// FindMissingBlocks finds gaps in block numbers between start and end
+func (db *Database) FindMissingBlocks(ctx context.Context, start, end uint64) ([]uint64, error) {
+	query := `
+		WITH RECURSIVE expected_blocks AS (
+			SELECT $1::BIGINT as block_num
+			UNION ALL
+			SELECT block_num + 1
+			FROM expected_blocks
+			WHERE block_num < $2
+		)
+		SELECT e.block_num
+		FROM expected_blocks e
+		LEFT JOIN blocks b ON e.block_num = b.number
+		WHERE b.number IS NULL
+		ORDER BY e.block_num`
+	
+	rows, err := db.pool.Query(ctx, query, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find missing blocks: %w", err)
+	}
+	defer rows.Close()
+	
+	var missing []uint64
+	for rows.Next() {
+		var blockNum uint64
+		if err := rows.Scan(&blockNum); err != nil {
+			return nil, err
+		}
+		missing = append(missing, blockNum)
+	}
+	
+	return missing, nil
+}
+
+// ValidateBlockSequence checks if blocks are properly linked by parent hash
+func (db *Database) ValidateBlockSequence(ctx context.Context, start, end uint64) error {
+	query := `
+		SELECT b1.number, b1.hash, b2.parent_hash
+		FROM blocks b1
+		LEFT JOIN blocks b2 ON b1.number + 1 = b2.number
+		WHERE b1.number >= $1 AND b1.number < $2
+			AND b2.parent_hash IS NOT NULL
+			AND b1.hash != b2.parent_hash
+		ORDER BY b1.number`
+	
+	rows, err := db.pool.Query(ctx, query, start, end)
+	if err != nil {
+		return fmt.Errorf("failed to validate block sequence: %w", err)
+	}
+	defer rows.Close()
+	
+	var mismatches []string
+	for rows.Next() {
+		var blockNum uint64
+		var blockHash, nextParentHash string
+		if err := rows.Scan(&blockNum, &blockHash, &nextParentHash); err != nil {
+			return err
+		}
+		mismatches = append(mismatches, fmt.Sprintf("block %d hash %s != next block parent %s", 
+			blockNum, blockHash, nextParentHash))
+	}
+	
+	if len(mismatches) > 0 {
+		return fmt.Errorf("block sequence validation failed: %v", mismatches)
+	}
+	
 	return nil
 }

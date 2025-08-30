@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/zilstream/indexer/internal/api"
 	"github.com/zilstream/indexer/internal/config"
 	"github.com/zilstream/indexer/internal/database"
 	"github.com/zilstream/indexer/internal/rpc"
+	syncMgr "github.com/zilstream/indexer/internal/sync"
 )
 
 // Indexer is the main indexer that coordinates block processing
@@ -23,6 +25,8 @@ type Indexer struct {
 	
 	blockProcessor *BlockProcessor
 	txProcessor    *TransactionProcessor
+	syncManager    *syncMgr.Manager
+	healthServer   *api.HealthServer
 	
 	logger    zerolog.Logger
 	wg        sync.WaitGroup
@@ -48,6 +52,18 @@ func NewIndexer(cfg *config.Config, logger zerolog.Logger) (*Indexer, error) {
 	// Create processors
 	blockProcessor := NewBlockProcessor(rpcClient, db, logger)
 	txProcessor := NewTransactionProcessor(rpcClient, db, logger)
+	
+	// Create sync manager
+	syncConfig := syncMgr.Config{
+		BatchSize:  cfg.Processor.BatchSize,
+		MaxWorkers: cfg.Processor.Workers,
+		RetryDelay: 5 * time.Second,
+		MaxRetries: 3,
+	}
+	syncManager := syncMgr.NewManager(db, rpcClient, blockProcessor, logger, syncConfig)
+	
+	// Create health server
+	healthServer := api.NewHealthServer(db, rpcClient, syncManager, logger, fmt.Sprintf("%d", cfg.Server.MetricsPort))
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -57,6 +73,8 @@ func NewIndexer(cfg *config.Config, logger zerolog.Logger) (*Indexer, error) {
 		db:             db,
 		blockProcessor: blockProcessor,
 		txProcessor:    txProcessor,
+		syncManager:    syncManager,
+		healthServer:   healthServer,
 		logger:         logger,
 		ctx:            ctx,
 		cancel:         cancel,
@@ -71,9 +89,23 @@ func (i *Indexer) Start() error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start sync loop in a goroutine
+	// Start health server
 	i.wg.Add(1)
-	go i.syncLoop()
+	go func() {
+		defer i.wg.Done()
+		if err := i.healthServer.Start(); err != nil {
+			i.logger.Error().Err(err).Msg("Health server error")
+		}
+	}()
+
+	// Start sync manager
+	i.wg.Add(1)
+	go func() {
+		defer i.wg.Done()
+		if err := i.syncManager.Start(i.ctx); err != nil {
+			i.logger.Error().Err(err).Msg("Sync manager error")
+		}
+	}()
 
 	// Wait for shutdown signal
 	select {
@@ -105,126 +137,6 @@ func (i *Indexer) Stop() {
 	i.logger.Info().Msg("Indexer stopped")
 }
 
-// syncLoop is the main synchronization loop
-func (i *Indexer) syncLoop() {
-	defer i.wg.Done()
-
-	// Get last indexed block
-	lastBlock, err := i.db.GetLastBlockNumber(i.ctx)
-	if err != nil {
-		i.logger.Error().Err(err).Msg("Failed to get last block number")
-		return
-	}
-
-	// If starting from scratch and start_block is 0, get latest block
-	if lastBlock == 0 && i.config.Chain.StartBlock == 0 {
-		latestBlock, err := i.rpcClient.GetLatestBlockNumber(i.ctx)
-		if err != nil {
-			i.logger.Error().Err(err).Msg("Failed to get latest block number")
-			return
-		}
-		lastBlock = latestBlock
-		i.logger.Info().Uint64("block", lastBlock).Msg("Starting from latest block")
-	} else if lastBlock == 0 && i.config.Chain.StartBlock > 0 {
-		lastBlock = i.config.Chain.StartBlock - 1
-		i.logger.Info().Uint64("block", i.config.Chain.StartBlock).Msg("Starting from configured block")
-	}
-
-	// Main sync loop
-	consecutiveErrors := 0
-	maxConsecutiveErrors := 10
-
-	for {
-		select {
-		case <-i.ctx.Done():
-			i.logger.Info().Msg("Sync loop stopped")
-			return
-		default:
-			// Get the latest block number
-			latestBlock, err := i.rpcClient.GetLatestBlockNumber(i.ctx)
-			if err != nil {
-				i.logger.Error().Err(err).Msg("Failed to get latest block number")
-				consecutiveErrors++
-				if consecutiveErrors >= maxConsecutiveErrors {
-					i.logger.Error().Msg("Too many consecutive errors, stopping sync")
-					return
-				}
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			// Check if we're caught up
-			if lastBlock >= latestBlock {
-				i.logger.Debug().
-					Uint64("current", lastBlock).
-					Uint64("latest", latestBlock).
-					Msg("Caught up with chain")
-				time.Sleep(i.config.Chain.BlockTime)
-				continue
-			}
-
-			// Process next block
-			nextBlock := lastBlock + 1
-			
-			startTime := time.Now()
-			err = i.processBlock(nextBlock)
-			processingTime := time.Since(startTime)
-
-			if err != nil {
-				i.logger.Error().
-					Err(err).
-					Uint64("block", nextBlock).
-					Dur("duration", processingTime).
-					Msg("Failed to process block")
-				
-				consecutiveErrors++
-				if consecutiveErrors >= maxConsecutiveErrors {
-					i.logger.Error().Msg("Too many consecutive errors, stopping sync")
-					return
-				}
-				
-				// Wait before retrying
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			// Reset error counter on success
-			consecutiveErrors = 0
-
-			// Log progress
-			lag := latestBlock - nextBlock
-			i.logger.Info().
-				Uint64("block", nextBlock).
-				Uint64("lag", lag).
-				Dur("duration", processingTime).
-				Msg("Block processed")
-
-			// Update last block
-			lastBlock = nextBlock
-
-			// If we're far behind, don't sleep
-			if lag > 100 {
-				continue
-			}
-
-			// Small delay to avoid overwhelming the RPC
-			if lag > 10 {
-				time.Sleep(100 * time.Millisecond)
-			} else {
-				time.Sleep(500 * time.Millisecond)
-			}
-		}
-	}
-}
-
-// processBlock processes a single block with its transactions
-func (i *Indexer) processBlock(blockNumber uint64) error {
-	ctx, cancel := context.WithTimeout(i.ctx, 30*time.Second)
-	defer cancel()
-
-	// Process block and transactions together in a transaction
-	return i.blockProcessor.ProcessBlockWithTransactions(ctx, blockNumber, i.txProcessor)
-}
 
 // GetStatus returns the current indexer status
 func (i *Indexer) GetStatus(ctx context.Context) (map[string]interface{}, error) {

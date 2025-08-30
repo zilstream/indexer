@@ -21,8 +21,8 @@ database:
   max_connections: 10
 
 processor:
-  batch_size: 100
-  workers: 5
+  batch_size: 10  # Reduced from 100 to avoid rate limiting
+  workers: 2      # Reduced from 5 to avoid rate limiting
 
 logging:
   level: "debug" # debug, info, warn, error

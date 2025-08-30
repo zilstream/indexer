@@ -15,6 +15,7 @@ type Block struct {
 	Timestamp        int64     `db:"timestamp"`
 	GasLimit         uint64    `db:"gas_limit"`
 	GasUsed          uint64    `db:"gas_used"`
+	BaseFeePerGas    *big.Int  `db:"base_fee_per_gas"`
 	TransactionCount int       `db:"transaction_count"`
 	CreatedAt        time.Time `db:"created_at"`
 }

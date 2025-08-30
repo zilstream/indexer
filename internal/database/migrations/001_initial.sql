@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     timestamp BIGINT NOT NULL,
     gas_limit BIGINT,
     gas_used BIGINT,
+    base_fee_per_gas NUMERIC,
     transaction_count INT DEFAULT 0,
     created_at TIMESTAMP DEFAULT NOW()
 );
