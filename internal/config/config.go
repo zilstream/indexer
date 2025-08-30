@@ -39,8 +39,20 @@ type DatabaseConfig struct {
 }
 
 type ProcessorConfig struct {
-	BatchSize int `mapstructure:"batch_size"`
-	Workers   int `mapstructure:"workers"`
+	BatchSize int            `mapstructure:"batch_size"`
+	Workers   int            `mapstructure:"workers"`
+	FastSync  FastSyncConfig `mapstructure:"fast_sync"`
+}
+
+type FastSyncConfig struct {
+	Enabled            bool `mapstructure:"enabled"`
+	Threshold          int  `mapstructure:"threshold"`
+	BatchSize          int  `mapstructure:"batch_size"`
+	Workers            int  `mapstructure:"workers"`
+	BufferSize         int  `mapstructure:"buffer_size"`
+	SkipReceipts       bool `mapstructure:"skip_receipts"`
+	SkipReceiptsBelow  int  `mapstructure:"skip_receipts_below"`
+	RequestsPerSecond  int  `mapstructure:"requests_per_second"`
 }
 
 type LoggingConfig struct {
@@ -61,6 +73,14 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("database.max_connections", 10)
 	viper.SetDefault("processor.batch_size", 100)
 	viper.SetDefault("processor.workers", 5)
+	viper.SetDefault("processor.fast_sync.enabled", true)
+	viper.SetDefault("processor.fast_sync.threshold", 10000)
+	viper.SetDefault("processor.fast_sync.batch_size", 50)
+	viper.SetDefault("processor.fast_sync.workers", 20)
+	viper.SetDefault("processor.fast_sync.buffer_size", 5000)
+	viper.SetDefault("processor.fast_sync.skip_receipts", true)
+	viper.SetDefault("processor.fast_sync.skip_receipts_below", 10000)
+	viper.SetDefault("processor.fast_sync.requests_per_second", 50)
 	viper.SetDefault("logging.level", "info")
 	viper.SetDefault("logging.format", "json")
 

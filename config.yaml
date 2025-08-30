@@ -23,6 +23,17 @@ database:
 processor:
   batch_size: 10  # Reduced from 100 to avoid rate limiting
   workers: 2      # Reduced from 5 to avoid rate limiting
+  
+  # Fast sync settings (used when behind by > 10,000 blocks)
+  fast_sync:
+    enabled: true            # Enable automatic fast sync
+    threshold: 10000         # Use fast sync when behind by this many blocks
+    batch_size: 50           # Blocks per batch for fast sync
+    workers: 20              # Number of parallel workers for fast sync
+    buffer_size: 5000        # Bulk write buffer size
+    skip_receipts: true      # Skip receipts for old blocks
+    skip_receipts_below: 10000  # Skip receipts for blocks older than this many from tip
+    requests_per_second: 50  # RPC rate limit
 
 logging:
   level: "debug" # debug, info, warn, error
