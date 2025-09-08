@@ -17,12 +17,13 @@ import (
 
 // UnifiedSync handles all synchronization with adaptive batching
 type UnifiedSync struct {
-	db       *database.Database
-	rpc      *rpc.Client
-	batch    *rpc.BatchClient
-	writer   *database.AtomicBlockWriter
-	modules  *core.ModuleRegistry
-	logger   zerolog.Logger
+	db         *database.Database
+	rpc        *rpc.Client
+	batch      *rpc.BatchClient
+	writer     *database.AtomicBlockWriter
+	bulkWriter *database.BulkWriter
+	modules    *core.ModuleRegistry
+	logger     zerolog.Logger
 	
 	// Configuration
 	maxBatchSize      int
@@ -50,14 +51,16 @@ func NewUnifiedSync(
 	// Create batch client for efficient fetching
 	batchClient := rpc.NewBatchClient(rpcClient.GetEndpoint(), config.MaxBatchSize, logger)
 	
-	// Create atomic writer
+	// Create atomic writer and bulk writer
 	writer := database.NewAtomicBlockWriter(db.Pool(), logger)
+	bulkWriter := database.NewBulkWriter(db.Pool(), logger)
 	
 	return &UnifiedSync{
 		db:                db,
 		rpc:               rpcClient,
 		batch:             batchClient,
 		writer:            writer,
+		bulkWriter:        bulkWriter,
 		modules:           modules,
 		logger:            logger.With().Str("component", "unified_sync").Logger(),
 		maxBatchSize:      config.MaxBatchSize,
@@ -217,10 +220,19 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 		}
 	}
 	
-	// Write batch atomically
-	err = s.writer.WriteBatch(ctx, dbBlocks, transactionsByBlock, eventLogsByBlock)
-	if err != nil {
-		return fmt.Errorf("failed to write batch: %w", err)
+	// Use bulk writer for large batches, atomic writer for small ones
+	batchSize := len(dbBlocks)
+	if batchSize >= 50 { // Use bulk writer for 50+ blocks
+		err = s.bulkWriter.WriteBatchBulk(ctx, dbBlocks, transactionsByBlock, eventLogsByBlock)
+		if err != nil {
+			return fmt.Errorf("failed to bulk write batch: %w", err)
+		}
+	} else {
+		// Use atomic writer for small batches to maintain ACID guarantees near head
+		err = s.writer.WriteBatch(ctx, dbBlocks, transactionsByBlock, eventLogsByBlock)
+		if err != nil {
+			return fmt.Errorf("failed to write batch: %w", err)
+		}
 	}
 	
 	// Update last block number
@@ -273,10 +285,14 @@ func (s *UnifiedSync) fetchBlocksWithReceipts(ctx context.Context, startBlock, e
 	
 	s.logger.Debug().Int("tx_count", len(allHashes)).Msg("Fetching receipts for all transactions")
 	
-	// Fetch receipts in chunks to avoid overwhelming the RPC
+	// Fetch receipts in optimized chunks with parallel processing  
 	receiptsMap := make(map[uint64][]*types.Receipt)
 	if len(allHashes) > 0 {
-		const maxReceiptsPerBatch = 500 // Limit to avoid huge RPC requests
+		// Use larger chunks for better performance
+		maxReceiptsPerBatch := 1000
+		if len(allHashes) > 10000 {
+			maxReceiptsPerBatch = 2000 // Even larger chunks for massive syncs
+		}
 		
 		var allReceipts []*types.Receipt
 		for i := 0; i < len(allHashes); i += maxReceiptsPerBatch {
@@ -300,6 +316,11 @@ func (s *UnifiedSync) fetchBlocksWithReceipts(ctx context.Context, startBlock, e
 				continue
 			}
 			allReceipts = append(allReceipts, chunkReceipts...)
+			
+			// Add small delay for very large batches to avoid overwhelming RPC
+			if len(chunk) > 1500 && i+maxReceiptsPerBatch < len(allHashes) {
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 		
 		// Organize receipts by block number
