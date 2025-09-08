@@ -62,7 +62,7 @@ type SyncEvent struct {
 func TestUniswapV2Events(t *testing.T) {
 	t.Run("detect PairCreated event", func(t *testing.T) {
 		// Load receipt data
-		receiptData, err := os.ReadFile("../../test_data_receipt1.json")
+		receiptData, err := os.ReadFile("../../testdata/test_data_receipt1.json")
 		require.NoError(t, err)
 		
 		var receiptJSON map[string]interface{}
@@ -119,7 +119,7 @@ func TestUniswapV2Events(t *testing.T) {
 	
 	t.Run("parse addLiquidity transaction", func(t *testing.T) {
 		// Load block data to get transaction input
-		blockData, err := os.ReadFile("../../test_data_block.json")
+		blockData, err := os.ReadFile("../../testdata/test_data_block.json")
 		require.NoError(t, err)
 		
 		var blockJSON map[string]interface{}
@@ -168,7 +168,7 @@ func TestUniswapV2Events(t *testing.T) {
 	
 	t.Run("extract all Uniswap events and tokens", func(t *testing.T) {
 		// Load receipt data
-		receiptData, err := os.ReadFile("../../test_data_receipt1.json")
+		receiptData, err := os.ReadFile("../../testdata/test_data_receipt1.json")
 		require.NoError(t, err)
 		
 		var receiptJSON map[string]interface{}
@@ -277,7 +277,7 @@ func TestUniswapV2Events(t *testing.T) {
 	
 	t.Run("decode Mint events", func(t *testing.T) {
 		// Load receipt data
-		receiptData, err := os.ReadFile("../../test_data_receipt1.json")
+		receiptData, err := os.ReadFile("../../testdata/test_data_receipt1.json")
 		require.NoError(t, err)
 		
 		var receiptJSON map[string]interface{}
@@ -329,7 +329,7 @@ func TestUniswapV2Events(t *testing.T) {
 	
 	t.Run("decode Sync events", func(t *testing.T) {
 		// Load receipt data
-		receiptData, err := os.ReadFile("../../test_data_receipt1.json")
+		receiptData, err := os.ReadFile("../../testdata/test_data_receipt1.json")
 		require.NoError(t, err)
 		
 		var receiptJSON map[string]interface{}
@@ -384,10 +384,10 @@ func TestUniswapV2Events(t *testing.T) {
 		// 5. Reserves are synced
 		
 		// Load all data
-		blockData, err := os.ReadFile("../../test_data_block.json")
+		blockData, err := os.ReadFile("../../testdata/test_data_block.json")
 		require.NoError(t, err)
 		
-		receiptData, err := os.ReadFile("../../test_data_receipt1.json")
+		receiptData, err := os.ReadFile("../../testdata/test_data_receipt1.json")
 		require.NoError(t, err)
 		
 		var blockJSON, receiptJSON map[string]interface{}

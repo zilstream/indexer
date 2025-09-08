@@ -1,150 +1,170 @@
 # Zilstream Indexer
 
-A high-performance EVM indexer for the Zilliqa blockchain, designed to handle 1-second block times with comprehensive data indexing capabilities.
+High-performance Zilliqa EVM indexer with unified sync, event-log storage, and a pluggable module system (Uniswap V2 module included). Designed to keep up with ~1s block times while handling Zilliqa pre‑EVM transactions gracefully.
 
-## 🚀 Features
+## Highlights
 
-- **Ultra-Fast Historical Sync**: HyperSync-inspired fast sync achieves 100-1000x faster historical data synchronization
-- **Automatic Sync Mode Detection**: Intelligently switches between fast sync and normal sync based on how far behind the indexer is
-- **Zilliqa Pre-EVM Transaction Support**: Handles all transaction types including legacy Zilliqa transactions
-- **Robust Recovery**: Gap detection, automatic retries, and recovery mechanisms
-- **Production Ready**: Health endpoints, metrics, and configurable rate limiting
+- Unified sync with adaptive batching (near-head 1-by-1, deep backfill in large batches)
+- Batch RPC for blocks and receipts with client-side rate limiting
+- Pre‑EVM Zilliqa transaction compatibility (fallbacks and minimal receipts)
+- Event log extraction into `event_logs` for downstream processing
+- Pluggable module system driven by YAML manifests (`manifests/`)
+- Health and status endpoints exposed over HTTP
 
-## Quick Start
+## Requirements
 
-### Prerequisites
-
-- Go 1.21+
+- Go 1.25+
 - PostgreSQL 15+
-- Zilliqa RPC endpoint (default: https://api.zilliqa.com)
+- Zilliqa EVM RPC endpoint
 
-### Setup
+## Quick start
 
-1. **Start PostgreSQL**:
+1. Start PostgreSQL (fresh DB will auto-run migrations from this repo):
+
 ```bash
 docker-compose up -d postgres
 ```
 
-2. **Create database and run migrations**:
-```bash
-make db-create
-make migrate-up
+2. Configure the indexer:
+
+Update `config.yaml` (RPC, DB credentials, batch sizes, etc.). Example:
+
+```yaml
+server:
+  port: 8080
+  metrics_port: 9090
+
+chain:
+  name: "zilliqa"
+  chain_id: 32769
+  rpc_endpoint: "http://localhost:4202"
+  block_time: 1s
+  start_block: 0
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "zilstream"
+  user: "postgres"
+  password: "postgres"
+  ssl_mode: "disable"
+  max_connections: 10
+
+processor:
+  batch_size: 100
+  workers: 5
+  requests_per_second: 50
+  max_retries: 3
+  retry_delay: 1s
+
+logging:
+  level: "info"
+  format: "json"
 ```
 
-3. **Configure the indexer**:
-Edit `config.yaml` to set your database credentials and RPC endpoint.
+3. Build and run:
 
-4. **Build and run**:
 ```bash
 make build
 ./bin/indexer --config=config.yaml
 ```
 
 Or run directly:
+
 ```bash
 make run
 ```
 
-## Configuration
+Notes on migrations:
 
-See `config.yaml` for configuration options:
+- With Docker Compose, migrations are mounted to `/docker-entrypoint-initdb.d` and apply automatically on first start.
+- Running Postgres locally? Either use `make db-create && make migrate-up` (adjust user/host in the Makefile) or apply SQL files with `psql` from `internal/database/migrations/`.
 
-- `chain.rpc_endpoint`: Zilliqa RPC endpoint
-- `chain.start_block`: Starting block (0 = latest)
-- `database.*`: PostgreSQL connection settings
-- `logging.level`: Log level (debug, info, warn, error)
+## How it works
+
+### Unified sync
+
+- Adaptive batches based on gap size (see `internal/sync/unified_sync.go`).
+- Uses `internal/rpc/BatchClient` to batch `eth_getBlockByNumber` and `eth_getTransactionReceipt` calls with `requests_per_second` rate limiting.
+- Writes small batches atomically with `AtomicBlockWriter`; switches to `BulkWriter` for larger batches (>= 50 blocks).
+- Extracts and stores all event logs in `event_logs` for downstream consumers.
+
+### Zilliqa pre‑EVM support
+
+- Falls back to raw RPC for problematic blocks and constructs minimal receipts when necessary (see `internal/rpc/client.go` and `batch_client.go`).
+
+### Health and status endpoints
+
+Once running, the indexer serves:
+
+- `GET /health` → simple health check
+- `GET /status` → `{ lastIndexedBlock, latestBlock, blocksIndexing, synced, chainId }`
+
+Endpoints are served on `server.metrics_port` (default `:9090`).
+
+## Module system
+
+Modules are defined by manifests in `manifests/` and registered at startup. Currently the Uniswap V2 module is implemented and loaded via its manifest:
+
+- Manifest: `manifests/uniswap-v2.yaml`
+- Module: `internal/modules/uniswapv2`
+- Registry: `internal/modules/core/registry.go`
+
+At startup, the indexer loads manifests from `manifests/`, initializes the Uniswap V2 module for each, and routes relevant `event_logs` to the module handlers.
+
+### Backfill a module
+
+You can backfill a module over a historical block range using the backfill CLI:
+
+```bash
+go build -o bin/backfill ./cmd/backfill
+./bin/backfill --module uniswap-v2 --from 3250780 --to 3260000 --config=config.yaml
+```
+
+- If `--from`/`--to` are omitted, it defaults to the min/max from `event_logs`.
+- Backfill reads from `event_logs` and replays events through the module.
+
+## Configuration reference
+
+- `server.port` / `server.metrics_port`
+- `chain.name`, `chain.chain_id`, `chain.rpc_endpoint`, `chain.block_time`, `chain.start_block`
+- `database.host`, `database.port`, `database.name`, `database.user`, `database.password`, `database.ssl_mode`, `database.max_connections`
+- `processor.batch_size`, `processor.workers`, `processor.requests_per_second`, `processor.max_retries`, `processor.retry_delay`
+- `logging.level` (`debug|info|warn|error`), `logging.format` (`json|console`)
+
+Environment variables are supported via prefix `INDEXER_` (e.g. `INDEXER_DATABASE_PASSWORD`).
+
+## Database model (core tables)
+
+- `blocks` — block header and meta (`number`, `hash`, `parent_hash`, `timestamp`, gas fields)
+- `transactions` — tx details + Zilliqa-specific fields (`transaction_type`, etc.)
+- `event_logs` — raw EVM logs (topics as JSONB, data as hex)
+- `indexer_state` — last indexed block per chain
+- `module_state` — per-module progress/status
+
+Uniswap V2 entities (subset): `uniswap_v2_factory`, `uniswap_v2_pairs`, `uniswap_v2_swaps`, `uniswap_v2_mints`, `uniswap_v2_burns`, `uniswap_v2_syncs`, plus universal `tokens`.
 
 ## Development
 
-### Project Structure
-
-```
-├── cmd/indexer/          # Main application entry point
-├── internal/
-│   ├── config/          # Configuration management
-│   ├── database/        # Database layer and migrations
-│   ├── rpc/            # RPC client for Zilliqa
-│   └── processor/      # Block and transaction processing
-├── config.yaml         # Configuration file
-└── docker-compose.yml  # Local development setup
-```
-
-### Available Commands
+Common Make targets:
 
 ```bash
-make help         # Show all available commands
-make build       # Build the binary
-make run         # Run the indexer
-make test        # Run tests
-make db-reset    # Reset database
-make docker-run  # Run with Docker Compose
+make help            # List commands
+make build           # Build indexer
+make run             # Run with config.yaml
+make test            # Run tests
+make db-create       # Create DB (adjust user/host in Makefile if needed)
+make migrate-up      # Apply SQL migrations
+make db-reset        # Drop + recreate + migrate
+docker-compose up -d # Start Postgres for local dev
 ```
 
-## Fast Sync
+## Troubleshooting
 
-The indexer automatically uses fast sync when it detects it's more than 10,000 blocks behind. Fast sync features:
-
-- **Batch RPC Requests**: Bundles up to 100 blocks in a single HTTP request
-- **PostgreSQL COPY**: Uses bulk inserts achieving 20,000+ blocks/second database write speed
-- **Parallel Processing**: Configurable workers for concurrent block fetching
-- **Selective Data**: Skips receipts for old blocks to maximize speed
-
-### Manual Fast Sync
-
-You can also run fast sync manually for specific ranges:
-
-```bash
-./fastsync -start 0 -end 1000000 -workers 20 -batch 50
-```
-
-### Fast Sync Configuration
-
-Configure fast sync behavior in `config.yaml`:
-
-```yaml
-processor:
-  fast_sync:
-    enabled: true            # Enable automatic fast sync
-    threshold: 10000         # Use fast sync when behind by this many blocks
-    batch_size: 50           # Blocks per batch
-    workers: 20              # Parallel workers
-    skip_receipts: true      # Skip receipts for old blocks
-```
-
-## Current Features
-
-- ✅ **Stage 1**: Basic block and transaction indexing
-- ✅ **Stage 2**: Gap detection and recovery mechanisms
-- ✅ **Stage 2.5**: Ultra-fast historical sync with batch processing
-- ✅ **Stage 3**: Event log processing and indexing
-- ✅ Zilliqa pre-EVM transaction support
-- ✅ Health and metrics endpoints
-- ✅ Configurable rate limiting
-- ✅ Automatic sync mode switching
-
-## Upcoming Features
-- **Stage 4**: Module system
-- **Stage 5**: ERC-20 token indexing
-- **Stage 6**: Uniswap V2/V3 support
-- **Stage 7**: WebSocket subscriptions
-
-## Database Schema
-
-The indexer uses four main tables:
-
-- `blocks`: Block data including hash, timestamp, gas usage
-- `transactions`: Transaction details with from/to addresses, value, gas
-- `event_logs`: Smart contract event logs with topics and data
-- `indexer_state`: Tracks synchronization progress
-
-## Monitoring
-
-Check indexer status:
-```sql
-SELECT * FROM indexer_state;
-SELECT COUNT(*) FROM blocks;
-SELECT COUNT(*) FROM transactions;
-```
+- RPC errors or slow responses: lower `processor.requests_per_second` and/or `processor.batch_size`.
+- Connection refused to Postgres: ensure Docker container is healthy (`docker ps`) and config points to `localhost:5432`.
+- No events processed by module: confirm logs exist in `event_logs`, the manifest address/signatures are correct, and the module registered (see startup logs and `/status`).
+- Migrations didn’t apply: for fresh Docker volumes they apply automatically; otherwise run `make migrate-up` or use `psql` to apply files in `internal/database/migrations/`.
 
 ## License
 

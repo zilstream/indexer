@@ -13,7 +13,7 @@ import (
 func TestRealBlockData(t *testing.T) {
 	t.Run("validate block 3251552 structure", func(t *testing.T) {
 		// Load block data
-		blockData, err := os.ReadFile("../../test_data_block.json")
+		blockData, err := os.ReadFile("../../testdata/test_data_block.json")
 		require.NoError(t, err)
 		
 		var blockJSON map[string]interface{}
@@ -47,7 +47,7 @@ func TestRealBlockData(t *testing.T) {
 	
 	t.Run("validate receipt data", func(t *testing.T) {
 		// Load first receipt
-		receipt1Data, err := os.ReadFile("../../test_data_receipt1.json")
+		receipt1Data, err := os.ReadFile("../../testdata/test_data_receipt1.json")
 		require.NoError(t, err)
 		
 		var receipt1JSON map[string]interface{}
@@ -91,7 +91,7 @@ func TestRealBlockData(t *testing.T) {
 	
 	t.Run("validate Zilliqa transaction format", func(t *testing.T) {
 		// Load block data
-		blockData, err := os.ReadFile("../../test_data_block.json")
+		blockData, err := os.ReadFile("../../testdata/test_data_block.json")
 		require.NoError(t, err)
 		
 		var blockJSON map[string]interface{}

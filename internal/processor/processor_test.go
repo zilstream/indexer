@@ -16,7 +16,7 @@ import (
 func TestBlockProcessor(t *testing.T) {
 	t.Run("process block 3251552", func(t *testing.T) {
 		// Load test data
-		blockData, err := os.ReadFile("../../test_data_block.json")
+		blockData, err := os.ReadFile("../../testdata/test_data_block.json")
 		require.NoError(t, err)
 		
 		var blockJSON map[string]interface{}
@@ -45,7 +45,7 @@ func TestBlockProcessor(t *testing.T) {
 	
 	t.Run("process transactions", func(t *testing.T) {
 		// Load block data
-		blockData, err := os.ReadFile("../../test_data_block.json")
+		blockData, err := os.ReadFile("../../testdata/test_data_block.json")
 		require.NoError(t, err)
 		
 		var blockJSON map[string]interface{}
@@ -91,7 +91,7 @@ func TestBlockProcessor(t *testing.T) {
 	
 	t.Run("process event logs", func(t *testing.T) {
 		// Load receipt data
-		receipt1Data, err := os.ReadFile("../../test_data_receipt1.json")
+		receipt1Data, err := os.ReadFile("../../testdata/test_data_receipt1.json")
 		require.NoError(t, err)
 		
 		var receipt1JSON map[string]interface{}
@@ -161,13 +161,13 @@ func TestBlockProcessor(t *testing.T) {
 		// 4. Uniswap V2 events are detectable
 		
 		// Load all test data
-		blockData, err := os.ReadFile("../../test_data_block.json")
+		blockData, err := os.ReadFile("../../testdata/test_data_block.json")
 		require.NoError(t, err)
 		
-		receipt1Data, err := os.ReadFile("../../test_data_receipt1.json")
+		receipt1Data, err := os.ReadFile("../../testdata/test_data_receipt1.json")
 		require.NoError(t, err)
 		
-		receipt2Data, err := os.ReadFile("../../test_data_receipt2.json")
+		receipt2Data, err := os.ReadFile("../../testdata/test_data_receipt2.json")
 		require.NoError(t, err)
 		
 		var blockJSON, receipt1JSON, receipt2JSON map[string]interface{}
