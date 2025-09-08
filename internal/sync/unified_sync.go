@@ -251,31 +251,69 @@ func (s *UnifiedSync) fetchBlocksWithReceipts(ctx context.Context, startBlock, e
 	}
 	s.logger.Debug().Int("count", len(rawBlocks)).Msg("Fetched raw blocks")
 	
-	receiptsMap := make(map[uint64][]*types.Receipt)
+	// Collect ALL transaction hashes across all blocks
+	allHashes := []common.Hash{}
+	hashToBlock := make(map[common.Hash]uint64) // Map hash to block number
+	blockTxCounts := make(map[uint64]int) // Track tx count per block
+	
 	for _, rawBlock := range rawBlocks {
 		if rawBlock == nil || len(rawBlock.Transactions) == 0 {
 			continue
 		}
 		
 		blockNum := (*big.Int)(rawBlock.Number).Uint64()
+		blockTxCounts[blockNum] = len(rawBlock.Transactions)
 		
 		// Collect transaction hashes directly from raw data
-		hashes := make([]common.Hash, len(rawBlock.Transactions))
-		for i, tx := range rawBlock.Transactions {
-			hashes[i] = tx.Hash
+		for _, tx := range rawBlock.Transactions {
+			allHashes = append(allHashes, tx.Hash)
+			hashToBlock[tx.Hash] = blockNum
+		}
+	}
+	
+	s.logger.Debug().Int("tx_count", len(allHashes)).Msg("Fetching receipts for all transactions")
+	
+	// Fetch receipts in chunks to avoid overwhelming the RPC
+	receiptsMap := make(map[uint64][]*types.Receipt)
+	if len(allHashes) > 0 {
+		const maxReceiptsPerBatch = 500 // Limit to avoid huge RPC requests
+		
+		var allReceipts []*types.Receipt
+		for i := 0; i < len(allHashes); i += maxReceiptsPerBatch {
+			end := i + maxReceiptsPerBatch
+			if end > len(allHashes) {
+				end = len(allHashes)
+			}
+			
+			chunk := allHashes[i:end]
+			chunkReceipts, err := s.batch.GetReceiptBatch(ctx, chunk)
+			if err != nil {
+				s.logger.Warn().
+					Err(err).
+					Int("chunk_size", len(chunk)).
+					Int("chunk_start", i).
+					Msg("Failed to fetch receipts chunk, continuing without")
+				// Create empty receipts for this chunk
+				for j := 0; j < len(chunk); j++ {
+					allReceipts = append(allReceipts, nil)
+				}
+				continue
+			}
+			allReceipts = append(allReceipts, chunkReceipts...)
 		}
 		
-		// Batch fetch receipts
-		receipts, err := s.batch.GetReceiptBatch(ctx, hashes)
-		if err != nil {
-			s.logger.Warn().
-				Err(err).
-				Uint64("block", blockNum).
-				Msg("Failed to fetch receipts, continuing without")
-			continue
+		// Organize receipts by block number
+		for i, receipt := range allReceipts {
+			if receipt != nil {
+				blockNum := hashToBlock[allHashes[i]]
+				if receiptsMap[blockNum] == nil {
+					receiptsMap[blockNum] = make([]*types.Receipt, 0, blockTxCounts[blockNum])
+				}
+				receiptsMap[blockNum] = append(receiptsMap[blockNum], receipt)
+			}
 		}
 		
-		receiptsMap[blockNum] = receipts
+		s.logger.Debug().Int("receipts_fetched", len(allReceipts)).Msg("Receipts fetched")
 	}
 	
 	return rawBlocks, receiptsMap, nil

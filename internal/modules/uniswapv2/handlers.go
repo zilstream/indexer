@@ -182,6 +182,43 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 	// Create swap record ID: txhash-logindex
 	swapID := fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex)
 
+	// Check for duplicate by looking for same transaction hash and values
+	// This handles Zilliqa's duplicate event issue
+	dupCheckQuery := `
+		SELECT COUNT(*) FROM uniswap_v2_swaps 
+		WHERE transaction_hash = $1
+		  AND pair = $2 
+		  AND sender = $3 
+		  AND recipient = $4
+		  AND amount0_in = $5 
+		  AND amount1_in = $6
+		  AND amount0_out = $7 
+		  AND amount1_out = $8
+		  AND block_number = $9
+		  AND id != $10`
+	
+	var duplicateCount int
+	err := module.db.Pool().QueryRow(ctx, dupCheckQuery,
+		event.TransactionHash.Hex(),
+		strings.ToLower(event.Address.Hex()),
+		strings.ToLower(sender.Hex()),
+		strings.ToLower(to.Hex()),
+		amount0In.String(),
+		amount1In.String(),
+		amount0Out.String(),
+		amount1Out.String(),
+		event.BlockNumber,
+		swapID,
+	).Scan(&duplicateCount)
+	
+	if err == nil && duplicateCount > 0 {
+		module.logger.Debug().
+			Str("swap_id", swapID).
+			Int("duplicates", duplicateCount).
+			Msg("Skipping duplicate swap event")
+		return nil
+	}
+
 	// Insert swap record
 	query := `
 		INSERT INTO uniswap_v2_swaps (
@@ -194,7 +231,7 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 			amount0_out = EXCLUDED.amount0_out,
 			amount1_out = EXCLUDED.amount1_out`
 
-	_, err := module.db.Pool().Exec(ctx, query,
+	_, err = module.db.Pool().Exec(ctx, query,
 		swapID,
 		event.TransactionHash.Hex(),
 		event.LogIndex,
@@ -319,6 +356,36 @@ func handleMint(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 	// Create mint ID
 	mintID := fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex)
 
+	// Check for duplicate mint event with same transaction hash
+	dupCheckQuery := `
+		SELECT COUNT(*) FROM uniswap_v2_mints
+		WHERE transaction_hash = $1
+		  AND pair = $2
+		  AND sender = $3
+		  AND amount0 = $4
+		  AND amount1 = $5
+		  AND block_number = $6
+		  AND id != $7`
+	
+	var duplicateCount int
+	err := module.db.Pool().QueryRow(ctx, dupCheckQuery,
+		event.TransactionHash.Hex(),
+		strings.ToLower(event.Address.Hex()),
+		strings.ToLower(sender.Hex()),
+		amount0.String(),
+		amount1.String(),
+		event.BlockNumber,
+		mintID,
+	).Scan(&duplicateCount)
+	
+	if err == nil && duplicateCount > 0 {
+		module.logger.Debug().
+			Str("mint_id", mintID).
+			Int("duplicates", duplicateCount).
+			Msg("Skipping duplicate mint event")
+		return nil
+	}
+
 	// Insert mint record
 	query := `
 		INSERT INTO uniswap_v2_mints (
@@ -329,7 +396,7 @@ func handleMint(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 
 	// For mints, the 'to' address is usually found from a Transfer event
 	// For now, we'll use the sender as the to_address
-	_, err := module.db.Pool().Exec(ctx, query,
+	_, err = module.db.Pool().Exec(ctx, query,
 		mintID,
 		event.TransactionHash.Hex(),
 		event.LogIndex,
@@ -383,6 +450,38 @@ func handleBurn(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 	// Create burn ID
 	burnID := fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex)
 
+	// Check for duplicate burn event with same transaction hash
+	dupCheckQuery := `
+		SELECT COUNT(*) FROM uniswap_v2_burns
+		WHERE transaction_hash = $1
+		  AND pair = $2
+		  AND sender = $3
+		  AND to_address = $4
+		  AND amount0 = $5
+		  AND amount1 = $6
+		  AND block_number = $7
+		  AND id != $8`
+	
+	var duplicateCount int
+	err := module.db.Pool().QueryRow(ctx, dupCheckQuery,
+		event.TransactionHash.Hex(),
+		strings.ToLower(event.Address.Hex()),
+		strings.ToLower(sender.Hex()),
+		strings.ToLower(to.Hex()),
+		amount0.String(),
+		amount1.String(),
+		event.BlockNumber,
+		burnID,
+	).Scan(&duplicateCount)
+	
+	if err == nil && duplicateCount > 0 {
+		module.logger.Debug().
+			Str("burn_id", burnID).
+			Int("duplicates", duplicateCount).
+			Msg("Skipping duplicate burn event")
+		return nil
+	}
+
 	// Insert burn record
 	query := `
 		INSERT INTO uniswap_v2_burns (
@@ -391,7 +490,7 @@ func handleBurn(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (id) DO NOTHING`
 
-	_, err := module.db.Pool().Exec(ctx, query,
+	_, err = module.db.Pool().Exec(ctx, query,
 		burnID,
 		event.TransactionHash.Hex(),
 		event.LogIndex,

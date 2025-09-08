@@ -226,8 +226,13 @@ func (m *UniswapV2Module) HandleEvent(ctx context.Context, log *types.Log) error
 			Str("event", parsedEvent.EventName).
 			Str("address", parsedEvent.Address.Hex()).
 			Msg("Handler failed")
-		return fmt.Errorf("handler failed for event %s: %w", parsedEvent.EventName, err)
+		// Update state but don't return error to prevent getting stuck
+		m.updateModuleState(ctx, log.BlockNumber, "active")
+		return nil
 	}
+
+	// Update module state with successfully processed block
+	m.updateModuleState(ctx, log.BlockNumber, "active")
 
 	m.logger.Debug().
 		Str("event", parsedEvent.EventName).
@@ -389,6 +394,25 @@ func (m *UniswapV2Module) UpdateSyncState(ctx context.Context, blockNumber uint6
 	}
 
 	return nil
+}
+
+// updateModuleState updates the module's state in the database
+func (m *UniswapV2Module) updateModuleState(ctx context.Context, blockNumber uint64, status string) {
+	query := `
+		UPDATE module_state 
+		SET last_processed_block = GREATEST(last_processed_block, $2), 
+		    status = $3,
+		    updated_at = CURRENT_TIMESTAMP 
+		WHERE module_name = $1`
+
+	_, err := m.db.Pool().Exec(ctx, query, m.Name(), blockNumber, status)
+	if err != nil {
+		m.logger.Error().
+			Err(err).
+			Uint64("block", blockNumber).
+			Str("status", status).
+			Msg("Failed to update module state")
+	}
 }
 
 // LogData represents a log entry from the database
