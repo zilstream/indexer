@@ -259,6 +259,11 @@ func (c *Client) GetLogs(ctx context.Context, query ethereum.FilterQuery) ([]typ
 	return logs, nil
 }
 
+// GetEndpoint returns the RPC endpoint URL
+func (c *Client) GetEndpoint() string {
+	return c.endpoint
+}
+
 // IsConnected checks if the client is connected to the RPC endpoint
 func (c *Client) IsConnected(ctx context.Context) bool {
 	_, err := c.client.BlockNumber(ctx)

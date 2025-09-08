@@ -1,0 +1,89 @@
+name: uniswap-v2
+version: 1.0.0
+description: Indexes Uniswap V2 pools, swaps, and liquidity events
+repository: https://github.com/zilstream/indexer
+
+dataSources:
+  # UniswapV2Factory contract
+  - kind: ethereum/contract
+    name: UniswapV2Factory
+    network: zilliqa
+    source:
+      address: "0xf42d1058f233329185A36B04B7f96105afa1adD2"
+      abi: UniswapV2Factory
+      startBlock: 3250780
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.1
+      language: wasm/assemblyscript
+      entities:
+        - Factory
+        - Pair
+        - Token
+      eventHandlers:
+        - event: PairCreated(indexed address,indexed address,address,uint256)
+          handler: handlePairCreated
+
+  # UniswapV2Pair template - will be instantiated for each pair
+  - kind: ethereum/contract
+    name: UniswapV2Pair
+    network: zilliqa
+    source:
+      abi: UniswapV2Pair
+      # No address - this is a template that gets instantiated per pair
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.1
+      language: wasm/assemblyscript
+      entities:
+        - Pair
+        - Swap
+        - Mint
+        - Burn
+        - Sync
+        - Token
+      eventHandlers:
+        - event: Swap(indexed address,uint256,uint256,uint256,uint256,indexed address)
+          handler: handleSwap
+        - event: Sync(uint112,uint112)
+          handler: handleSync
+        - event: Mint(indexed address,uint256,uint256)
+          handler: handleMint
+        - event: Burn(indexed address,uint256,uint256,indexed address)
+          handler: handleBurn
+        - event: Transfer(indexed address,indexed address,uint256)
+          handler: handleTransfer
+
+# Context for module configuration
+context:
+  # Factory configuration
+  factoryAddress: "0xf42d1058f233329185A36B04B7f96105afa1adD2"
+
+  # WETH address for price calculations
+  wethAddress: "0x94e18aE7dd5eE57B55f30c4B63E2760c09EFb192"
+  
+  # RPC endpoint for fetching token metadata
+  rpcEndpoint: "http://176.9.25.203:4202"
+
+  # Stable coins for USD price calculation
+  stablecoins:
+    - address: "0x2274005778063684fbB1BfA96a2b725dC37D75f9" # zUSDT
+      symbol: zUSDT
+      decimals: 6
+    - address: "0xD8b73cEd1B16C047048f2c5EA42233DA33168198" # USDC
+      symbol: USDC
+      decimals: 6
+    - address: "0xE9df5b4b1134A3aadf693Db999786699B016239e" # kUSD
+      symbol: kUSD
+      decimals: 6
+
+  # Configuration
+  settings:
+    # Minimum liquidity USD to track a pair
+    minLiquidityUSD: 0
+
+    # Minimum volume USD to consider for price calculations
+    minVolumeUSD: 50
+
+    # Skip pairs with less than this amount in reserves
+    minReservesUSD: 0

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -31,6 +32,60 @@ type BatchClient struct {
 	totalRequests   int64
 	totalBatchCalls int64
 	avgBatchSize    float64
+}
+
+// ZilliqaReceipt represents a Zilliqa transaction receipt with optional fields
+type ZilliqaReceipt struct {
+	TxHash            common.Hash     `json:"transactionHash"`
+	TxIndex           hexutil.Uint64  `json:"transactionIndex"`
+	BlockHash         common.Hash     `json:"blockHash"`
+	BlockNumber       *hexutil.Big    `json:"blockNumber"`
+	From              common.Address  `json:"from"`
+	To                *common.Address `json:"to"`
+	CumulativeGasUsed *hexutil.Big    `json:"cumulativeGasUsed,omitempty"` // Optional for Zilliqa
+	GasUsed           *hexutil.Big    `json:"gasUsed"`
+	ContractAddress   *common.Address `json:"contractAddress"`
+	Logs              []*types.Log    `json:"logs"`
+	LogsBloom         types.Bloom     `json:"logsBloom"`
+	Status            hexutil.Uint64  `json:"status"`
+}
+
+// ToStandardReceipt converts a ZilliqaReceipt to a standard types.Receipt
+func (zr *ZilliqaReceipt) ToStandardReceipt() *types.Receipt {
+	receipt := &types.Receipt{
+		Type:             types.LegacyTxType,
+		TxHash:           zr.TxHash,
+		GasUsed:          uint64(0),
+		BlockHash:        zr.BlockHash,
+		TransactionIndex: uint(zr.TxIndex),
+		Logs:             zr.Logs,
+		Bloom:            zr.LogsBloom,
+		Status:           uint64(zr.Status),
+	}
+	
+	// Set contract address if it exists
+	if zr.ContractAddress != nil {
+		receipt.ContractAddress = *zr.ContractAddress
+	}
+	
+	// Set block number
+	if zr.BlockNumber != nil {
+		receipt.BlockNumber = (*big.Int)(zr.BlockNumber)
+	}
+	
+	// Set gas used
+	if zr.GasUsed != nil {
+		receipt.GasUsed = (*big.Int)(zr.GasUsed).Uint64()
+	}
+	
+	// Set cumulative gas used (use gas used if cumulative not available)
+	if zr.CumulativeGasUsed != nil {
+		receipt.CumulativeGasUsed = (*big.Int)(zr.CumulativeGasUsed).Uint64()
+	} else {
+		receipt.CumulativeGasUsed = receipt.GasUsed // Fallback for Zilliqa
+	}
+	
+	return receipt
 }
 
 // BatchRequest represents a single request in a batch
@@ -84,8 +139,8 @@ func (c *BatchClient) Close() {
 	c.rateLimiter.Stop()
 }
 
-// GetBlockBatch fetches multiple blocks in a single batch request
-func (c *BatchClient) GetBlockBatch(ctx context.Context, blockNumbers []uint64) ([]*types.Block, error) {
+// GetBlockBatchRaw fetches multiple blocks and returns raw RPC data
+func (c *BatchClient) GetBlockBatchRaw(ctx context.Context, blockNumbers []uint64) ([]*RawBlock, error) {
 	if len(blockNumbers) == 0 {
 		return nil, nil
 	}
@@ -115,7 +170,7 @@ func (c *BatchClient) GetBlockBatch(ctx context.Context, blockNumbers []uint64) 
 	}
 	
 	// Parse responses
-	blocks := make([]*types.Block, 0, len(responses))
+	blocks := make([]*RawBlock, 0, len(responses))
 	for i, resp := range responses {
 		if resp.Error != nil {
 			c.logger.Warn().
@@ -125,7 +180,7 @@ func (c *BatchClient) GetBlockBatch(ctx context.Context, blockNumbers []uint64) 
 			continue
 		}
 		
-		// Try to parse as raw block first (for Zilliqa transactions)
+		// Parse as raw block to preserve all RPC fields
 		var rawBlock RawBlock
 		if err := json.Unmarshal(resp.Result, &rawBlock); err != nil {
 			c.logger.Error().
@@ -135,10 +190,7 @@ func (c *BatchClient) GetBlockBatch(ctx context.Context, blockNumbers []uint64) 
 			continue
 		}
 		
-		block := rawBlock.ToEthBlock()
-		if block != nil {
-			blocks = append(blocks, block)
-		}
+		blocks = append(blocks, &rawBlock)
 	}
 	
 	// Update metrics
@@ -148,7 +200,7 @@ func (c *BatchClient) GetBlockBatch(ctx context.Context, blockNumbers []uint64) 
 }
 
 // GetBlockRangeFast fetches a range of blocks using optimized batching
-func (c *BatchClient) GetBlockRangeFast(ctx context.Context, start, end uint64, batchSize int) ([]*types.Block, error) {
+func (c *BatchClient) GetBlockRangeFast(ctx context.Context, start, end uint64, batchSize int) ([]*RawBlock, error) {
 	if start > end {
 		return nil, fmt.Errorf("invalid range: start %d > end %d", start, end)
 	}
@@ -160,7 +212,7 @@ func (c *BatchClient) GetBlockRangeFast(ctx context.Context, start, end uint64, 
 	}
 	
 	// Fetch all blocks in this range
-	return c.GetBlockBatch(ctx, nums)
+	return c.GetBlockBatchRaw(ctx, nums)
 }
 
 // GetReceiptBatch fetches multiple receipts in a single batch request
@@ -202,19 +254,21 @@ func (c *BatchClient) GetReceiptBatch(ctx context.Context, txHashes []common.Has
 			continue
 		}
 		
-		var receipt types.Receipt
-		if err := json.Unmarshal(resp.Result, &receipt); err != nil {
+		// Try parsing as Zilliqa receipt first
+		var zilliqaReceipt ZilliqaReceipt
+		if err := json.Unmarshal(resp.Result, &zilliqaReceipt); err != nil {
 			c.logger.Warn().
 				Err(err).
 				Str("hash", txHashes[i].Hex()).
-				Msg("Failed to parse receipt")
+				Msg("Failed to parse Zilliqa receipt")
 			// Create minimal receipt
 			receipts[i] = &types.Receipt{
 				TxHash: txHashes[i],
 				Status: types.ReceiptStatusSuccessful,
 			}
 		} else {
-			receipts[i] = &receipt
+			// Convert Zilliqa receipt to standard receipt
+			receipts[i] = zilliqaReceipt.ToStandardReceipt()
 		}
 	}
 	
@@ -363,7 +417,7 @@ func (c *BatchClient) EstimateOptimalBatchSize(ctx context.Context) (int, error)
 			nums[i] = latestBlock - uint64(i)
 		}
 		
-		_, err := c.GetBlockBatch(ctx, nums)
+		_, err := c.GetBlockBatchRaw(ctx, nums)
 		if err != nil {
 			c.logger.Warn().
 				Int("size", size).

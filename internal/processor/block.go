@@ -31,6 +31,17 @@ func NewBlockProcessor(rpcClient *rpc.Client, db *database.Database, logger zero
 	}
 }
 
+// NewBlockProcessorWithEventProcessor creates a new block processor with a provided event processor
+func NewBlockProcessorWithEventProcessor(rpcClient *rpc.Client, db *database.Database, eventProcessor *EventProcessor, logger zerolog.Logger) *BlockProcessor {
+	return &BlockProcessor{
+		rpcClient:      rpcClient,
+		db:             db,
+		blockRepo:      database.NewBlockRepository(db),
+		eventProcessor: eventProcessor,
+		logger:         logger,
+	}
+}
+
 // ProcessBlock processes a single block with its transactions and events
 func (p *BlockProcessor) ProcessBlock(ctx context.Context, blockNumber uint64) error {
 	// Create a transaction processor for this operation

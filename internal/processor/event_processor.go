@@ -12,13 +12,15 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/zilstream/indexer/internal/database"
 	"github.com/zilstream/indexer/internal/rpc"
+	"github.com/zilstream/indexer/internal/modules/core"
 )
 
 // EventProcessor handles processing of event logs
 type EventProcessor struct {
-	rpcClient *rpc.Client
-	db        *database.Database
-	logger    zerolog.Logger
+	rpcClient      *rpc.Client
+	db             *database.Database
+	moduleRegistry *core.ModuleRegistry
+	logger         zerolog.Logger
 }
 
 // NewEventProcessor creates a new event processor
@@ -27,6 +29,16 @@ func NewEventProcessor(rpcClient *rpc.Client, db *database.Database, logger zero
 		rpcClient: rpcClient,
 		db:        db,
 		logger:    logger.With().Str("component", "event_processor").Logger(),
+	}
+}
+
+// NewEventProcessorWithModules creates a new event processor with module support
+func NewEventProcessorWithModules(rpcClient *rpc.Client, db *database.Database, moduleRegistry *core.ModuleRegistry, logger zerolog.Logger) *EventProcessor {
+	return &EventProcessor{
+		rpcClient:      rpcClient,
+		db:             db,
+		moduleRegistry: moduleRegistry,
+		logger:         logger.With().Str("component", "event_processor").Logger(),
 	}
 }
 
@@ -72,7 +84,26 @@ func (p *EventProcessor) ProcessBlockLogs(ctx context.Context, block *types.Bloc
 		Msg("Processing event logs")
 
 	// Store logs in database
-	return p.storeLogs(ctx, block, allLogs)
+	if err := p.storeLogs(ctx, block, allLogs); err != nil {
+		return err
+	}
+
+	// Route events to modules if module registry is available
+	if p.moduleRegistry != nil {
+		for _, log := range allLogs {
+			if err := p.moduleRegistry.ProcessEvent(ctx, &log); err != nil {
+				p.logger.Error().
+					Err(err).
+					Uint64("block", log.BlockNumber).
+					Str("tx_hash", log.TxHash.Hex()).
+					Uint("log_index", log.Index).
+					Msg("Failed to process event in modules")
+				// Continue processing other events even if one fails
+			}
+		}
+	}
+
+	return nil
 }
 
 // ProcessBlockLogsBatch processes logs for multiple blocks in a batch

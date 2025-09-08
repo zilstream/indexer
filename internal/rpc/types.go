@@ -122,6 +122,8 @@ func (rb *RawBlock) ToEthBlockWithMeta() (*types.Block, []TransactionMeta) {
 			
 			// Create metadata for this transaction
 			meta := TransactionMeta{
+				Hash:          rawTx.Hash,
+				From:          rawTx.From,
 				IsZilliqaType: rawTx.IsZilliqaType,
 				OriginalType:  rawTx.OriginalType,
 			}
@@ -140,9 +142,17 @@ func (rb *RawBlock) ToEthBlockWithMeta() (*types.Block, []TransactionMeta) {
 
 // TransactionMeta contains metadata about a transaction
 type TransactionMeta struct {
+	Hash            common.Hash     // Original transaction hash from RPC
+	From            common.Address  // Original from address from RPC  
 	IsZilliqaType   bool
 	OriginalType    uint64
 	OriginalTypeHex string
+}
+
+// BlockWithMeta contains a block with transaction metadata
+type BlockWithMeta struct {
+	Block    *types.Block
+	TxMeta   []TransactionMeta
 }
 
 // ToTransaction converts RawTransaction to types.Transaction

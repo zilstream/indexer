@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -13,165 +12,131 @@ import (
 	"github.com/zilstream/indexer/internal/api"
 	"github.com/zilstream/indexer/internal/config"
 	"github.com/zilstream/indexer/internal/database"
+	"github.com/zilstream/indexer/internal/modules/core"
+	"github.com/zilstream/indexer/internal/modules/loader"
+	"github.com/zilstream/indexer/internal/modules/uniswapv2"
 	"github.com/zilstream/indexer/internal/rpc"
-	syncMgr "github.com/zilstream/indexer/internal/sync"
+	"github.com/zilstream/indexer/internal/sync"
 )
 
 // Indexer is the main indexer that coordinates block processing
 type Indexer struct {
-	config    *config.Config
-	rpcClient *rpc.Client
-	db        *database.Database
-	
-	blockProcessor *BlockProcessor
-	txProcessor    *TransactionProcessor
-	syncManager    *syncMgr.Manager
-	healthServer   *api.HealthServer
-	
-	logger    zerolog.Logger
-	wg        sync.WaitGroup
-	ctx       context.Context
-	cancel    context.CancelFunc
+	config         *config.Config
+	rpcClient      *rpc.Client
+	db             *database.Database
+	moduleRegistry *core.ModuleRegistry
+	logger         zerolog.Logger
+	shutdown       chan struct{}
 }
 
 // NewIndexer creates a new indexer instance
 func NewIndexer(cfg *config.Config, logger zerolog.Logger) (*Indexer, error) {
-	// Create RPC client
-	rpcClient, err := rpc.NewClient(cfg.Chain.RPCEndpoint, cfg.Chain.ChainID, logger)
+	// Extract RPC endpoint from config
+	rpcEndpoint := cfg.Chain.RPCEndpoint
+	if rpcEndpoint == "" {
+		return nil, fmt.Errorf("RPC endpoint not configured")
+	}
+	
+	// Connect to RPC
+	rpcClient, err := rpc.NewClient(rpcEndpoint, int64(cfg.Chain.ChainID), logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create RPC client: %w", err)
 	}
-
-	// Create database connection
+	
+	// Connect to database
 	db, err := database.New(context.Background(), &cfg.Database, logger)
 	if err != nil {
-		rpcClient.Close()
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
-
-	// Create processors
-	blockProcessor := NewBlockProcessor(rpcClient, db, logger)
-	txProcessor := NewTransactionProcessor(rpcClient, db, logger)
 	
-	// Create sync manager
-	syncConfig := syncMgr.Config{
-		BatchSize:  cfg.Processor.BatchSize,
-		MaxWorkers: cfg.Processor.Workers,
-		RetryDelay: 5 * time.Second,
-		MaxRetries: 3,
-		StartBlock: cfg.Chain.StartBlock,
-	}
-	syncManager := syncMgr.NewManager(db, rpcClient, blockProcessor, logger, syncConfig)
+	// Migrations are run separately, not here
 	
-	// Create health server
-	healthServer := api.NewHealthServer(db, rpcClient, syncManager, logger, fmt.Sprintf("%d", cfg.Server.MetricsPort))
-
-	ctx, cancel := context.WithCancel(context.Background())
-
+	// Create module registry
+	moduleRegistry := core.NewModuleRegistry(db, logger)
+	
 	return &Indexer{
 		config:         cfg,
 		rpcClient:      rpcClient,
 		db:             db,
-		blockProcessor: blockProcessor,
-		txProcessor:    txProcessor,
-		syncManager:    syncManager,
-		healthServer:   healthServer,
-		logger:         logger,
-		ctx:            ctx,
-		cancel:         cancel,
+		moduleRegistry: moduleRegistry,
+		logger:         logger.With().Str("component", "indexer").Logger(),
+		shutdown:       make(chan struct{}),
 	}, nil
 }
 
 // Start starts the indexer
-func (i *Indexer) Start() error {
+func (i *Indexer) Start(ctx context.Context) error {
 	i.logger.Info().Msg("Starting indexer")
-
-	// Set up signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
+	
+	// Initialize modules
+	if err := i.initializeModules(ctx); err != nil {
+		return fmt.Errorf("failed to initialize modules: %w", err)
+	}
+	
 	// Start health server
-	i.wg.Add(1)
+	healthServer := api.NewHealthServer(i, i.logger)
 	go func() {
-		defer i.wg.Done()
-		if err := i.healthServer.Start(); err != nil {
+		port := fmt.Sprintf(":%d", i.config.Server.MetricsPort)
+		i.logger.Info().Str("port", port).Msg("Starting health server")
+		if err := healthServer.Start(port); err != nil {
 			i.logger.Error().Err(err).Msg("Health server error")
 		}
 	}()
-
-	// Check if we should use fast sync
-	if err := i.checkAndRunFastSync(); err != nil {
-		i.logger.Error().Err(err).Msg("Fast sync check failed")
-		// Continue with normal sync even if fast sync fails
+	
+	// Start initial sync if needed
+	if err := i.syncOnce(ctx); err != nil {
+		i.logger.Error().Err(err).Msg("Initial sync failed")
 	}
-
-	// Start normal sync manager for ongoing blocks
-	i.wg.Add(1)
-	go func() {
-		defer i.wg.Done()
-		if err := i.syncManager.Start(i.ctx); err != nil {
-			i.logger.Error().Err(err).Msg("Sync manager error")
-		}
-	}()
-
-	// Wait for shutdown signal
-	select {
-	case sig := <-sigChan:
-		i.logger.Info().Str("signal", sig.String()).Msg("Received shutdown signal")
-	case <-i.ctx.Done():
-		i.logger.Info().Msg("Context cancelled")
-	}
-
-	// Graceful shutdown
-	i.Stop()
+	
+	// Start continuous sync
+	go i.continuousSync(ctx)
+	
+	// Wait for shutdown
+	i.waitForShutdown()
+	
 	return nil
 }
 
-// Stop stops the indexer gracefully
-func (i *Indexer) Stop() {
-	i.logger.Info().Msg("Stopping indexer")
+// continuousSync runs the continuous sync loop
+func (i *Indexer) continuousSync(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 	
-	// Cancel context to stop all goroutines
-	i.cancel()
-	
-	// Wait for all goroutines to finish
-	i.wg.Wait()
-	
-	// Close connections
-	i.rpcClient.Close()
-	i.db.Close()
-	
-	i.logger.Info().Msg("Indexer stopped")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-i.shutdown:
+			return
+		case <-ticker.C:
+			if err := i.syncOnce(ctx); err != nil {
+				i.logger.Error().Err(err).Msg("Sync error")
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}
 }
 
-
-// checkAndRunFastSync checks if fast sync should be used and runs it if needed
-func (i *Indexer) checkAndRunFastSync() error {
-	// Check if fast sync is enabled
-	if !i.config.Processor.FastSync.Enabled {
-		i.logger.Info().Msg("Fast sync is disabled in configuration")
-		return nil
+// syncOnce performs one sync iteration
+func (i *Indexer) syncOnce(ctx context.Context) error {
+	// Get current state
+	lastBlock, err := i.db.GetLastBlockNumber(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get last block: %w", err)
 	}
 	
-	ctx := context.Background()
-	
-	// Get current chain tip
 	latestBlock, err := i.rpcClient.GetLatestBlockNumber(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get latest block: %w", err)
 	}
 	
-	// Get last indexed block
-	lastIndexedBlock, err := i.db.GetLastBlockNumber(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get last indexed block: %w", err)
-	}
-	
 	// Determine start block
-	startBlock := lastIndexedBlock
-	if startBlock == 0 && i.config.Chain.StartBlock > 0 {
-		startBlock = i.config.Chain.StartBlock
-		// If we're starting from a specific block, update the database so we don't try to sync earlier blocks
+	startBlock := lastBlock + 1
+	if lastBlock == 0 && i.config.Chain.StartBlock > 0 {
+		startBlock = uint64(i.config.Chain.StartBlock)
+		i.logger.Info().Uint64("start_block", startBlock).Msg("Starting from configured block")
+		
+		// Set initial block number
 		if err := i.db.UpdateLastBlockNumber(ctx, startBlock-1, ""); err != nil {
 			i.logger.Warn().Err(err).Uint64("block", startBlock-1).Msg("Failed to set initial block number")
 		}
@@ -181,82 +146,42 @@ func (i *Indexer) checkAndRunFastSync() error {
 	}
 	
 	// Calculate how far behind we are
+	if latestBlock <= startBlock {
+		return nil // Already caught up
+	}
+	
 	blocksToSync := latestBlock - startBlock
 	
-	// Use fast sync if we're more than threshold blocks behind
-	fastSyncThreshold := uint64(i.config.Processor.FastSync.Threshold)
-	
-	if blocksToSync > fastSyncThreshold {
-		i.logger.Info().
-			Uint64("start_block", startBlock).
-			Uint64("latest_block", latestBlock).
-			Uint64("blocks_to_sync", blocksToSync).
-			Msg("Large gap detected, using fast sync for historical blocks")
-		
-		// Calculate where to stop fast sync (leave last 1000 blocks for normal sync)
-		const recentBlockBuffer = 1000
-		fastSyncEndBlock := latestBlock - recentBlockBuffer
-		if fastSyncEndBlock <= startBlock {
-			// Not enough blocks to warrant fast sync
-			return nil
+	if blocksToSync > 0 {
+		// Create unified sync config
+		syncConfig := sync.UnifiedSyncConfig{
+			MaxBatchSize:      i.config.Processor.BatchSize,
+			MaxRetries:        i.config.Processor.MaxRetries,
+			RetryDelay:        i.config.Processor.RetryDelay,
+			RequestsPerSecond: i.config.Processor.RequestsPerSecond,
 		}
 		
-		// Configure fast sync from config
-		fastSyncConfig := syncMgr.FastSyncConfig{
-			BatchSize:         i.config.Processor.FastSync.BatchSize,
-			WorkerCount:       i.config.Processor.FastSync.Workers,
-			BufferSize:        i.config.Processor.FastSync.BufferSize,
-			SkipReceipts:      i.config.Processor.FastSync.SkipReceipts,
-			SkipReceiptsBelow: latestBlock - uint64(i.config.Processor.FastSync.SkipReceiptsBelow),
-			RequestsPerSecond: i.config.Processor.FastSync.RequestsPerSecond,
-			OptimizeBatchSize: true,
-			LogBlockRange:     5000,
-		}
-		
-		// Create fast sync instance
-		fastSync := syncMgr.NewFastSync(
-			fastSyncConfig,
+		// Create unified sync instance
+		unifiedSync := sync.NewUnifiedSync(
 			i.db,
 			i.rpcClient,
+			i.moduleRegistry,
+			syncConfig,
 			i.logger,
 		)
-		defer fastSync.Close()
+		defer unifiedSync.Close()
 		
-		// Run fast sync
-		i.logger.Info().
-			Uint64("start", startBlock).
-			Uint64("end", fastSyncEndBlock).
-			Uint64("total", fastSyncEndBlock-startBlock+1).
-			Msg("Starting fast sync for historical blocks")
-		
-		startTime := time.Now()
-		if err := fastSync.SyncRange(ctx, startBlock, fastSyncEndBlock); err != nil {
-			return fmt.Errorf("fast sync failed: %w", err)
+		// Determine end block (don't go all the way to latest for safety)
+		endBlock := latestBlock
+		if blocksToSync > 100 {
+			// Leave a small buffer for very recent blocks
+			endBlock = latestBlock - 10
 		}
 		
-		elapsed := time.Since(startTime)
-		blocksPerSec := float64(fastSyncEndBlock-startBlock+1) / elapsed.Seconds()
-		
-		i.logger.Info().
-			Uint64("blocks_synced", fastSyncEndBlock-startBlock+1).
-			Dur("elapsed", elapsed).
-			Float64("blocks_per_sec", blocksPerSec).
-			Msg("Fast sync completed successfully")
-		
-		// Update last indexed block for normal sync to continue
-		if err := i.db.UpdateLastBlockNumber(ctx, fastSyncEndBlock, ""); err != nil {
-			return fmt.Errorf("failed to update last block after fast sync: %w", err)
+		// Run sync
+		if err := unifiedSync.SyncRange(ctx, startBlock, endBlock); err != nil {
+			return fmt.Errorf("sync failed: %w", err)
 		}
-		
-		i.logger.Info().
-			Uint64("continuing_from", fastSyncEndBlock+1).
-			Msg("Switching to normal sync for recent blocks")
-	} else if blocksToSync > 0 {
-		i.logger.Info().
-			Uint64("blocks_behind", blocksToSync).
-			Msg("Gap is small, using normal sync")
-	} else {
-		i.logger.Info().Msg("Already caught up with chain")
 	}
 	
 	return nil
@@ -275,10 +200,93 @@ func (i *Indexer) GetStatus(ctx context.Context) (map[string]interface{}, error)
 	}
 
 	return map[string]interface{}{
-		"last_indexed_block": lastBlock,
-		"latest_block":       latestBlock,
-		"lag":                latestBlock - lastBlock,
-		"syncing":            lastBlock < latestBlock,
-		"connected":          i.rpcClient.IsConnected(ctx),
+		"lastIndexedBlock": lastBlock,
+		"latestBlock":      latestBlock,
+		"blocksIndexing":   latestBlock - lastBlock,
+		"synced":           lastBlock >= latestBlock,
+		"chainId":          i.config.Chain.ChainID,
 	}, nil
+}
+
+// waitForShutdown waits for shutdown signal
+func (i *Indexer) waitForShutdown() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	
+	<-sigChan
+	i.logger.Info().Msg("Shutdown signal received")
+	
+	close(i.shutdown)
+	
+	i.logger.Info().Msg("Indexer stopped")
+}
+
+// initializeModules initializes the module system
+func (i *Indexer) initializeModules(ctx context.Context) error {
+	i.logger.Info().Msg("Initializing modules")
+	
+	// Load manifests from directory
+	manifestLoader := loader.NewManifestLoader(i.logger)
+	manifests, err := manifestLoader.LoadFromDirectory("manifests")
+	if err != nil {
+		return fmt.Errorf("failed to load manifests: %w", err)
+	}
+	
+	// Initialize each module based on manifest
+	for _, manifest := range manifests {
+		// For now, we'll create Uniswap V2 module for any manifest
+		// In future, this can be expanded based on manifest contents
+		module, err := uniswapv2.NewUniswapV2Module(i.logger)
+		if err != nil {
+			i.logger.Error().
+				Err(err).
+				Str("module", manifest.Name).
+				Msg("Failed to create module")
+			continue
+		}
+		
+		// Initialize module with database
+		if err := module.Initialize(ctx, i.db); err != nil {
+			i.logger.Error().
+				Err(err).
+				Str("module", manifest.Name).
+				Msg("Failed to initialize module")
+			continue
+		}
+		
+		// Register module
+		if err := i.moduleRegistry.RegisterModule(module); err != nil {
+			i.logger.Error().
+				Err(err).
+				Str("module", manifest.Name).
+				Msg("Failed to register module")
+			continue
+		}
+		
+		i.logger.Info().
+			Str("module", manifest.Name).
+			Str("version", manifest.Version).
+			Msg("Module registered")
+	}
+	
+	// Start module registry
+	i.moduleRegistry.Start()
+	
+	i.logger.Info().
+		Int("modules", len(manifests)).
+		Msg("Module system initialized")
+	
+	return nil
+}
+
+// Close closes the indexer
+func (i *Indexer) Close() error {
+	close(i.shutdown)
+	
+	if i.moduleRegistry != nil {
+		i.moduleRegistry.Stop()
+	}
+	
+	i.db.Close()
+	return nil
 }

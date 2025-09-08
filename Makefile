@@ -24,16 +24,55 @@ run:
 	@echo "Running indexer..."
 	@go run cmd/indexer/main.go --config=config.yaml
 
-## clean: Clean build artifacts
+## clean: Clean build artifacts and test cache
 clean:
 	@echo "Cleaning..."
 	@rm -rf bin/
-	@go clean
+	@go clean -testcache
+	@rm -f coverage.out coverage.html
 
-## test: Run tests
+## test: Run all tests
 test:
 	@echo "Running tests..."
-	@go test -v -race -cover ./...
+	@go test ./... -short
+
+## test-verbose: Run all tests with verbose output
+test-verbose:
+	@echo "Running tests (verbose)..."
+	@go test ./... -v
+
+## test-database: Test database package
+test-database:
+	@echo "Testing database package..."
+	@go test ./internal/database -v -count=1
+
+## test-modules: Test modules (including Zilliqa transaction handling)
+test-modules:
+	@echo "Testing modules package..."
+	@go test ./internal/modules -v -count=1
+
+## test-processor: Test processor (block processing)
+test-processor:
+	@echo "Testing processor package..."
+	@go test ./internal/processor -run TestBlockProcessor -v -count=1
+
+## test-uniswap: Test Uniswap V2 events (PairCreated, token extraction)
+test-uniswap:
+	@echo "Testing Uniswap V2 events..."
+	@go test ./internal/processor -run TestUniswapV2Events -v -count=1
+
+## test-coverage: Run tests with coverage
+test-coverage:
+	@echo "Running tests with coverage..."
+	@go test ./... -coverprofile=coverage.out
+	@go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report generated: coverage.html"
+
+## test-summary: Quick test summary
+test-summary:
+	@echo "Test Summary:"
+	@echo "============="
+	@go test ./... 2>&1 | grep -E "^(ok|FAIL|\?)" | column -t
 
 ## deps: Download dependencies
 deps:
@@ -44,22 +83,27 @@ deps:
 ## migrate-up: Run database migrations up
 migrate-up:
 	@echo "Running migrations..."
-	@psql -h localhost -U postgres -d zilstream -f internal/database/migrations/001_initial.sql
+	@for file in internal/database/migrations/*.sql; do \
+		echo "Applying migration: $$file"; \
+		psql -h localhost -U melvin -d zilstream -f $$file || exit 1; \
+	done
+	@echo "All migrations applied successfully"
 
 ## migrate-down: Run database migrations down
 migrate-down:
 	@echo "Rolling back migrations..."
-	@psql -h localhost -U postgres -d zilstream -c "DROP TABLE IF EXISTS transactions, blocks, indexer_state CASCADE;"
+	@psql -h localhost -U melvin -d zilstream -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+	@echo "All tables dropped"
 
 ## db-create: Create database
 db-create:
 	@echo "Creating database..."
-	@psql -h localhost -U postgres -c "CREATE DATABASE zilstream;" || true
+	@psql -h localhost -U melvin -d postgres -c "CREATE DATABASE zilstream;" || true
 
 ## db-drop: Drop database
 db-drop:
 	@echo "Dropping database..."
-	@psql -h localhost -U postgres -c "DROP DATABASE IF EXISTS zilstream;"
+	@psql -h localhost -U melvin -d postgres -c "DROP DATABASE IF EXISTS zilstream;"
 
 ## db-reset: Reset database (drop and recreate)
 db-reset: db-drop db-create migrate-up

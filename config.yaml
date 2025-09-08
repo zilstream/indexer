@@ -7,9 +7,9 @@ server:
 chain:
   name: "zilliqa"
   chain_id: 32769
-  rpc_endpoint: "https://api.zilliqa.com"
+  rpc_endpoint: "http://176.9.25.203:4202"
   block_time: 1s
-  start_block: 8497800 # Start from more recent block to find contract transactions
+  start_block: 3251550 # Close to first pair creation for testing
 
 database:
   host: "localhost"
@@ -21,19 +21,11 @@ database:
   max_connections: 10
 
 processor:
-  batch_size: 10  # Reduced from 100 to avoid rate limiting
-  workers: 2      # Reduced from 5 to avoid rate limiting
-  
-  # Fast sync settings (used when behind by > 10,000 blocks)
-  fast_sync:
-    enabled: true            # Enable automatic fast sync
-    threshold: 10000         # Use fast sync when behind by this many blocks
-    batch_size: 50           # Blocks per batch for fast sync
-    workers: 20              # Number of parallel workers for fast sync
-    buffer_size: 5000        # Bulk write buffer size
-    skip_receipts: true      # Skip receipts for old blocks
-    skip_receipts_below: 10000  # Skip receipts for blocks older than this many from tip
-    requests_per_second: 50  # RPC rate limit
+  batch_size: 100 # Adaptive batch size based on sync gap
+  workers: 5 # Number of parallel workers
+  requests_per_second: 50 # RPC rate limit
+  max_retries: 3
+  retry_delay: 1s
 
 logging:
   level: "debug" # debug, info, warn, error

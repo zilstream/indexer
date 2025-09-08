@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -40,7 +41,8 @@ func main() {
 	}
 
 	// Start indexer (blocks until shutdown)
-	if err := indexer.Start(); err != nil {
+	ctx := context.Background()
+	if err := indexer.Start(ctx); err != nil {
 		logger.Fatal().Err(err).Msg("Indexer failed")
 	}
 
