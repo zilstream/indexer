@@ -2,6 +2,7 @@ package uniswapv3
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math/big"
 	"strings"
@@ -212,32 +213,57 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 		func() string { if tick != nil { return tick.String() }; return "0" }(),
 	)
 	if err != nil { return err }
-	// Compute amount_usd for ZIL pools using ZIL→USD price and ZIL leg delta
+	// Compute amount_usd using stablecoin/ZIL direct paths, then router fallback
 	if module.priceProvider != nil {
 		var t0, t1 string
 		if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v3_pools WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+			l0 := strings.ToLower(t0)
+			l1 := strings.ToLower(t1)
 			zilAddr := strings.ToLower(module.wethAddress.Hex())
-			var zilAmt *big.Int
-			if strings.ToLower(t0) == zilAddr && amount0 != nil {
-				zilAmt = new(big.Int).Abs(amount0)
-			} else if strings.ToLower(t1) == zilAddr && amount1 != nil {
-				zilAmt = new(big.Int).Abs(amount1)
-			}
-			if zilAmt != nil && zilAmt.Sign() > 0 {
-				var ts int64
-				_ = module.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, event.BlockNumber).Scan(&ts)
-				if ts > 0 {
-					if price, ok := module.priceProvider.PriceZILUSD(ctx, time.Unix(ts, 0).UTC()); ok {
-						_, _ = module.db.Pool().Exec(ctx, `
-							UPDATE uniswap_v3_swaps
-							SET amount_usd = ( $2::numeric / 1e18::numeric ) * $3::numeric
-							WHERE id = $1`, id, zilAmt.String(), price)
-						// increment pool volume_usd
-						_, _ = module.db.Pool().Exec(ctx, `
-							UPDATE uniswap_v3_pools
-							SET volume_usd = COALESCE(volume_usd,0) + COALESCE((SELECT amount_usd FROM uniswap_v3_swaps WHERE id = $1),0)
-							WHERE address = $2`, id, strings.ToLower(event.Address.Hex()))
+			// Resolve block timestamp via DB, fallback to RPC if DB row not yet visible
+			minute, ok := module.blockTime(ctx, event.BlockNumber)
+			if ok {
+				var usd string
+				// Stablecoin direct
+				if module.isStablecoin(l0) && amount0 != nil {
+					dec := module.tokenDecimals(ctx, l0)
+					usd = divBigIntByPow10Str(absBig(amount0), dec)
+				} else if module.isStablecoin(l1) && amount1 != nil {
+					dec := module.tokenDecimals(ctx, l1)
+					usd = divBigIntByPow10Str(absBig(amount1), dec)
+				} else if l0 == zilAddr && amount0 != nil {
+					if price, ok := module.priceProvider.PriceZILUSD(ctx, minute); ok {
+						usd = mulStr(divBigIntByPow10Str(absBig(amount0), 18), price)
 					}
+				} else if l1 == zilAddr && amount1 != nil {
+					if price, ok := module.priceProvider.PriceZILUSD(ctx, minute); ok {
+						usd = mulStr(divBigIntByPow10Str(absBig(amount1), 18), price)
+					}
+				} else if module.priceRouter != nil {
+					// Router fallback: try token0 then token1
+					if amount0 != nil {
+						if p, ok := module.priceRouter.PriceTokenUSD(ctx, l0, minute); ok {
+							dec0 := module.tokenDecimals(ctx, l0)
+							usd = mulStr(divBigIntByPow10Str(absBig(amount0), dec0), p)
+						}
+					}
+					if usd == "" && amount1 != nil {
+						if p, ok := module.priceRouter.PriceTokenUSD(ctx, l1, minute); ok {
+							dec1 := module.tokenDecimals(ctx, l1)
+							usd = mulStr(divBigIntByPow10Str(absBig(amount1), dec1), p)
+						}
+					}
+				}
+				if usd != "" {
+					// Set swap amount_usd
+					_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v3_swaps SET amount_usd = $2::numeric WHERE id = $1`, id, usd)
+					// Update pool volume_usd and fees_usd
+					_, _ = module.db.Pool().Exec(ctx, `
+						UPDATE uniswap_v3_pools
+						SET 
+							volume_usd = COALESCE(volume_usd,0) + $2::numeric,
+							fees_usd = COALESCE(fees_usd,0) + ($2::numeric * (COALESCE(fee,0)::numeric / 1000000.0))
+						WHERE address = $1`, strings.ToLower(event.Address.Hex()), usd)
 				}
 			}
 		}
@@ -306,7 +332,28 @@ func handleMint(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 		func() string { if amount0 != nil { return amount0.String() }; return "0" }(),
 		func() string { if amount1 != nil { return amount1.String() }; return "0" }(),
 	)
-	return err
+	if err != nil { return err }
+	// Compute amount_usd (sum of both legs) for mint
+	if module.priceProvider != nil {
+		var t0, t1 string
+		if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v3_pools WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+			l0 := strings.ToLower(t0); l1 := strings.ToLower(t1)
+			minute, ok := module.blockTime(ctx, event.BlockNumber)
+			if ok {
+				total := "0"
+				if amount0 != nil && amount0.Sign() != 0 {
+					if usd, ok := module.valueTokenAmountUSD(ctx, l0, minute, absBig(amount0)); ok { total = addStr(total, usd) }
+				}
+				if amount1 != nil && amount1.Sign() != 0 {
+					if usd, ok := module.valueTokenAmountUSD(ctx, l1, minute, absBig(amount1)); ok { total = addStr(total, usd) }
+				}
+				if total != "0" {
+					_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v3_mints SET amount_usd = $2::numeric WHERE id = $1`, id, total)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // handleBurn stores v3 Burn events
@@ -370,7 +417,28 @@ func handleBurn(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 		func() string { if amount0 != nil { return amount0.String() }; return "0" }(),
 		func() string { if amount1 != nil { return amount1.String() }; return "0" }(),
 	)
-	return err
+	if err != nil { return err }
+	// Compute amount_usd (sum of both legs) for burn
+	if module.priceProvider != nil {
+		var t0, t1 string
+		if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v3_pools WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+			l0 := strings.ToLower(t0); l1 := strings.ToLower(t1)
+			minute, ok := module.blockTime(ctx, event.BlockNumber)
+			if ok {
+				total := "0"
+				if amount0 != nil && amount0.Sign() != 0 {
+					if usd, ok := module.valueTokenAmountUSD(ctx, l0, minute, absBig(amount0)); ok { total = addStr(total, usd) }
+				}
+				if amount1 != nil && amount1.Sign() != 0 {
+					if usd, ok := module.valueTokenAmountUSD(ctx, l1, minute, absBig(amount1)); ok { total = addStr(total, usd) }
+				}
+				if total != "0" {
+					_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v3_burns SET amount_usd = $2::numeric WHERE id = $1`, id, total)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // handleCollect stores v3 Collect events
@@ -435,7 +503,28 @@ func handleCollect(ctx context.Context, module *UniswapV3Module, event *core.Par
 		func() string { if amount0 != nil { return amount0.String() }; return "0" }(),
 		func() string { if amount1 != nil { return amount1.String() }; return "0" }(),
 	)
-	return err
+	if err != nil { return err }
+	// Compute amount_usd (sum of both legs) for collect
+	if module.priceProvider != nil {
+		var t0, t1 string
+		if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v3_pools WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+			l0 := strings.ToLower(t0); l1 := strings.ToLower(t1)
+			minute, ok := module.blockTime(ctx, event.BlockNumber)
+			if ok {
+				total := "0"
+				if amount0 != nil && amount0.Sign() != 0 {
+					if usd, ok := module.valueTokenAmountUSD(ctx, l0, minute, absBig(amount0)); ok { total = addStr(total, usd) }
+				}
+				if amount1 != nil && amount1.Sign() != 0 {
+					if usd, ok := module.valueTokenAmountUSD(ctx, l1, minute, absBig(amount1)); ok { total = addStr(total, usd) }
+				}
+				if total != "0" {
+					_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v3_collects SET amount_usd = $2::numeric WHERE id = $1`, id, total)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // ensureToken ensures a token exists in the universal tokens table
@@ -464,4 +553,75 @@ func (m *UniswapV3Module) ensureToken(ctx context.Context, tokenAddress common.A
 		0, 0,
 	)
 	return err
+}
+
+// Pricing helpers and math utilities
+// These are local to the module to avoid wider dependencies.
+func (m *UniswapV3Module) isStablecoin(addr string) bool {
+	if m.stablecoinSet == nil { return false }
+	_, ok := m.stablecoinSet[strings.ToLower(addr)]
+	return ok
+}
+
+func (m *UniswapV3Module) tokenDecimals(ctx context.Context, addr string) int {
+	var d sql.NullInt32
+	_ = m.db.Pool().QueryRow(ctx, `SELECT decimals FROM tokens WHERE address = $1`, strings.ToLower(addr)).Scan(&d)
+	if d.Valid { return int(d.Int32) }
+	return 18
+}
+
+func (m *UniswapV3Module) valueTokenAmountUSD(ctx context.Context, token string, ts time.Time, amount *big.Int) (string, bool) {
+	l := strings.ToLower(token)
+	if m.isStablecoin(l) {
+		dec := m.tokenDecimals(ctx, l)
+		return divBigIntByPow10Str(amount, dec), true
+	}
+	if l == strings.ToLower(m.wethAddress.Hex()) {
+		if price, ok := m.priceProvider.PriceZILUSD(ctx, ts); ok {
+			usd := mulStr(divBigIntByPow10Str(amount, 18), price)
+			return usd, usd != ""
+		}
+		return "", false
+	}
+	if m.priceRouter != nil {
+		if p, ok := m.priceRouter.PriceTokenUSD(ctx, l, ts); ok {
+			dec := m.tokenDecimals(ctx, l)
+			usd := mulStr(divBigIntByPow10Str(amount, dec), p)
+			return usd, usd != ""
+		}
+	}
+	return "", false
+}
+
+func absBig(x *big.Int) *big.Int { if x == nil { return big.NewInt(0) }; return new(big.Int).Abs(x) }
+
+func divBigIntByPow10Str(x *big.Int, decimals int) string {
+	if x == nil { return "0" }
+	n := new(big.Rat).SetInt(x)
+	d := new(big.Rat).SetFloat64(pow10Float(decimals))
+	if d.Sign() == 0 { return "0" }
+	n.Quo(n, d)
+	return n.FloatString(18)
+}
+
+func addStr(a, b string) string {
+	x := new(big.Rat); x.SetString(a)
+	y := new(big.Rat); y.SetString(b)
+	x.Add(x, y)
+	return x.FloatString(18)
+}
+
+func mulStr(a, b string) string {
+	x := new(big.Rat); if _, ok := x.SetString(a); !ok { return "" }
+	y := new(big.Rat); if _, ok := y.SetString(b); !ok { return "" }
+	x.Mul(x, y)
+	return x.FloatString(18)
+}
+
+// local pow10Float for decimal scaling
+func pow10Float(n int) float64 {
+	v := 1.0
+	if n > 0 { for i:=0; i<n; i++ { v *= 10 } }
+	if n < 0 { for i:=0; i<(-n); i++ { v /= 10 } }
+	return v
 }

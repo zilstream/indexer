@@ -57,5 +57,12 @@ dataSources:
 context:
   # Default factory address (override for your deployment)
   factoryAddress: "0x0000000000000000000000000000000000000000"
+  # Wrapped ZIL (WZIL) address used for pricing; set to your deployed WZIL
+  wethAddress: "0xYOUR_WZIL_ADDRESS"
+  # USD stablecoins (addresses on Zilliqa EVM); used for direct USD valuation
+  stablecoins:
+    - "0xYOUR_USDT_ADDRESS"
+    - "0xYOUR_USDC_ADDRESS"
+    # - "0xANOTHER_STABLE_ADDRESS"
   # Optional RPC for token metadata enrichment
   rpcEndpoint: ""

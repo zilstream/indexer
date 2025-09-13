@@ -93,6 +93,14 @@ if manifest.Context != nil {
   return nil, fmt.Errorf("failed to parse module config: %w", err)
  }
 }
+// Normalize address casing from config to avoid user formatting requirements
+if config.FactoryAddress != "" { config.FactoryAddress = strings.ToLower(config.FactoryAddress) }
+if config.WethAddress != "" { config.WethAddress = strings.ToLower(config.WethAddress) }
+if len(config.Stablecoins) > 0 {
+	for i := range config.Stablecoins {
+		config.Stablecoins[i].Address = strings.ToLower(config.Stablecoins[i].Address)
+	}
+}
 
 // Set up addresses - use the addresses from the context if available
 factoryAddress := common.HexToAddress("0xf42d1058f233329185A36B04B7f96105afa1adD2") // Default Zilliqa factory

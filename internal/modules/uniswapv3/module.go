@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -34,7 +35,7 @@ type UniswapV3Module struct {
 	poolABI        *abi.ABI
 
 	// Configuration
-	config *Config
+	config      *Config
 	wethAddress common.Address
 
 	// Event handlers
@@ -42,6 +43,10 @@ type UniswapV3Module struct {
 
 	// Pricing
 	priceProvider prices.Provider
+	priceRouter   prices.TokenRouter
+
+	// Cached config sets
+	stablecoinSet map[string]struct{}
 }
 
 // Config represents the module configuration
@@ -80,6 +85,12 @@ func NewUniswapV3Module(logger zerolog.Logger) (*UniswapV3Module, error) {
 			return nil, fmt.Errorf("failed to parse v3 module config: %w", err)
 		}
 	}
+	// Normalize config addresses to lowercase to avoid casing issues
+	if config.FactoryAddress != "" { config.FactoryAddress = strings.ToLower(config.FactoryAddress) }
+	if config.WethAddress != "" { config.WethAddress = strings.ToLower(config.WethAddress) }
+	if len(config.Stablecoins) > 0 {
+		for i := range config.Stablecoins { config.Stablecoins[i] = strings.ToLower(config.Stablecoins[i]) }
+	}
 
 	// Set up addresses - allow override via context
 	factoryAddress := common.HexToAddress("0x0000000000000000000000000000000000000000")
@@ -113,6 +124,25 @@ func NewUniswapV3Module(logger zerolog.Logger) (*UniswapV3Module, error) {
 	return module, nil
 }
 
+// blockTime returns the UTC minute bucket for the given block number by
+// reading from the DB if present, otherwise falling back to RPC header.
+// ok=false when neither source is available.
+func (m *UniswapV3Module) blockTime(ctx context.Context, blockNumber uint64) (time.Time, bool) {
+	// Try DB first (fast path)
+	var tsSec int64
+	if err := m.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, blockNumber).Scan(&tsSec); err == nil && tsSec > 0 {
+		return time.Unix(tsSec, 0).UTC(), true
+	}
+	// Fallback to RPC header (unified sync may call modules before DB commit)
+	if m.rpcClient != nil {
+		h, err := m.rpcClient.HeaderByNumber(ctx, big.NewInt(int64(blockNumber)))
+		if err == nil && h != nil {
+			return time.Unix(int64(h.Time), 0).UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
 // Name returns the module name
 func (m *UniswapV3Module) Name() string { return m.manifest.Name }
 
@@ -127,6 +157,17 @@ func (m *UniswapV3Module) SetRPCClient(client *ethclient.Client) { m.rpcClient =
 
 // SetPriceProvider injects the price provider
 func (m *UniswapV3Module) SetPriceProvider(p prices.Provider) { m.priceProvider = p }
+
+// internal: build stablecoin set from config
+func (m *UniswapV3Module) buildStablecoinSet() {
+	set := make(map[string]struct{})
+	if m.config != nil {
+		for _, a := range m.config.Stablecoins {
+			set[strings.ToLower(a)] = struct{}{}
+		}
+	}
+	m.stablecoinSet = set
+}
 
 // Initialize sets up the module with database connection
 func (m *UniswapV3Module) Initialize(ctx context.Context, db *database.Database) error {
@@ -160,6 +201,12 @@ func (m *UniswapV3Module) Initialize(ctx context.Context, db *database.Database)
 		if err != nil {
 			return fmt.Errorf("failed to initialize v3 factory: %w", err)
 		}
+	}
+
+	// Build stablecoin set and price router if provider is available
+	m.buildStablecoinSet()
+	if m.priceProvider != nil {
+		m.priceRouter = prices.NewDBRouter(db.Pool(), m.priceProvider, m.wethAddress.Hex(), m.config.Stablecoins)
 	}
 
 	m.logger.Info().Str("factory", m.factoryAddress.Hex()).Msg("UniswapV3 module initialized")

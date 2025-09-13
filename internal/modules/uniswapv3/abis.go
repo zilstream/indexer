@@ -83,6 +83,7 @@ const UniswapV3PoolABI = `[
   {
     "anonymous": false,
     "inputs": [
+      {"indexed": false, "internalType": "address", "name": "sender",     "type": "address"},
       {"indexed": true,  "internalType": "address", "name": "owner",      "type": "address"},
       {"indexed": true,  "internalType": "int24",   "name": "tickLower",  "type": "int24"},
       {"indexed": true,  "internalType": "int24",   "name": "tickUpper",  "type": "int24"},

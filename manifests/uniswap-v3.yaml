@@ -55,7 +55,14 @@ dataSources:
 
 # Context for module configuration
 context:
-  # Default factory address (override for your deployment)
+  # Factory address for your deployment
   factoryAddress: "0x000A3ED861B2cC98Cc5f1C0Eb4d1B53904c0c93a"
-  # Optional RPC for token metadata enrichment
+  # Wrapped ZIL (WZIL) address used for pricing; set this to your WZIL token
+  wethAddress: "0x94e18aE7dd5eE57B55f30c4B63E2760c09EFb192"
+  # USD stablecoins on Zilliqa EVM; used for direct USD valuation in V3
+  stablecoins:
+    - "0x2274005778063684fbB1BfA96a2b725dC37D75f9" # zUSDT
+    - "0xD8b73cEd1B16C047048f2c5EA42233DA33168198" # USDC
+    - "0xE9df5b4b1134A3aadf693Db999786699B016239e" # kUSD
+  # Optional RPC for token metadata enrichment (leave empty to skip on-chain metadata)
   rpcEndpoint: "http://176.9.25.203:4202"

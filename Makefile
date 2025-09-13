@@ -1,4 +1,4 @@
-.PHONY: build run clean test migrate-up migrate-down docker-build help
+.PHONY: build run clean test migrate-up migrate-down docker-build help db-clean
 
 # Variables
 BINARY_NAME=indexer
@@ -154,3 +154,9 @@ fmt:
 dev:
 	@which air > /dev/null || go install github.com/cosmtrek/air@latest
 	@air -c .air.toml
+
+## db-clean: Truncate all public tables except prices_zil_usd_minute
+db-clean:
+	@echo "Cleaning database (keeping prices_zil_usd_minute)..."
+	@psql -h localhost -U melvin -d zilstream -At -c "SELECT 'TRUNCATE TABLE ' || quote_ident(schemaname) || '.' || quote_ident(tablename) || ' RESTART IDENTITY CASCADE;' FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'prices_zil_usd_minute';" | psql -h localhost -U melvin -d zilstream
+	@echo "Database cleaned."
