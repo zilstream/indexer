@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/zilstream/indexer/internal/modules/core"
@@ -210,7 +211,38 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 		func() string { if liquidity != nil { return liquidity.String() }; return "0" }(),
 		func() string { if tick != nil { return tick.String() }; return "0" }(),
 	)
-	return err
+	if err != nil { return err }
+	// Compute amount_usd for ZIL pools using ZIL→USD price and ZIL leg delta
+	if module.priceProvider != nil {
+		var t0, t1 string
+		if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v3_pools WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+			zilAddr := strings.ToLower(module.wethAddress.Hex())
+			var zilAmt *big.Int
+			if strings.ToLower(t0) == zilAddr && amount0 != nil {
+				zilAmt = new(big.Int).Abs(amount0)
+			} else if strings.ToLower(t1) == zilAddr && amount1 != nil {
+				zilAmt = new(big.Int).Abs(amount1)
+			}
+			if zilAmt != nil && zilAmt.Sign() > 0 {
+				var ts int64
+				_ = module.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, event.BlockNumber).Scan(&ts)
+				if ts > 0 {
+					if price, ok := module.priceProvider.PriceZILUSD(ctx, time.Unix(ts, 0).UTC()); ok {
+						_, _ = module.db.Pool().Exec(ctx, `
+							UPDATE uniswap_v3_swaps
+							SET amount_usd = ( $2::numeric / 1e18::numeric ) * $3::numeric
+							WHERE id = $1`, id, zilAmt.String(), price)
+						// increment pool volume_usd
+						_, _ = module.db.Pool().Exec(ctx, `
+							UPDATE uniswap_v3_pools
+							SET volume_usd = COALESCE(volume_usd,0) + COALESCE((SELECT amount_usd FROM uniswap_v3_swaps WHERE id = $1),0)
+							WHERE address = $2`, id, strings.ToLower(event.Address.Hex()))
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // handleMint stores v3 Mint events

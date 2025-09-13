@@ -5,6 +5,9 @@ BINARY_NAME=indexer
 DOCKER_IMAGE=zilstream-indexer
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
+CONFIG?=config.yaml
+CSV?=data/zilliqa_historical_prices.csv
+SOURCE?=bootstrap_csv
 
 # Default target
 all: build
@@ -22,7 +25,17 @@ build:
 ## run: Run the indexer
 run:
 	@echo "Running indexer..."
-	@go run cmd/indexer/main.go --config=config.yaml
+	@go run cmd/indexer/main.go --config=$(CONFIG)
+
+## load-zil-prices: Load historical ZIL/USD prices from CSV into prices_zil_usd_minute
+load-zil-prices:
+	@echo "Loading ZIL/USD prices from $(CSV) with source=$(SOURCE)..."
+	@go run cmd/load_zil_prices_csv/main.go --config=$(CONFIG) --csv=$(CSV) --source=$(SOURCE)
+
+## build-load-zil-prices: Build the CSV loader binary
+build-load-zil-prices:
+	@echo "Building CSV loader..."
+	@go build $(LDFLAGS) -o bin/load_zil_prices_csv cmd/load_zil_prices_csv/main.go
 
 ## clean: Clean build artifacts and test cache
 clean:

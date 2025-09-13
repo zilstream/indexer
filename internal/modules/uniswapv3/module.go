@@ -17,6 +17,7 @@ import (
 	"github.com/zilstream/indexer/internal/database"
 	"github.com/zilstream/indexer/internal/modules/core"
 	"github.com/zilstream/indexer/internal/modules/loader"
+	"github.com/zilstream/indexer/internal/prices"
 )
 
 // UniswapV3Module implements the Module interface for Uniswap V3 indexing
@@ -34,14 +35,19 @@ type UniswapV3Module struct {
 
 	// Configuration
 	config *Config
+	wethAddress common.Address
 
 	// Event handlers
 	handlers map[common.Hash]EventHandler
+
+	// Pricing
+	priceProvider prices.Provider
 }
 
 // Config represents the module configuration
 type Config struct {
 	FactoryAddress string   `yaml:"factoryAddress"`
+	WethAddress    string   `yaml:"wethAddress"`
 	RPCEndpoint    string   `yaml:"rpcEndpoint"`
 	Stablecoins    []string `yaml:"stablecoins"`
 }
@@ -80,6 +86,10 @@ func NewUniswapV3Module(logger zerolog.Logger) (*UniswapV3Module, error) {
 	if config.FactoryAddress != "" {
 		factoryAddress = common.HexToAddress(config.FactoryAddress)
 	}
+	wethAddress := common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2") // default; override via context
+	if config.WethAddress != "" {
+		wethAddress = common.HexToAddress(config.WethAddress)
+	}
 
 	module := &UniswapV3Module{
 		manifest:       manifest,
@@ -87,6 +97,7 @@ func NewUniswapV3Module(logger zerolog.Logger) (*UniswapV3Module, error) {
 		parser:         core.NewEventParser(),
 		factoryAddress: factoryAddress,
 		config:         &config,
+		wethAddress:    wethAddress,
 		handlers:       make(map[common.Hash]EventHandler),
 	}
 
@@ -113,6 +124,9 @@ func (m *UniswapV3Module) Manifest() *core.Manifest { return m.manifest }
 
 // SetRPCClient sets the RPC client for the module
 func (m *UniswapV3Module) SetRPCClient(client *ethclient.Client) { m.rpcClient = client }
+
+// SetPriceProvider injects the price provider
+func (m *UniswapV3Module) SetPriceProvider(p prices.Provider) { m.priceProvider = p }
 
 // Initialize sets up the module with database connection
 func (m *UniswapV3Module) Initialize(ctx context.Context, db *database.Database) error {

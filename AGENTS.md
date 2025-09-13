@@ -254,3 +254,18 @@ The UniswapV2 module demonstrates the complete pattern:
 - Test module backfill functionality with historical events
 - Verify bulk writer performance with large datasets
 - Monitor memory usage during long-running syncs
+
+## USD Pricing (CSV loader)
+
+- Migration adds minute-bucketed ZIL→USD prices: see [`009_prices_zil_usd_minute.sql`](file:///Users/melvin/Developer/zilstream-indexer/internal/database/migrations/009_prices_zil_usd_minute.sql).
+- Load historical ZIL prices from CSV and forward-fill to minutes:
+
+```bash
+make migrate-up
+make load-zil-prices CONFIG=config.yaml CSV=data/zilliqa_historical_prices.csv SOURCE=bootstrap_csv
+```
+
+- After loading, modules compute USD values at event time:
+  - Uniswap V2: swap `amount_usd`, pair `volume_usd`, `reserve_usd` (from Sync) using ZIL→USD.
+  - Uniswap V3: swap `amount_usd` and pool `volume_usd` for pools with ZIL.
+- Make targets are defined in the [`Makefile`](file:///Users/melvin/Developer/zilstream-indexer/Makefile).

@@ -19,6 +19,7 @@ import (
 	"github.com/zilstream/indexer/internal/modules/uniswapv3"
 	"github.com/zilstream/indexer/internal/rpc"
 	"github.com/zilstream/indexer/internal/sync"
+	"github.com/zilstream/indexer/internal/prices"
 )
 
 // Indexer is the main indexer that coordinates block processing
@@ -235,6 +236,8 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 	}
 	
 	// Initialize each module based on manifest
+	// Create shared price provider
+	priceProvider := prices.NewPostgresProvider(i.db.Pool(), 10_000)
 	for _, manifest := range manifests {
 		// Instantiate module based on manifest name
 		var module core.Module
@@ -245,6 +248,7 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 				i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to create UniswapV2 module")
 				continue
 			}
+			m.SetPriceProvider(priceProvider)
 			module = m
 		case "uniswap-v3":
 			m, err := uniswapv3.NewUniswapV3Module(i.logger)
@@ -252,6 +256,7 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 				i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to create UniswapV3 module")
 				continue
 			}
+			m.SetPriceProvider(priceProvider)
 			module = m
 		default:
 			// Fallback: try v2
@@ -260,6 +265,7 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 				i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to create default module")
 				continue
 			}
+			m.SetPriceProvider(priceProvider)
 			module = m
 		}
 		

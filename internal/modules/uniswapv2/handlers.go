@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -251,15 +252,47 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 		return fmt.Errorf("failed to insert swap: %w", err)
 	}
 
-	// TODO: Update pair volume and USD amounts
-	// This would require price calculation logic
-
+	// Compute USD notional for ZIL pairs when a price provider is available
+	if module.priceProvider != nil {
+	 var t0, t1 string
+	 if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v2_pairs WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+	 zilAddr := strings.ToLower(module.wethAddress.Hex())
+	 var zilDelta *big.Int
+	 if strings.ToLower(t0) == zilAddr {
+	  zilDelta = new(big.Int).Sub(amount0Out, amount0In)
+	  } else if strings.ToLower(t1) == zilAddr {
+	   zilDelta = new(big.Int).Sub(amount1Out, amount1In)
+			}
+			if zilDelta != nil && zilDelta.Sign() != 0 {
+				// Lookup price at block timestamp
+				var ts int64
+				_ = module.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, event.BlockNumber).Scan(&ts)
+				if ts > 0 {
+					if price, ok := module.priceProvider.PriceZILUSD(ctx, time.Unix(ts, 0).UTC()); ok {
+						// amount_usd = abs(zilDelta)/1e18 * price
+						_, _ = module.db.Pool().Exec(ctx, `
+							UPDATE uniswap_v2_swaps
+							SET amount_usd = (abs($2::numeric) / 1e18::numeric) * $3::numeric
+							WHERE id = $1`, swapID, zilDelta.String(), price)
+						// increment pair volume_usd by this swap's usd
+						_, _ = module.db.Pool().Exec(ctx, `
+							UPDATE uniswap_v2_pairs
+							SET volume_usd = COALESCE(volume_usd,0) + COALESCE((SELECT amount_usd FROM uniswap_v2_swaps WHERE id = $1),0)
+							WHERE address = $2`, swapID, strings.ToLower(event.Address.Hex()))
+						// record ZIL token price snapshot
+						_, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, zilAddr, price)
+					}
+				}
+			}
+		}
+	}
+	
 	module.logger.Debug().
 		Str("pair", event.Address.Hex()).
 		Str("sender", sender.Hex()).
 		Str("swap_id", swapID).
 		Msg("Swap processed")
-
+	
 	return nil
 }
 
@@ -307,26 +340,52 @@ func handleSync(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 
 	// Update pair reserves
 	updatePairQuery := `
-		UPDATE uniswap_v2_pairs 
-		SET reserve0 = $2, reserve1 = $3, updated_at = CURRENT_TIMESTAMP
-		WHERE address = $1`
+	UPDATE uniswap_v2_pairs 
+	SET reserve0 = $2, reserve1 = $3, updated_at = CURRENT_TIMESTAMP
+	WHERE address = $1`
 
 	_, err = module.db.Pool().Exec(ctx, updatePairQuery,
-		strings.ToLower(event.Address.Hex()),
-		reserve0.String(),
-		reserve1.String(),
+	strings.ToLower(event.Address.Hex()),
+	reserve0.String(),
+	reserve1.String(),
 	)
-
+	
 	if err != nil {
-		return fmt.Errorf("failed to update pair reserves: %w", err)
+	return fmt.Errorf("failed to update pair reserves: %w", err)
 	}
 
+	// Update reserve_usd for ZIL pairs (approx 2 * zil_reserve * price)
+	if module.priceProvider != nil {
+	var t0, t1 string
+	if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v2_pairs WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+	 zilAddr := strings.ToLower(module.wethAddress.Hex())
+	  var zilRes *big.Int
+	  if strings.ToLower(t0) == zilAddr {
+				zilRes = reserve0
+			} else if strings.ToLower(t1) == zilAddr {
+				zilRes = reserve1
+			}
+			if zilRes != nil {
+				var ts int64
+				_ = module.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, event.BlockNumber).Scan(&ts)
+				if ts > 0 {
+					if price, ok := module.priceProvider.PriceZILUSD(ctx, time.Unix(ts, 0).UTC()); ok {
+						_, _ = module.db.Pool().Exec(ctx, `
+							UPDATE uniswap_v2_pairs
+							SET reserve_usd = ( ($2::numeric) / 1e18::numeric ) * 2 * $3::numeric
+							WHERE address = $1`, strings.ToLower(event.Address.Hex()), zilRes.String(), price)
+					}
+				}
+			}
+		}
+	}
+	
 	module.logger.Debug().
 		Str("pair", event.Address.Hex()).
 		Str("reserve0", reserve0.String()).
 		Str("reserve1", reserve1.String()).
 		Msg("Sync processed")
-
+	
 	return nil
 }
 
