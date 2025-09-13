@@ -9,7 +9,7 @@ chain:
   chain_id: 32769
   rpc_endpoint: "http://176.9.25.203:4202"
   block_time: 1s
-  start_block: 3251550 # Close to first pair creation for testing
+  start_block: 3862930 # Close to first pair creation for testing
 
 database:
   host: "localhost"
@@ -28,5 +28,5 @@ processor:
   retry_delay: 1s
 
 logging:
-  level: "debug" # debug, info, warn, error
+  level: "info" # debug, info, warn, error
   format: "console" # json or console

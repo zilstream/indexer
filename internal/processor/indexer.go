@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"strings"
 
 	"github.com/rs/zerolog"
 	"github.com/zilstream/indexer/internal/api"
@@ -15,6 +16,7 @@ import (
 	"github.com/zilstream/indexer/internal/modules/core"
 	"github.com/zilstream/indexer/internal/modules/loader"
 	"github.com/zilstream/indexer/internal/modules/uniswapv2"
+	"github.com/zilstream/indexer/internal/modules/uniswapv3"
 	"github.com/zilstream/indexer/internal/rpc"
 	"github.com/zilstream/indexer/internal/sync"
 )
@@ -234,39 +236,46 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 	
 	// Initialize each module based on manifest
 	for _, manifest := range manifests {
-		// For now, we'll create Uniswap V2 module for any manifest
-		// In future, this can be expanded based on manifest contents
-		module, err := uniswapv2.NewUniswapV2Module(i.logger)
-		if err != nil {
-			i.logger.Error().
-				Err(err).
-				Str("module", manifest.Name).
-				Msg("Failed to create module")
-			continue
+		// Instantiate module based on manifest name
+		var module core.Module
+		switch strings.ToLower(manifest.Name) {
+		case "uniswap-v2":
+			m, err := uniswapv2.NewUniswapV2Module(i.logger)
+			if err != nil {
+				i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to create UniswapV2 module")
+				continue
+			}
+			module = m
+		case "uniswap-v3":
+			m, err := uniswapv3.NewUniswapV3Module(i.logger)
+			if err != nil {
+				i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to create UniswapV3 module")
+				continue
+			}
+			module = m
+		default:
+			// Fallback: try v2
+			m, err := uniswapv2.NewUniswapV2Module(i.logger)
+			if err != nil {
+				i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to create default module")
+				continue
+			}
+			module = m
 		}
 		
 		// Initialize module with database
 		if err := module.Initialize(ctx, i.db); err != nil {
-			i.logger.Error().
-				Err(err).
-				Str("module", manifest.Name).
-				Msg("Failed to initialize module")
+			i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to initialize module")
 			continue
 		}
 		
 		// Register module
 		if err := i.moduleRegistry.RegisterModule(module); err != nil {
-			i.logger.Error().
-				Err(err).
-				Str("module", manifest.Name).
-				Msg("Failed to register module")
+			i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to register module")
 			continue
 		}
 		
-		i.logger.Info().
-			Str("module", manifest.Name).
-			Str("version", manifest.Version).
-			Msg("Module registered")
+		i.logger.Info().Str("module", manifest.Name).Str("version", manifest.Version).Msg("Module registered")
 	}
 	
 	// Start module registry
