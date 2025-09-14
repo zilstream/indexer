@@ -32,6 +32,7 @@ type UnifiedSync struct {
 	maxRetries        int
 	retryDelay        time.Duration
 	requestsPerSecond int
+	useEthGetLogs     bool
 }
 
 // UnifiedSyncConfig holds configuration for unified sync
@@ -40,6 +41,7 @@ type UnifiedSyncConfig struct {
 	MaxRetries        int
 	RetryDelay        time.Duration
 	RequestsPerSecond int
+	UseEthGetLogs     bool // Use eth_getLogs instead of fetching individual receipts for events
 }
 
 // NewUnifiedSync creates a new unified sync instance
@@ -70,6 +72,7 @@ func NewUnifiedSync(
 		maxRetries:        config.MaxRetries,
 		retryDelay:        config.RetryDelay,
 		requestsPerSecond: config.RequestsPerSecond,
+		useEthGetLogs:     config.UseEthGetLogs,
 	}
 }
 
@@ -172,17 +175,35 @@ func (s *UnifiedSync) SyncRange(ctx context.Context, startBlock, endBlock uint64
 
 // processBatch fetches and stores a batch of blocks atomically
 func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uint64) error {
-	s.logger.Debug().Uint64("start", startBlock).Uint64("end", endBlock).Msg("processBatch called")
-	// Fetch raw blocks with receipts to preserve transaction metadata
-	rawBlocks, receiptsMap, err := s.fetchBlocksWithReceipts(ctx, startBlock, endBlock)
+	batchStart := time.Now()
+	blockCount := endBlock - startBlock + 1
+	s.logger.Info().Uint64("start", startBlock).Uint64("end", endBlock).Uint64("count", blockCount).Msg("Starting processBatch")
+
+	// Phase 1: Fetch blocks and events (optimized path)
+	fetchStart := time.Now()
+	var rawBlocks []*rpc.RawBlock
+	var receiptsMap map[uint64][]*types.Receipt
+	var directEventLogs map[uint64][]*database.EventLog
+	var err error
+
+	if s.useEthGetLogs {
+		rawBlocks, directEventLogs, err = s.fetchBlocksWithLogs(ctx, startBlock, endBlock)
+	} else {
+		rawBlocks, receiptsMap, err = s.fetchBlocksWithReceipts(ctx, startBlock, endBlock)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to fetch blocks: %w", err)
 	}
-	
-	// Process each raw block
+	fetchDuration := time.Since(fetchStart)
+
+	// Phase 2: Process raw blocks into database format
+	processStart := time.Now()
 	dbBlocks := make([]*database.Block, 0, len(rawBlocks))
 	transactionsByBlock := make(map[uint64][]*database.Transaction)
 	eventLogsByBlock := make(map[uint64][]*database.EventLog)
+
+	totalTxs := 0
+	totalLogs := 0
 	
 	for _, rawBlock := range rawBlocks {
 		if rawBlock == nil {
@@ -199,35 +220,53 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 		dbTransactions := s.convertRawTransactions(rawBlock, receiptsMap[blockNum])
 		if len(dbTransactions) > 0 {
 			transactionsByBlock[blockNum] = dbTransactions
+			totalTxs += len(dbTransactions)
 		}
-		
+
 		// Extract and convert event logs
-		if receipts, ok := receiptsMap[blockNum]; ok {
+		if directEventLogs != nil {
+			// Use direct event logs from eth_getLogs
+			if eventLogs, ok := directEventLogs[blockNum]; ok && len(eventLogs) > 0 {
+				eventLogsByBlock[blockNum] = eventLogs
+				totalLogs += len(eventLogs)
+			}
+		} else if receipts, ok := receiptsMap[blockNum]; ok {
+			// Extract from receipts (fallback path)
 			eventLogs := s.extractEventLogsFromReceipts(blockNum, rawBlock.Hash.Hex(), receipts)
 			if len(eventLogs) > 0 {
 				eventLogsByBlock[blockNum] = eventLogs
-
+				totalLogs += len(eventLogs)
 			}
 		}
 	}
-	
-	// Use bulk writer for large batches, atomic writer for small ones
+	processDuration := time.Since(processStart)
+
+	// Phase 3: Write to database
+	dbWriteStart := time.Now()
 	batchSize := len(dbBlocks)
+	var writerType string
 	if batchSize >= 50 { // Use bulk writer for 50+ blocks
+		writerType = "bulk"
 		err = s.bulkWriter.WriteBatchBulk(ctx, dbBlocks, transactionsByBlock, eventLogsByBlock)
 		if err != nil {
 			return fmt.Errorf("failed to bulk write batch: %w", err)
 		}
 	} else {
+		writerType = "atomic"
 		// Use atomic writer for small batches to maintain ACID guarantees near head
 		err = s.writer.WriteBatch(ctx, dbBlocks, transactionsByBlock, eventLogsByBlock)
 		if err != nil {
 			return fmt.Errorf("failed to write batch: %w", err)
 		}
 	}
+	dbWriteDuration := time.Since(dbWriteStart)
 	
-	// Process events synchronously in the correct order (after database writes)
+	// Phase 4: Process events synchronously in the correct order
+	var eventProcessDuration time.Duration
+	processedEvents := 0
 	if s.modules != nil && len(eventLogsByBlock) > 0 {
+		eventProcessStart := time.Now()
+
 		// Sort blocks by block number to ensure correct processing order
 		var sortedBlockNums []uint64
 		for blockNum := range eventLogsByBlock {
@@ -243,33 +282,63 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 			}
 		}
 
-		// Process events for each block in order
+		// Collect all events in proper order for batch processing
+		var allEvents []*types.Log
 		for _, blockNum := range sortedBlockNums {
 			eventLogs := eventLogsByBlock[blockNum]
 
-			// Convert database event logs to ethereum types.Log and process in order
+			// Convert database event logs to ethereum types.Log
 			for _, dbLog := range eventLogs {
 				ethLog := s.convertToEthLog(dbLog)
-				if err := s.modules.ProcessEvent(ctx, &ethLog); err != nil {
-					s.logger.Error().
-						Err(err).
-						Uint64("block", ethLog.BlockNumber).
-						Str("tx_hash", ethLog.TxHash.Hex()).
-						Uint("log_index", ethLog.Index).
-						Msg("Failed to process event in modules")
-					// Continue processing other events even if one fails
-				}
+				allEvents = append(allEvents, &ethLog)
+				processedEvents++
 			}
 		}
+
+		// Process all events in a single batch for maximum performance
+		if len(allEvents) > 0 {
+			if err := s.modules.ProcessEventBatch(ctx, allEvents); err != nil {
+				s.logger.Error().
+					Err(err).
+					Int("event_count", len(allEvents)).
+					Msg("Failed to process event batch in modules")
+				// Note: Individual module errors are handled within ProcessEventBatch
+			}
+		}
+		eventProcessDuration = time.Since(eventProcessStart)
 	}
 
-	// Update last block number
+	// Phase 5: Update last block number
+	updateStart := time.Now()
 	if len(dbBlocks) > 0 {
 		lastBlock := dbBlocks[len(dbBlocks)-1]
 		if err := s.db.UpdateLastBlockNumber(ctx, lastBlock.Number, lastBlock.Hash); err != nil {
 			return fmt.Errorf("failed to update last block: %w", err)
 		}
 	}
+	updateDuration := time.Since(updateStart)
+
+	// Performance summary
+	totalDuration := time.Since(batchStart)
+	blocksPerSec := float64(blockCount) / totalDuration.Seconds()
+
+	s.logger.Info().
+		Uint64("blocks", blockCount).
+		Int("transactions", totalTxs).
+		Int("event_logs", totalLogs).
+		Int("processed_events", processedEvents).
+		Str("writer_type", writerType).
+		Dur("fetch_time", fetchDuration).
+		Dur("process_time", processDuration).
+		Dur("db_write_time", dbWriteDuration).
+		Dur("event_process_time", eventProcessDuration).
+		Dur("update_time", updateDuration).
+		Dur("total_time", totalDuration).
+		Float64("blocks_per_sec", blocksPerSec).
+		Float64("fetch_pct", 100*fetchDuration.Seconds()/totalDuration.Seconds()).
+		Float64("db_write_pct", 100*dbWriteDuration.Seconds()/totalDuration.Seconds()).
+		Float64("event_process_pct", 100*eventProcessDuration.Seconds()/totalDuration.Seconds()).
+		Msg("ProcessBatch performance breakdown")
 
 	return nil
 }
@@ -334,8 +403,101 @@ func (s *UnifiedSync) fetchBlocksWithReceipts(ctx context.Context, startBlock, e
 
 		s.logger.Debug().Int("receipts_fetched", len(allReceipts)).Msg("Receipts fetched")
 	}
-	
+
 	return rawBlocks, receiptsMap, nil
+}
+
+// fetchBlocksWithLogs fetches blocks and their event logs using eth_getLogs (MUCH faster!)
+func (s *UnifiedSync) fetchBlocksWithLogs(ctx context.Context, startBlock, endBlock uint64) ([]*rpc.RawBlock, map[uint64][]*database.EventLog, error) {
+	batchSize := int(endBlock - startBlock + 1)
+
+	// Step 1: Fetch raw blocks (preserve transaction metadata)
+	s.logger.Debug().Uint64("start", startBlock).Uint64("end", endBlock).Msg("Fetching raw blocks")
+	rawBlocks, err := s.batch.GetBlockBatchRaw(ctx, s.makeBlockNumbers(startBlock, endBlock))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to fetch raw blocks: %w", err)
+	}
+
+	// Step 2: Fetch ALL event logs for the block range with a single eth_getLogs call
+	logsFetchStart := time.Now()
+	allLogs, err := s.batch.GetLogs(ctx, startBlock, endBlock, nil) // nil = all addresses
+	if err != nil {
+		// Fallback to receipt-based approach on getLogs failure
+		s.logger.Warn().
+			Err(err).
+			Uint64("start", startBlock).
+			Uint64("end", endBlock).
+			Msg("eth_getLogs failed, falling back to receipt fetching")
+
+		// Fetch with receipts and convert to the expected return format
+		rawBlocks, receiptsMap, err := s.fetchBlocksWithReceipts(ctx, startBlock, endBlock)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// Convert receipts to event logs format for consistency
+		eventLogsByBlock := make(map[uint64][]*database.EventLog)
+		for blockNum, receipts := range receiptsMap {
+			if len(receipts) > 0 {
+				// Find the block hash from rawBlocks
+				var blockHashStr string
+				for _, rawBlock := range rawBlocks {
+					if (*big.Int)(rawBlock.Number).Uint64() == blockNum {
+						blockHashStr = rawBlock.Hash.Hex()
+						break
+					}
+				}
+				eventLogs := s.extractEventLogsFromReceipts(blockNum, blockHashStr, receipts)
+				if len(eventLogs) > 0 {
+					eventLogsByBlock[blockNum] = eventLogs
+				}
+			}
+		}
+
+		return rawBlocks, eventLogsByBlock, nil
+	}
+
+	logsFetchTime := time.Since(logsFetchStart)
+	s.logger.Info().
+		Uint64("start", startBlock).
+		Uint64("end", endBlock).
+		Int("blocks", batchSize).
+		Int("logs", len(allLogs)).
+		Dur("logs_fetch_time", logsFetchTime).
+		Msg("Fetched all logs with eth_getLogs - MASSIVE PERFORMANCE WIN!")
+
+	// Step 3: Group logs by block number and convert to database format
+	eventLogsByBlock := make(map[uint64][]*database.EventLog)
+	for _, log := range allLogs {
+		blockNum := log.BlockNumber
+
+		// Convert to database event log format
+		topics := make([]string, len(log.Topics))
+		for i, topic := range log.Topics {
+			topics[i] = topic.Hex()
+		}
+
+		dbEventLog := &database.EventLog{
+			BlockNumber:      blockNum,
+			BlockHash:        log.BlockHash.Hex(),
+			TransactionHash:  log.TxHash.Hex(),
+			TransactionIndex: int(log.TxIndex),
+			LogIndex:         int(log.Index),
+			Address:          log.Address.Hex(),
+			Topics:           topics,
+			Data:             common.Bytes2Hex(log.Data),
+			Removed:          log.Removed,
+		}
+
+		eventLogsByBlock[blockNum] = append(eventLogsByBlock[blockNum], dbEventLog)
+	}
+
+	s.logger.Debug().
+		Int("raw_blocks", len(rawBlocks)).
+		Int("event_logs_blocks", len(eventLogsByBlock)).
+		Msg("Grouped logs by block")
+
+	return rawBlocks, eventLogsByBlock, nil
 }
 
 // fetchReceiptsParallel fetches receipts in parallel for maximum performance

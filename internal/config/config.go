@@ -45,6 +45,7 @@ type ProcessorConfig struct {
 	RequestsPerSecond int           `mapstructure:"requests_per_second"`
 	MaxRetries        int           `mapstructure:"max_retries"`
 	RetryDelay        time.Duration `mapstructure:"retry_delay"`
+	UseEthGetLogs     bool          `mapstructure:"use_eth_get_logs"`
 }
 
 type LoggingConfig struct {
@@ -69,6 +70,7 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("processor.requests_per_second", 50)
 	viper.SetDefault("processor.max_retries", 3)
 	viper.SetDefault("processor.retry_delay", "1s")
+	viper.SetDefault("processor.use_eth_get_logs", true) // Enable high-performance event fetching by default
 	viper.SetDefault("logging.level", "info")
 	viper.SetDefault("logging.format", "json")
 

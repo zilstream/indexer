@@ -15,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/semaphore"
 )
 
 // BatchClient provides batch RPC operations for fast syncing
@@ -275,14 +276,91 @@ func (c *BatchClient) GetReceiptBatch(ctx context.Context, txHashes []common.Has
 	return receipts, nil
 }
 
-// GetLogs fetches logs for a block range using eth_getLogs
+// GetLogs fetches logs for a block range using eth_getLogs with chunking for large ranges
 func (c *BatchClient) GetLogs(ctx context.Context, fromBlock, toBlock uint64, addresses []common.Address) ([]types.Log, error) {
+	blockRange := toBlock - fromBlock + 1
+
+	// For large ranges, split into chunks to avoid RPC limits
+	maxRangePerRequest := uint64(2000) // Conservative limit for most RPCs
+	if blockRange <= maxRangePerRequest {
+		return c.getLogsRange(ctx, fromBlock, toBlock, addresses)
+	}
+
+	// Split into chunks and process in parallel
+	var allLogs []types.Log
+	numChunks := (blockRange + maxRangePerRequest - 1) / maxRangePerRequest
+
+	// Use semaphore to limit concurrent requests
+	maxConcurrency := int64(4) // Conservative concurrency for getLogs
+	if numChunks < 4 {
+		maxConcurrency = int64(numChunks)
+	}
+	sem := semaphore.NewWeighted(maxConcurrency)
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var fetchErr error
+
+	for start := fromBlock; start <= toBlock; start += maxRangePerRequest {
+		end := start + maxRangePerRequest - 1
+		if end > toBlock {
+			end = toBlock
+		}
+
+		wg.Add(1)
+		go func(chunkStart, chunkEnd uint64) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			if err := sem.Acquire(ctx, 1); err != nil {
+				mu.Lock()
+				if fetchErr == nil {
+					fetchErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			defer sem.Release(1)
+
+			chunkLogs, err := c.getLogsRange(ctx, chunkStart, chunkEnd, addresses)
+			if err != nil {
+				mu.Lock()
+				if fetchErr == nil {
+					fetchErr = fmt.Errorf("failed to get logs for range %d-%d: %w", chunkStart, chunkEnd, err)
+				}
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			allLogs = append(allLogs, chunkLogs...)
+			mu.Unlock()
+		}(start, end)
+	}
+
+	wg.Wait()
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
+
+	c.logger.Debug().
+		Uint64("from", fromBlock).
+		Uint64("to", toBlock).
+		Int("total_logs", len(allLogs)).
+		Int("chunks", int(numChunks)).
+		Msg("Fetched logs in chunks")
+
+	return allLogs, nil
+}
+
+// getLogsRange fetches logs for a single block range
+func (c *BatchClient) getLogsRange(ctx context.Context, fromBlock, toBlock uint64, addresses []common.Address) ([]types.Log, error) {
 	// Build filter
 	filter := map[string]interface{}{
 		"fromBlock": hexutil.EncodeUint64(fromBlock),
 		"toBlock":   hexutil.EncodeUint64(toBlock),
 	}
-	
+
 	if len(addresses) > 0 {
 		addrStrs := make([]string, len(addresses))
 		for i, addr := range addresses {
@@ -290,37 +368,46 @@ func (c *BatchClient) GetLogs(ctx context.Context, fromBlock, toBlock uint64, ad
 		}
 		filter["address"] = addrStrs
 	}
-	
+
 	params, _ := json.Marshal([]interface{}{filter})
-	
+
 	// Wait for rate limiter
 	<-c.rateLimiter.C
-	
-	// Execute single request (eth_getLogs doesn't support batch well)
+
+	startTime := time.Now()
+
+	// Execute single request
 	request := BatchRequest{
 		JSONRPC: "2.0",
 		Method:  "eth_getLogs",
 		Params:  params,
 		ID:      1,
 	}
-	
+
 	responses, err := c.executeBatch(ctx, []BatchRequest{request})
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if len(responses) == 0 || responses[0].Error != nil {
-		if responses[0].Error != nil {
+		if len(responses) > 0 && responses[0].Error != nil {
 			return nil, fmt.Errorf("eth_getLogs error: %s", responses[0].Error.Message)
 		}
 		return nil, fmt.Errorf("no response from eth_getLogs")
 	}
-	
+
 	var logs []types.Log
 	if err := json.Unmarshal(responses[0].Result, &logs); err != nil {
 		return nil, fmt.Errorf("failed to parse logs: %w", err)
 	}
-	
+
+	c.logger.Debug().
+		Uint64("from", fromBlock).
+		Uint64("to", toBlock).
+		Int("logs", len(logs)).
+		Dur("elapsed", time.Since(startTime)).
+		Msg("Fetched logs range")
+
 	return logs, nil
 }
 

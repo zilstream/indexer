@@ -12,33 +12,42 @@ import (
 type Module interface {
 	// Name returns the unique name of the module
 	Name() string
-	
+
 	// Version returns the module version
 	Version() string
-	
+
 	// Manifest returns the module's manifest configuration
 	Manifest() *Manifest
-	
+
 	// Initialize sets up the module with database connection and any required state
 	Initialize(ctx context.Context, db *database.Database) error
-	
+
 	// HandleEvent processes a single event log that matches this module's filters
 	HandleEvent(ctx context.Context, event *types.Log) error
-	
+
 	// GetEventFilters returns the event filters this module is interested in
 	GetEventFilters() []EventFilter
-	
+
 	// GetStartBlock returns the block number from which this module should start processing
 	GetStartBlock() uint64
-	
+
 	// Backfill processes historical events from the event_logs table
 	Backfill(ctx context.Context, fromBlock, toBlock uint64) error
-	
+
 	// GetSyncState returns the last processed block for this module
 	GetSyncState(ctx context.Context) (uint64, error)
-	
+
 	// UpdateSyncState updates the last processed block for this module
 	UpdateSyncState(ctx context.Context, blockNumber uint64) error
+}
+
+// BatchModule extends Module with batch processing capabilities for performance
+type BatchModule interface {
+	Module
+
+	// HandleEventBatch processes multiple events in a single database transaction
+	// This provides much better performance than HandleEvent for bulk operations
+	HandleEventBatch(ctx context.Context, events []*types.Log) error
 }
 
 // EventFilter defines what events a module wants to receive

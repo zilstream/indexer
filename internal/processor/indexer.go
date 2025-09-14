@@ -162,6 +162,7 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 			MaxRetries:        i.config.Processor.MaxRetries,
 			RetryDelay:        i.config.Processor.RetryDelay,
 			RequestsPerSecond: i.config.Processor.RequestsPerSecond,
+			UseEthGetLogs:     i.config.Processor.UseEthGetLogs,
 		}
 		
 		// Create unified sync instance

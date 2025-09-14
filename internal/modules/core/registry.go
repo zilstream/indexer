@@ -24,6 +24,10 @@ type ModuleRegistry struct {
 	eventFilters map[string][]string // topic -> module names
 	addressFilters map[string][]string // address -> module names
 
+	// Performance optimization - cached module status
+	moduleStatus map[string]ModuleStatus
+	statusMu     sync.RWMutex
+
 	// Lifecycle management
 	mu       sync.RWMutex
 	running  bool
@@ -42,6 +46,7 @@ func NewModuleRegistry(db *database.Database, logger zerolog.Logger) *ModuleRegi
 		logger:         logger.With().Str("component", "module_registry").Logger(),
 		eventFilters:   make(map[string][]string),
 		addressFilters: make(map[string][]string),
+		moduleStatus:   make(map[string]ModuleStatus),
 		ctx:            ctx,
 		cancel:         cancel,
 	}
@@ -106,6 +111,9 @@ func (r *ModuleRegistry) RegisterModule(module Module) error {
 		return fmt.Errorf("failed to initialize module state for %s: %w", name, err)
 	}
 
+	// Cache the module status for performance
+	r.cacheModuleStatus(name, StatusActive)
+
 	r.logger.Info().
 		Str("module", name).
 		Str("version", module.Version()).
@@ -147,7 +155,105 @@ func (r *ModuleRegistry) UnregisterModule(name string) error {
 	return nil
 }
 
-// ProcessEvent routes an event to interested modules
+// ProcessEventBatch routes multiple events to interested modules using batch processing for performance
+func (r *ModuleRegistry) ProcessEventBatch(ctx context.Context, logs []*types.Log) error {
+	if len(logs) == 0 {
+		return nil
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if !r.running {
+		return nil // Skip processing if registry is not running
+	}
+
+	// Group events by module for batch processing
+	eventsByModule := make(map[string][]*types.Log)
+	totalEventsProcessed := 0
+
+	for _, log := range logs {
+		// Find interested modules for this event (optimized - no logging)
+		interestedModules := r.findInterestedModules(log)
+
+		if len(interestedModules) > 0 && len(log.Topics) > 0 {
+			r.logger.Debug().
+				Str("topic0", log.Topics[0].Hex()).
+				Str("address", log.Address.Hex()).
+				Uint64("block", log.BlockNumber).
+				Strs("interested_modules", interestedModules).
+				Msg("Event matched modules")
+		}
+
+		for _, moduleName := range interestedModules {
+			eventsByModule[moduleName] = append(eventsByModule[moduleName], log)
+			totalEventsProcessed++
+		}
+	}
+
+	if totalEventsProcessed > 0 {
+		r.logger.Info().
+			Int("input_events", len(logs)).
+			Int("matched_events", totalEventsProcessed).
+			Int("modules_with_events", len(eventsByModule)).
+			Msg("Event batch routing summary")
+	}
+
+	// Process events for each module in batches
+	for moduleName, moduleEvents := range eventsByModule {
+		module, exists := r.modules[moduleName]
+		if !exists {
+			r.logger.Warn().Str("module", moduleName).Msg("Module not found during batch event processing")
+			continue
+		}
+
+		// Check if module should process events based on cached status
+		status := r.getCachedModuleStatus(moduleName)
+		if status != StatusActive && status != StatusBackfilling {
+			continue // Skip inactive modules silently for performance
+		}
+
+		r.logger.Debug().
+			Str("module", moduleName).
+			Int("event_count", len(moduleEvents)).
+			Msg("Processing events for module")
+
+		// Try batch processing first, fall back to individual processing
+		if batchModule, ok := module.(BatchModule); ok {
+			if err := batchModule.HandleEventBatch(ctx, moduleEvents); err != nil {
+				r.logger.Error().
+					Err(err).
+					Str("module", moduleName).
+					Int("event_count", len(moduleEvents)).
+					Msg("Module failed to process event batch")
+				r.updateModuleStatus(moduleName, StatusError) // Ignore cache update errors for performance
+			} else {
+				r.logger.Debug().
+					Str("module", moduleName).
+					Int("event_count", len(moduleEvents)).
+					Msg("Successfully processed event batch")
+			}
+		} else {
+			// Fall back to individual event processing (should rarely happen)
+			for _, event := range moduleEvents {
+				if err := module.HandleEvent(ctx, event); err != nil {
+					r.logger.Error().
+						Err(err).
+						Str("module", moduleName).
+						Uint64("block", event.BlockNumber).
+						Str("tx_hash", event.TxHash.Hex()).
+						Msg("Module failed to process event")
+					r.updateModuleStatus(moduleName, StatusError) // Ignore cache update errors for performance
+					break // Stop processing this module's events on first error
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// ProcessEvent routes an event to interested modules (legacy method for compatibility)
 func (r *ModuleRegistry) ProcessEvent(ctx context.Context, log *types.Log) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -384,12 +490,34 @@ func (r *ModuleRegistry) getModuleStatus(name string) (ModuleStatus, error) {
 // updateModuleStatus updates the status of a module
 func (r *ModuleRegistry) updateModuleStatus(name string, status ModuleStatus) error {
 	query := `
-		UPDATE module_state 
+		UPDATE module_state
 		SET status = $2, updated_at = CURRENT_TIMESTAMP
 		WHERE module_name = $1`
 
 	_, err := r.db.Pool().Exec(r.ctx, query, name, string(status))
+	if err == nil {
+		// Update cache
+		r.cacheModuleStatus(name, status)
+	}
 	return err
+}
+
+// getCachedModuleStatus returns cached module status, defaults to active
+func (r *ModuleRegistry) getCachedModuleStatus(name string) ModuleStatus {
+	r.statusMu.RLock()
+	defer r.statusMu.RUnlock()
+
+	if status, exists := r.moduleStatus[name]; exists {
+		return status
+	}
+	return StatusActive // Default to active for performance
+}
+
+// cacheModuleStatus caches the module status
+func (r *ModuleRegistry) cacheModuleStatus(name string, status ModuleStatus) {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	r.moduleStatus[name] = status
 }
 
 // TriggerBackfill starts backfilling for a module

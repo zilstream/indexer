@@ -5,11 +5,13 @@ import (
 "fmt"
 "math/big"
 "strings"
+"time"
 
 "github.com/ethereum/go-ethereum/accounts/abi"
 "github.com/ethereum/go-ethereum/common"
 "github.com/ethereum/go-ethereum/core/types"
 "github.com/ethereum/go-ethereum/ethclient"
+"github.com/jackc/pgx/v5"
 "github.com/rs/zerolog"
 	"gopkg.in/yaml.v3"
 
@@ -508,5 +510,924 @@ func (ld *LogData) ToEthereumLog() (*types.Log, error) {
 		Index:       ld.LogIndex,
 		Removed:     ld.Removed,
 	}, nil
+}
+
+// HandleEventBatch processes multiple events in a single database transaction for performance
+func (m *UniswapV2Module) HandleEventBatch(ctx context.Context, events []*types.Log) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	start := time.Now()
+
+	// Deduplicate events by transaction hash + log index
+	seen := make(map[string]bool)
+	uniqueEvents := make([]*types.Log, 0, len(events))
+	duplicateCount := 0
+
+	for _, event := range events {
+		key := fmt.Sprintf("%s-%d", event.TxHash.Hex(), event.Index)
+		if seen[key] {
+			duplicateCount++
+			continue
+		}
+		seen[key] = true
+		uniqueEvents = append(uniqueEvents, event)
+	}
+
+	if duplicateCount > 0 {
+		m.logger.Warn().
+			Int("duplicates_removed", duplicateCount).
+			Int("unique_events", len(uniqueEvents)).
+			Msg("Removed duplicate events from batch")
+	}
+
+	// Group events by type for batch processing
+	var pairCreatedEvents, swapEvents, syncEvents, mintEvents, burnEvents, transferEvents []*types.Log
+
+	for _, event := range uniqueEvents {
+		if len(event.Topics) == 0 {
+			continue
+		}
+
+		eventSignature := event.Topics[0]
+		if _, exists := m.handlers[eventSignature]; !exists {
+			continue // This event is not handled by this module
+		}
+
+		// Group by event type for different batch operations
+		switch eventSignature.Hex() {
+		case "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9": // PairCreated
+			pairCreatedEvents = append(pairCreatedEvents, event)
+		case "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822": // Swap
+			swapEvents = append(swapEvents, event)
+		case "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1": // Sync
+			syncEvents = append(syncEvents, event)
+		case "0x4c209b5fc8ad50758f13e2e1088ba56a560dff690a1c6fef26394f4c03821c4f": // Mint
+			mintEvents = append(mintEvents, event)
+		case "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496": // Burn
+			burnEvents = append(burnEvents, event)
+		case "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef": // Transfer
+			transferEvents = append(transferEvents, event)
+		}
+	}
+
+	// Use a single database transaction for all operations
+	tx, err := m.db.Pool().Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin batch transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Process each event type with bulk operations - ORDER MATTERS!
+	// 1. PairCreated events first (creates pairs)
+	if len(pairCreatedEvents) > 0 {
+		if err := m.batchHandlePairCreated(ctx, tx, pairCreatedEvents); err != nil {
+			return fmt.Errorf("batch PairCreated failed: %w", err)
+		}
+	}
+
+	// 2. Transfer events (creates pending mints/burns)
+	if len(transferEvents) > 0 {
+		if err := m.batchHandleTransfers(ctx, tx, transferEvents); err != nil {
+			return fmt.Errorf("batch Transfers failed: %w", err)
+		}
+	}
+
+	if len(swapEvents) > 0 {
+		if err := m.batchHandleSwaps(ctx, tx, swapEvents); err != nil {
+			return fmt.Errorf("batch Swaps failed: %w", err)
+		}
+	}
+
+	if len(syncEvents) > 0 {
+		if err := m.batchHandleSyncs(ctx, tx, syncEvents); err != nil {
+			return fmt.Errorf("batch Syncs failed: %w", err)
+		}
+	}
+
+	if len(mintEvents) > 0 {
+		if err := m.batchHandleMints(ctx, tx, mintEvents); err != nil {
+			return fmt.Errorf("batch Mints failed: %w", err)
+		}
+	}
+
+	if len(burnEvents) > 0 {
+		if err := m.batchHandleBurns(ctx, tx, burnEvents); err != nil {
+			return fmt.Errorf("batch Burns failed: %w", err)
+		}
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit batch transaction: %w", err)
+	}
+
+	m.logger.Info().
+		Int("total_events", len(uniqueEvents)).
+		Int("pairs_created", len(pairCreatedEvents)).
+		Int("transfers", len(transferEvents)).
+		Int("swaps", len(swapEvents)).
+		Int("syncs", len(syncEvents)).
+		Int("mints", len(mintEvents)).
+		Int("burns", len(burnEvents)).
+		Dur("duration", time.Since(start)).
+		Msg("Batch processed UniswapV2 events")
+
+	return nil
+}
+
+// batchHandleSwaps processes multiple Swap events using bulk insert
+func (m *UniswapV2Module) batchHandleSwaps(ctx context.Context, tx pgx.Tx, events []*types.Log) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Deduplicate swaps based on tx hash + swap values (Zilliqa duplicate event issue)
+	type swapKey struct {
+		txHash      string
+		pair        string
+		sender      string
+		recipient   string
+		amount0In   string
+		amount1In   string
+		amount0Out  string
+		amount1Out  string
+	}
+
+	seenSwaps := make(map[swapKey]bool)
+	duplicatesRemoved := 0
+
+	// Prepare arrays for bulk insert using UNNEST
+	ids := make([]string, 0, len(events))
+	txHashes := make([]string, 0, len(events))
+	logIndexes := make([]uint, 0, len(events))
+	blockNumbers := make([]uint64, 0, len(events))
+	blockHashes := make([]string, 0, len(events))
+	timestamps := make([]int64, 0, len(events))
+	pairs := make([]string, 0, len(events))
+	senders := make([]string, 0, len(events))
+	recipients := make([]string, 0, len(events))
+	amount0Ins := make([]string, 0, len(events))
+	amount1Ins := make([]string, 0, len(events))
+	amount0Outs := make([]string, 0, len(events))
+	amount1Outs := make([]string, 0, len(events))
+	amountUSDs := make([]*string, 0, len(events)) // Nullable field
+
+	for _, event := range events {
+		// Parse the event data (simplified - reuse logic from individual handler)
+		swapID := fmt.Sprintf("%s-%d", event.TxHash.Hex(), event.Index)
+		pairAddr := strings.ToLower(event.Address.Hex())
+
+		// Extract swap data from topics and data
+		if len(event.Topics) < 3 || len(event.Data) < 128 {
+			m.logger.Warn().Str("tx_hash", event.TxHash.Hex()).Msg("Invalid Swap event data")
+			continue
+		}
+
+		sender := common.BytesToAddress(event.Topics[1].Bytes())
+		to := common.BytesToAddress(event.Topics[2].Bytes())
+
+		// Parse amounts from data
+		amount0In := new(big.Int).SetBytes(event.Data[0:32])
+		amount1In := new(big.Int).SetBytes(event.Data[32:64])
+		amount0Out := new(big.Int).SetBytes(event.Data[64:96])
+		amount1Out := new(big.Int).SetBytes(event.Data[96:128])
+
+		// Create deduplication key based on transaction + swap values
+		key := swapKey{
+			txHash:      event.TxHash.Hex(),
+			pair:        pairAddr,
+			sender:      strings.ToLower(sender.Hex()),
+			recipient:   strings.ToLower(to.Hex()),
+			amount0In:   amount0In.String(),
+			amount1In:   amount1In.String(),
+			amount0Out:  amount0Out.String(),
+			amount1Out:  amount1Out.String(),
+		}
+
+		// Skip if we've already seen this exact swap in the same transaction
+		if seenSwaps[key] {
+			duplicatesRemoved++
+			m.logger.Debug().
+				Str("tx_hash", event.TxHash.Hex()).
+				Uint("log_index", event.Index).
+				Msg("Skipping duplicate swap event (Zilliqa duplicate event issue)")
+			continue
+		}
+		seenSwaps[key] = true
+
+		// Calculate USD value if price router is available
+		var amountUSD *string
+		blockTimestamp := m.getBlockTimestamp(ctx, event.BlockNumber)
+		if m.priceRouter != nil && blockTimestamp > 0 {
+			// Get token addresses for the pair
+			var token0, token1 string
+			err := tx.QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v2_pairs WHERE address = $1`, pairAddr).Scan(&token0, &token1)
+			if err == nil {
+				// Get token decimals
+				var decimals0, decimals1 int
+				_ = tx.QueryRow(ctx, `SELECT COALESCE(decimals, 18) FROM tokens WHERE address = $1`, token0).Scan(&decimals0)
+				_ = tx.QueryRow(ctx, `SELECT COALESCE(decimals, 18) FROM tokens WHERE address = $1`, token1).Scan(&decimals1)
+				if decimals0 == 0 { decimals0 = 18 }
+				if decimals1 == 0 { decimals1 = 18 }
+
+				// Try to get USD prices for both tokens
+				ts := time.Unix(blockTimestamp, 0)
+				price0, ok0 := m.priceRouter.PriceTokenUSD(ctx, token0, ts)
+				price1, ok1 := m.priceRouter.PriceTokenUSD(ctx, token1, ts)
+
+				// Calculate total USD value based on the amounts being swapped
+				totalUSD := big.NewFloat(0)
+
+				if ok0 && (amount0In.Sign() > 0 || amount0Out.Sign() > 0) {
+					// Convert amount to decimal (divide by 10^decimals)
+					divisor0 := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals0)), nil))
+					priceFloat0, _ := new(big.Float).SetString(price0)
+
+					if amount0In.Sign() > 0 {
+						amount0InFloat := new(big.Float).SetInt(amount0In)
+						amount0InFloat.Quo(amount0InFloat, divisor0)
+						amount0InFloat.Mul(amount0InFloat, priceFloat0)
+						totalUSD.Add(totalUSD, amount0InFloat)
+					}
+					if amount0Out.Sign() > 0 {
+						amount0OutFloat := new(big.Float).SetInt(amount0Out)
+						amount0OutFloat.Quo(amount0OutFloat, divisor0)
+						amount0OutFloat.Mul(amount0OutFloat, priceFloat0)
+						totalUSD.Add(totalUSD, amount0OutFloat)
+					}
+				}
+
+				if ok1 && (amount1In.Sign() > 0 || amount1Out.Sign() > 0) {
+					divisor1 := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals1)), nil))
+					priceFloat1, _ := new(big.Float).SetString(price1)
+
+					if amount1In.Sign() > 0 {
+						amount1InFloat := new(big.Float).SetInt(amount1In)
+						amount1InFloat.Quo(amount1InFloat, divisor1)
+						amount1InFloat.Mul(amount1InFloat, priceFloat1)
+						totalUSD.Add(totalUSD, amount1InFloat)
+					}
+					if amount1Out.Sign() > 0 {
+						amount1OutFloat := new(big.Float).SetInt(amount1Out)
+						amount1OutFloat.Quo(amount1OutFloat, divisor1)
+						amount1OutFloat.Mul(amount1OutFloat, priceFloat1)
+						totalUSD.Add(totalUSD, amount1OutFloat)
+					}
+				}
+
+				// Convert to string if we have a value
+				if totalUSD.Sign() > 0 {
+					usdStr := totalUSD.Text('f', 18)
+					amountUSD = &usdStr
+				}
+			}
+		}
+
+		// Add to batch arrays
+		ids = append(ids, swapID)
+		txHashes = append(txHashes, event.TxHash.Hex())
+		logIndexes = append(logIndexes, event.Index)
+		blockNumbers = append(blockNumbers, event.BlockNumber)
+		blockHashes = append(blockHashes, event.BlockHash.Hex())
+		timestamps = append(timestamps, blockTimestamp)
+		pairs = append(pairs, pairAddr)
+		senders = append(senders, strings.ToLower(sender.Hex()))
+		recipients = append(recipients, strings.ToLower(to.Hex()))
+		amount0Ins = append(amount0Ins, amount0In.String())
+		amount1Ins = append(amount1Ins, amount1In.String())
+		amount0Outs = append(amount0Outs, amount0Out.String())
+		amount1Outs = append(amount1Outs, amount1Out.String())
+		amountUSDs = append(amountUSDs, amountUSD)
+	}
+
+	// Bulk insert using UNNEST - much faster than individual INSERTs
+	query := `
+		INSERT INTO uniswap_v2_swaps (
+			id, transaction_hash, log_index, block_number, block_hash, timestamp,
+			pair, sender, recipient, amount0_in, amount1_in, amount0_out, amount1_out, amount_usd
+		)
+		SELECT * FROM UNNEST(
+			$1::TEXT[], $2::TEXT[], $3::INTEGER[], $4::BIGINT[], $5::TEXT[], $6::BIGINT[],
+			$7::TEXT[], $8::TEXT[], $9::TEXT[], $10::NUMERIC[], $11::NUMERIC[], $12::NUMERIC[], $13::NUMERIC[], $14::NUMERIC[]
+		) AS t(id, transaction_hash, log_index, block_number, block_hash, timestamp,
+				pair, sender, recipient, amount0_in, amount1_in, amount0_out, amount1_out, amount_usd)
+		ON CONFLICT (id) DO UPDATE SET
+			amount0_in = EXCLUDED.amount0_in,
+			amount1_in = EXCLUDED.amount1_in,
+			amount0_out = EXCLUDED.amount0_out,
+			amount1_out = EXCLUDED.amount1_out,
+			amount_usd = COALESCE(EXCLUDED.amount_usd, uniswap_v2_swaps.amount_usd)`
+
+	if duplicatesRemoved > 0 {
+		m.logger.Info().
+			Int("duplicates_removed", duplicatesRemoved).
+			Int("unique_swaps", len(ids)).
+			Msg("Removed duplicate swap events (Zilliqa issue)")
+	}
+
+	_, err := tx.Exec(ctx, query,
+		ids, txHashes, logIndexes, blockNumbers, blockHashes, timestamps,
+		pairs, senders, recipients, amount0Ins, amount1Ins, amount0Outs, amount1Outs, amountUSDs)
+
+	if err != nil {
+		return fmt.Errorf("failed to bulk insert swaps: %w", err)
+	}
+
+	m.logger.Debug().Int("swap_count", len(ids)).Msg("Bulk inserted swaps")
+	return nil
+}
+
+// batchHandleSyncs processes multiple Sync events using bulk insert
+func (m *UniswapV2Module) batchHandleSyncs(ctx context.Context, tx pgx.Tx, events []*types.Log) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Deduplicate syncs based on tx hash + sync values (Zilliqa duplicate event issue)
+	type syncKey struct {
+		txHash   string
+		pair     string
+		reserve0 string
+		reserve1 string
+	}
+
+	seenSyncs := make(map[syncKey]bool)
+	duplicatesRemoved := 0
+
+	// Prepare arrays for bulk insert
+	ids := make([]string, 0, len(events))
+	txHashes := make([]string, 0, len(events))
+	logIndexes := make([]uint, 0, len(events))
+	blockNumbers := make([]uint64, 0, len(events))
+	timestamps := make([]int64, 0, len(events))
+	pairs := make([]string, 0, len(events))
+	reserve0s := make([]string, 0, len(events))
+	reserve1s := make([]string, 0, len(events))
+
+	for _, event := range events {
+		syncID := fmt.Sprintf("%s-%d", event.TxHash.Hex(), event.Index)
+		pairAddr := strings.ToLower(event.Address.Hex())
+
+		// Parse reserves from data
+		if len(event.Data) < 64 {
+			m.logger.Warn().Str("tx_hash", event.TxHash.Hex()).Msg("Invalid Sync event data")
+			continue
+		}
+
+		reserve0 := new(big.Int).SetBytes(event.Data[0:32])
+		reserve1 := new(big.Int).SetBytes(event.Data[32:64])
+
+		// Create deduplication key
+		key := syncKey{
+			txHash:   event.TxHash.Hex(),
+			pair:     pairAddr,
+			reserve0: reserve0.String(),
+			reserve1: reserve1.String(),
+		}
+
+		// Skip if we've already seen this exact sync in the same transaction
+		if seenSyncs[key] {
+			duplicatesRemoved++
+			m.logger.Debug().
+				Str("tx_hash", event.TxHash.Hex()).
+				Uint("log_index", event.Index).
+				Msg("Skipping duplicate sync event (Zilliqa duplicate event issue)")
+			continue
+		}
+		seenSyncs[key] = true
+
+		// Add to batch arrays
+		ids = append(ids, syncID)
+		txHashes = append(txHashes, event.TxHash.Hex())
+		logIndexes = append(logIndexes, event.Index)
+		blockNumbers = append(blockNumbers, event.BlockNumber)
+		timestamps = append(timestamps, time.Now().Unix()) // TODO: Get actual block timestamp
+		pairs = append(pairs, pairAddr)
+		reserve0s = append(reserve0s, reserve0.String())
+		reserve1s = append(reserve1s, reserve1.String())
+	}
+
+	// Bulk insert using UNNEST
+	query := `
+		INSERT INTO uniswap_v2_syncs (
+			id, transaction_hash, log_index, block_number, timestamp,
+			pair, reserve0, reserve1
+		)
+		SELECT * FROM UNNEST(
+			$1::TEXT[], $2::TEXT[], $3::INTEGER[], $4::BIGINT[], $5::BIGINT[],
+			$6::TEXT[], $7::NUMERIC[], $8::NUMERIC[]
+		) AS t(id, transaction_hash, log_index, block_number, timestamp,
+				pair, reserve0, reserve1)
+		ON CONFLICT (id) DO UPDATE SET
+			reserve0 = EXCLUDED.reserve0,
+			reserve1 = EXCLUDED.reserve1`
+
+	if duplicatesRemoved > 0 {
+		m.logger.Info().
+			Int("duplicates_removed", duplicatesRemoved).
+			Int("unique_syncs", len(ids)).
+			Msg("Removed duplicate sync events (Zilliqa issue)")
+	}
+
+	_, err := tx.Exec(ctx, query,
+		ids, txHashes, logIndexes, blockNumbers, timestamps,
+		pairs, reserve0s, reserve1s)
+
+	if err != nil {
+		return fmt.Errorf("failed to bulk insert syncs: %w", err)
+	}
+
+	m.logger.Debug().Int("sync_count", len(ids)).Msg("Bulk inserted syncs")
+	return nil
+}
+
+// Placeholder implementations for other batch handlers
+func (m *UniswapV2Module) batchHandlePairCreated(ctx context.Context, tx pgx.Tx, events []*types.Log) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Process each PairCreated event individually since each needs token metadata fetching
+	// and database operations, but do it within the same transaction for atomicity
+	for _, event := range events {
+		// Parse the event using the same logic as handlePairCreated
+		parsedEvent, err := m.parser.ParseEvent(event)
+		if err != nil {
+			m.logger.Error().Err(err).Msg("Failed to parse PairCreated event in batch")
+			continue // Skip malformed events
+		}
+
+		// Extract event parameters
+		token0, ok := parsedEvent.Args["token0"].(common.Address)
+		if !ok {
+			m.logger.Error().Interface("args", parsedEvent.Args).Msg("Invalid token0 in PairCreated batch")
+			continue
+		}
+
+		token1, ok := parsedEvent.Args["token1"].(common.Address)
+		if !ok {
+			m.logger.Error().Interface("args", parsedEvent.Args).Msg("Invalid token1 in PairCreated batch")
+			continue
+		}
+
+		pair, ok := parsedEvent.Args["pair"].(common.Address)
+		if !ok {
+			m.logger.Error().Interface("args", parsedEvent.Args).Msg("Invalid pair in PairCreated batch")
+			continue
+		}
+
+		// Extract pair index
+		var pairIndex *big.Int
+		if val, ok := parsedEvent.Args["arg3"]; ok {
+			switch v := val.(type) {
+			case *big.Int:
+				pairIndex = v
+			case int64:
+				pairIndex = big.NewInt(v)
+			case float64:
+				pairIndex = big.NewInt(int64(v))
+			case int:
+				pairIndex = big.NewInt(int64(v))
+			default:
+				m.logger.Warn().Interface("val", val).Msg("Unexpected pair index type, using 0")
+				pairIndex = big.NewInt(0)
+			}
+		} else {
+			pairIndex = big.NewInt(0)
+		}
+
+		// Check for duplicate pairs
+		var exists bool
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM uniswap_v2_pairs WHERE address = $1)`,
+			strings.ToLower(pair.Hex())).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("failed to check pair existence: %w", err)
+		}
+		if exists {
+			m.logger.Debug().Str("pair", pair.Hex()).Msg("Pair already exists, skipping")
+			continue
+		}
+
+		// Fetch and ensure tokens exist (this may take time due to RPC calls)
+		if err := m.ensureToken(ctx, token0, parsedEvent.BlockNumber, m.getBlockTimestamp(ctx, parsedEvent.BlockNumber)); err != nil {
+			m.logger.Error().Err(err).Str("token", token0.Hex()).Msg("Failed to ensure token0 exists")
+			continue
+		}
+		if err := m.ensureToken(ctx, token1, parsedEvent.BlockNumber, m.getBlockTimestamp(ctx, parsedEvent.BlockNumber)); err != nil {
+			m.logger.Error().Err(err).Str("token", token1.Hex()).Msg("Failed to ensure token1 exists")
+			continue
+		}
+
+		// Insert the pair
+		_, err = tx.Exec(ctx, `
+			INSERT INTO uniswap_v2_pairs (
+				address, factory, token0, token1,
+				reserve0, reserve1, total_supply, reserve_usd,
+				volume_token0, volume_token1, volume_usd,
+				txn_count, created_at_timestamp, created_at_block
+			) VALUES ($1, $2, $3, $4, 0, 0, 0, 0, 0, 0, 0, 0, $5, $6)
+			ON CONFLICT (address) DO NOTHING`,
+			strings.ToLower(pair.Hex()),
+			strings.ToLower(m.factoryAddress.Hex()),
+			strings.ToLower(token0.Hex()),
+			strings.ToLower(token1.Hex()),
+			m.getBlockTimestamp(ctx, parsedEvent.BlockNumber),
+			parsedEvent.BlockNumber,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert pair: %w", err)
+		}
+
+		// Update factory pair count
+		_, err = tx.Exec(ctx, `
+			UPDATE uniswap_v2_factory
+			SET pair_count = pair_count + 1, updated_at = NOW()
+			WHERE address = $1`,
+			strings.ToLower(m.factoryAddress.Hex()))
+		if err != nil {
+			m.logger.Warn().Err(err).Msg("Failed to update factory pair count")
+		}
+
+		m.logger.Info().
+			Str("pair", pair.Hex()).
+			Str("token0", token0.Hex()).
+			Str("token1", token1.Hex()).
+			Str("pair_index", pairIndex.String()).
+			Msg("Pair created in batch")
+	}
+
+	return nil
+}
+
+func (m *UniswapV2Module) batchHandleMints(ctx context.Context, tx pgx.Tx, events []*types.Log) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Process each Mint event - they need to update existing "pending" mint rows
+	// created by Transfer events (from == 0x0)
+	for _, event := range events {
+		// Extract indexed sender from topics
+		var sender common.Address
+		if len(event.Topics) >= 2 {
+			sender = common.BytesToAddress(event.Topics[1].Bytes())
+		} else {
+			m.logger.Error().Msg("Insufficient topics for Mint event")
+			continue
+		}
+
+		// Parse amounts from data field
+		if len(event.Data) < 64 {
+			m.logger.Error().Msg("Insufficient data for Mint event")
+			continue
+		}
+
+		amount0 := new(big.Int).SetBytes(event.Data[0:32])
+		amount1 := new(big.Int).SetBytes(event.Data[32:64])
+
+		// Check for duplicates first
+		var exists int
+		_ = tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM uniswap_v2_mints
+			WHERE transaction_hash=$1 AND pair=$2 AND sender=$3 AND amount0=$4 AND amount1=$5`,
+			event.TxHash.Hex(), strings.ToLower(event.Address.Hex()),
+			strings.ToLower(sender.Hex()), amount0.String(), amount1.String()).Scan(&exists)
+
+		if exists > 0 {
+			m.logger.Debug().Str("pair", event.Address.Hex()).Msg("Duplicate Mint event skipped in batch")
+			continue
+		}
+
+		// Calculate USD value if price router is available
+		var amountUSD *string
+		blockTimestamp := m.getBlockTimestamp(ctx, event.BlockNumber)
+		if m.priceRouter != nil && blockTimestamp > 0 {
+			// Get token addresses for the pair
+			var token0, token1 string
+			err := tx.QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v2_pairs WHERE address = $1`,
+				strings.ToLower(event.Address.Hex())).Scan(&token0, &token1)
+			if err == nil {
+				// Get token decimals
+				var decimals0, decimals1 int
+				_ = tx.QueryRow(ctx, `SELECT COALESCE(decimals, 18) FROM tokens WHERE address = $1`, token0).Scan(&decimals0)
+				_ = tx.QueryRow(ctx, `SELECT COALESCE(decimals, 18) FROM tokens WHERE address = $1`, token1).Scan(&decimals1)
+				if decimals0 == 0 { decimals0 = 18 }
+				if decimals1 == 0 { decimals1 = 18 }
+
+				// Try to get USD prices for both tokens
+				ts := time.Unix(blockTimestamp, 0)
+				price0, ok0 := m.priceRouter.PriceTokenUSD(ctx, token0, ts)
+				price1, ok1 := m.priceRouter.PriceTokenUSD(ctx, token1, ts)
+
+				// Calculate total USD value
+				totalUSD := big.NewFloat(0)
+
+				if ok0 && amount0.Sign() > 0 {
+					divisor0 := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals0)), nil))
+					priceFloat0, _ := new(big.Float).SetString(price0)
+					amount0Float := new(big.Float).SetInt(amount0)
+					amount0Float.Quo(amount0Float, divisor0)
+					amount0Float.Mul(amount0Float, priceFloat0)
+					totalUSD.Add(totalUSD, amount0Float)
+				}
+
+				if ok1 && amount1.Sign() > 0 {
+					divisor1 := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals1)), nil))
+					priceFloat1, _ := new(big.Float).SetString(price1)
+					amount1Float := new(big.Float).SetInt(amount1)
+					amount1Float.Quo(amount1Float, divisor1)
+					amount1Float.Mul(amount1Float, priceFloat1)
+					totalUSD.Add(totalUSD, amount1Float)
+				}
+
+				// Convert to string if we have a value
+				if totalUSD.Sign() > 0 {
+					usdStr := totalUSD.Text('f', 18)
+					amountUSD = &usdStr
+				}
+			}
+		}
+
+		// Try to complete a pending mint row (created by Transfer event)
+		ct, err := tx.Exec(ctx, `
+			UPDATE uniswap_v2_mints m
+			SET sender = $3, amount0 = $4, amount1 = $5, amount_usd = COALESCE($7::numeric, amount_usd)
+			WHERE m.ctid IN (
+				SELECT ctid FROM uniswap_v2_mints
+				WHERE transaction_hash = $1 AND pair = $2 AND amount0 = '0' AND amount1 = '0' AND to_address <> $6
+				ORDER BY log_index ASC
+				LIMIT 1
+			)`,
+			event.TxHash.Hex(), strings.ToLower(event.Address.Hex()),
+			strings.ToLower(sender.Hex()), amount0.String(), amount1.String(),
+			strings.ToLower(common.Address{}.Hex()), amountUSD)
+
+		if err != nil {
+			m.logger.Error().Err(err).Str("pair", event.Address.Hex()).Msg("Mint update failed in batch")
+			continue
+		}
+
+		if ct.RowsAffected() == 0 {
+			m.logger.Debug().Str("pair", event.Address.Hex()).Msg("No pending mint to complete in batch; skipping")
+		} else {
+			m.logger.Debug().
+				Str("pair", event.Address.Hex()).
+				Str("sender", sender.Hex()).
+				Str("amount0", amount0.String()).
+				Str("amount1", amount1.String()).
+				Msg("Mint processed in batch")
+		}
+	}
+
+	return nil
+}
+
+func (m *UniswapV2Module) batchHandleTransfers(ctx context.Context, tx pgx.Tx, events []*types.Log) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Process Transfer events - these create pending mints and handle burns
+	for _, event := range events {
+		// Extract indexed parameters from topics
+		var from, to common.Address
+		if len(event.Topics) >= 3 {
+			from = common.BytesToAddress(event.Topics[1].Bytes())
+			to = common.BytesToAddress(event.Topics[2].Bytes())
+		} else {
+			continue // Skip if not enough topics
+		}
+
+		// Parse value from data field
+		if len(event.Data) < 32 {
+			continue // Skip if not enough data
+		}
+
+		value := new(big.Int).SetBytes(event.Data[0:32])
+		zero := common.Address{}
+
+		// Only process transfers from known pair contracts
+		var isPair bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM uniswap_v2_pairs WHERE address = $1)`,
+			strings.ToLower(event.Address.Hex())).Scan(&isPair); err != nil || !isPair {
+			continue
+		}
+
+		ts := m.getBlockTimestamp(ctx, event.BlockNumber)
+
+		// Mint start: LP tokens minted (from == zero)
+		if from == zero {
+			// Ignore the initial minimum liquidity lock (to == zero, value == 1000)
+			if to == zero && value.Cmp(big.NewInt(1000)) == 0 {
+				// Still update total_supply
+				_, _ = tx.Exec(ctx, `
+					UPDATE uniswap_v2_pairs
+					SET total_supply = COALESCE(total_supply,0) + $2::numeric, updated_at = NOW()
+					WHERE address = $1`, strings.ToLower(event.Address.Hex()), value.String())
+				continue
+			}
+
+			// Check for duplicates
+			var dup int
+			_ = tx.QueryRow(ctx, `
+				SELECT COUNT(*) FROM uniswap_v2_mints
+				WHERE transaction_hash=$1 AND pair=$2 AND to_address=$3 AND liquidity=$4 AND block_number=$5`,
+				event.TxHash.Hex(), strings.ToLower(event.Address.Hex()),
+				strings.ToLower(to.Hex()), value.String(), event.BlockNumber).Scan(&dup)
+
+			if dup == 0 {
+				_, _ = tx.Exec(ctx, `
+					INSERT INTO uniswap_v2_mints (
+						id, transaction_hash, log_index, block_number, timestamp,
+						pair, to_address, sender, amount0, amount1, liquidity
+					) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+					ON CONFLICT (id) DO NOTHING`,
+					fmt.Sprintf("%s-%d", event.TxHash.Hex(), event.Index),
+					event.TxHash.Hex(), event.Index, event.BlockNumber, ts,
+					strings.ToLower(event.Address.Hex()), strings.ToLower(to.Hex()),
+					strings.ToLower(zero.Hex()), "0", "0", value.String())
+
+				// Update pair total_supply
+				_, _ = tx.Exec(ctx, `
+					UPDATE uniswap_v2_pairs
+					SET total_supply = COALESCE(total_supply,0) + $2::numeric, updated_at = NOW()
+					WHERE address = $1`, strings.ToLower(event.Address.Hex()), value.String())
+
+				m.logger.Debug().
+					Str("pair", event.Address.Hex()).
+					Str("to", to.Hex()).
+					Str("value", value.String()).
+					Msg("LP mint transfer recorded in batch")
+			}
+		}
+
+		// Burn start: LP tokens burned (to == zero)
+		if to == zero && from != zero {
+			// Check for duplicates
+			var dup int
+			_ = tx.QueryRow(ctx, `
+				SELECT COUNT(*) FROM uniswap_v2_burns
+				WHERE transaction_hash=$1 AND pair=$2 AND sender=$3 AND liquidity=$4`,
+				event.TxHash.Hex(), strings.ToLower(event.Address.Hex()),
+				strings.ToLower(from.Hex()), value.String()).Scan(&dup)
+
+			if dup == 0 {
+				_, _ = tx.Exec(ctx, `
+					INSERT INTO uniswap_v2_burns (
+						id, transaction_hash, log_index, block_number, timestamp,
+						pair, sender, to_address, amount0, amount1, liquidity
+					) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+					ON CONFLICT (id) DO NOTHING`,
+					fmt.Sprintf("%s-%d-burn", event.TxHash.Hex(), event.Index),
+					event.TxHash.Hex(), event.Index, event.BlockNumber, ts,
+					strings.ToLower(event.Address.Hex()), strings.ToLower(from.Hex()),
+					strings.ToLower(zero.Hex()), "0", "0", value.String())
+
+				// Update pair total_supply
+				_, _ = tx.Exec(ctx, `
+					UPDATE uniswap_v2_pairs
+					SET total_supply = GREATEST(0, COALESCE(total_supply,0) - $2::numeric), updated_at = NOW()
+					WHERE address = $1`, strings.ToLower(event.Address.Hex()), value.String())
+
+				m.logger.Debug().
+					Str("pair", event.Address.Hex()).
+					Str("from", from.Hex()).
+					Str("value", value.String()).
+					Msg("LP burn transfer recorded in batch")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *UniswapV2Module) batchHandleBurns(ctx context.Context, tx pgx.Tx, events []*types.Log) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Process each Burn event - similar to Mints but for liquidity removal
+	for _, event := range events {
+		// Extract indexed sender and to from topics
+		var sender, to common.Address
+		if len(event.Topics) >= 3 {
+			sender = common.BytesToAddress(event.Topics[1].Bytes())
+			to = common.BytesToAddress(event.Topics[2].Bytes())
+		} else {
+			m.logger.Error().Msg("Insufficient topics for Burn event")
+			continue
+		}
+
+		// Parse amounts from data field
+		if len(event.Data) < 64 {
+			m.logger.Error().Msg("Insufficient data for Burn event")
+			continue
+		}
+
+		amount0 := new(big.Int).SetBytes(event.Data[0:32])
+		amount1 := new(big.Int).SetBytes(event.Data[32:64])
+
+		// Get block timestamp
+		ts := m.getBlockTimestamp(ctx, event.BlockNumber)
+
+		// Check for duplicates first
+		var exists int
+		_ = tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM uniswap_v2_burns
+			WHERE transaction_hash=$1 AND pair=$2 AND sender=$3 AND to_address=$4 AND amount0=$5 AND amount1=$6`,
+			event.TxHash.Hex(), strings.ToLower(event.Address.Hex()),
+			strings.ToLower(sender.Hex()), strings.ToLower(to.Hex()),
+			amount0.String(), amount1.String()).Scan(&exists)
+
+		if exists > 0 {
+			m.logger.Debug().Str("pair", event.Address.Hex()).Msg("Duplicate Burn event skipped in batch")
+			continue
+		}
+
+		// Calculate USD value if price router is available
+		var amountUSD string = "0"
+		if m.priceRouter != nil && ts > 0 {
+			// Get token addresses for the pair
+			var token0, token1 string
+			err := tx.QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v2_pairs WHERE address = $1`,
+				strings.ToLower(event.Address.Hex())).Scan(&token0, &token1)
+			if err == nil {
+				// Get token decimals
+				var decimals0, decimals1 int
+				_ = tx.QueryRow(ctx, `SELECT COALESCE(decimals, 18) FROM tokens WHERE address = $1`, token0).Scan(&decimals0)
+				_ = tx.QueryRow(ctx, `SELECT COALESCE(decimals, 18) FROM tokens WHERE address = $1`, token1).Scan(&decimals1)
+				if decimals0 == 0 { decimals0 = 18 }
+				if decimals1 == 0 { decimals1 = 18 }
+
+				// Try to get USD prices for both tokens
+				tsTime := time.Unix(ts, 0)
+				price0, ok0 := m.priceRouter.PriceTokenUSD(ctx, token0, tsTime)
+				price1, ok1 := m.priceRouter.PriceTokenUSD(ctx, token1, tsTime)
+
+				// Calculate total USD value
+				totalUSD := big.NewFloat(0)
+
+				if ok0 && amount0.Sign() > 0 {
+					divisor0 := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals0)), nil))
+					priceFloat0, _ := new(big.Float).SetString(price0)
+					amount0Float := new(big.Float).SetInt(amount0)
+					amount0Float.Quo(amount0Float, divisor0)
+					amount0Float.Mul(amount0Float, priceFloat0)
+					totalUSD.Add(totalUSD, amount0Float)
+				}
+
+				if ok1 && amount1.Sign() > 0 {
+					divisor1 := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals1)), nil))
+					priceFloat1, _ := new(big.Float).SetString(price1)
+					amount1Float := new(big.Float).SetInt(amount1)
+					amount1Float.Quo(amount1Float, divisor1)
+					amount1Float.Mul(amount1Float, priceFloat1)
+					totalUSD.Add(totalUSD, amount1Float)
+				}
+
+				// Convert to string
+				if totalUSD.Sign() > 0 {
+					amountUSD = totalUSD.Text('f', 18)
+				}
+			}
+		}
+
+		// Insert burn record directly (Burns don't need pending records like Mints)
+		_, err := tx.Exec(ctx, `
+			INSERT INTO uniswap_v2_burns (
+				id, transaction_hash, log_index, block_number, timestamp,
+				pair, sender, to_address, amount0, amount1, liquidity, amount_usd
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '0', $11)
+			ON CONFLICT (id) DO NOTHING`,
+			fmt.Sprintf("%s-%d", event.TxHash.Hex(), event.Index),
+			event.TxHash.Hex(),
+			event.Index,
+			event.BlockNumber,
+			ts,
+			strings.ToLower(event.Address.Hex()),
+			strings.ToLower(sender.Hex()),
+			strings.ToLower(to.Hex()),
+			amount0.String(),
+			amount1.String(),
+			amountUSD,
+		)
+
+		if err != nil {
+			m.logger.Error().Err(err).Str("pair", event.Address.Hex()).Msg("Burn insert failed in batch")
+			continue
+		}
+
+		m.logger.Debug().
+			Str("pair", event.Address.Hex()).
+			Str("sender", sender.Hex()).
+			Str("to", to.Hex()).
+			Str("amount0", amount0.String()).
+			Str("amount1", amount1.String()).
+			Msg("Burn processed in batch")
+	}
+
+	return nil
 }
 
