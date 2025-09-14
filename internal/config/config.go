@@ -1,10 +1,11 @@
 package config
 
 import (
-	"fmt"
-	"time"
+    "fmt"
+    "time"
+    "strings"
 
-	"github.com/spf13/viper"
+    "github.com/spf13/viper"
 )
 
 type Config struct {
@@ -53,9 +54,11 @@ type LoggingConfig struct {
 }
 
 func Load(configPath string) (*Config, error) {
-	viper.SetConfigFile(configPath)
-	viper.SetEnvPrefix("INDEXER")
-	viper.AutomaticEnv()
+    viper.SetConfigFile(configPath)
+    viper.SetEnvPrefix("INDEXER")
+    // Allow env vars like INDEXER_DATABASE_HOST to override database.host
+    viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+    viper.AutomaticEnv()
 
 	// Set defaults
 	viper.SetDefault("server.port", 8080)

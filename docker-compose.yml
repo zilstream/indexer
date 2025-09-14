@@ -1,37 +1,19 @@
 version: '3.8'
 
 services:
-  postgres:
-    image: postgres:15-alpine
-    container_name: zilstream-postgres
+  indexer:
+    image: zilstream-indexer:latest
+    build: .
+    platform: linux/amd64
+    container_name: zilstream-indexer
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: zilstream
-    ports:
-      - "5432:5432"
+      # Use host DB instead of a containerized one
+      INDEXER_DATABASE_HOST: host.docker.internal
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./internal/database/migrations:/docker-entrypoint-initdb.d
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # Uncomment to run the indexer in Docker
-  # indexer:
-  #   build: .
-  #   container_name: zilstream-indexer
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #   environment:
-  #     INDEXER_DATABASE_HOST: postgres
-  #     INDEXER_DATABASE_PASSWORD: postgres
-  #   volumes:
-  #     - ./config.yaml:/app/config.yaml
-  #   restart: unless-stopped
-
-volumes:
-  postgres_data:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./manifests:/app/manifests:ro
+    ports:
+      - "9090:9090"  # health + status (indexer only)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

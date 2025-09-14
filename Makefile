@@ -138,10 +138,10 @@ docker-build:
 	@docker build -t $(DOCKER_IMAGE):$(VERSION) .
 	@docker tag $(DOCKER_IMAGE):$(VERSION) $(DOCKER_IMAGE):latest
 
-## docker-run: Run with Docker Compose
+## docker-run: Build image and start via Docker Compose
 docker-run:
-	@echo "Starting with Docker Compose..."
-	@docker-compose up -d
+	@echo "Starting with Docker Compose (build if needed)..."
+	@docker-compose up -d --build
 
 ## docker-stop: Stop Docker Compose
 docker-stop:
