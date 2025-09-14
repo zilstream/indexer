@@ -113,44 +113,71 @@ func (w *BulkWriter) WriteBatchBulk(
 	return nil
 }
 
-// bulkInsertBlocks uses COPY to insert blocks in bulk
+// bulkInsertBlocks uses UNNEST arrays for high-performance bulk inserts
 func (w *BulkWriter) bulkInsertBlocks(ctx context.Context, tx pgx.Tx, blocks []*Block) error {
 	if len(blocks) == 0 {
 		return nil
 	}
 
-	// Create a temporary table first (for upsert behavior)
-	_, err := tx.Exec(ctx, `
-		CREATE TEMPORARY TABLE temp_blocks (
-			number BIGINT,
-			hash TEXT,
-			parent_hash TEXT,
-			timestamp BIGINT,
-			gas_limit BIGINT,
-			gas_used BIGINT,
-			base_fee_per_gas NUMERIC,
-			transaction_count INTEGER,
-			created_at TIMESTAMPTZ
-		) ON COMMIT DROP
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create temp blocks table: %w", err)
+	// For very large batches, use COPY approach for best performance
+	if len(blocks) > 1000 {
+		return w.bulkInsertBlocksCopy(ctx, tx, blocks)
 	}
 
-	// Use COPY to insert into temp table
+	// For smaller batches, use UNNEST for better performance than temp tables
+	return w.bulkInsertBlocksUnnest(ctx, tx, blocks)
+}
+
+// bulkInsertBlocksCopy uses COPY method for very large batches
+func (w *BulkWriter) bulkInsertBlocksCopy(ctx context.Context, tx pgx.Tx, blocks []*Block) error {
+	// Use the existing COPY-based approach for very large batches
 	copySource := &blockCopySource{blocks: blocks}
-	_, err = tx.CopyFrom(ctx, pgx.Identifier{"temp_blocks"}, 
+
+	// Direct COPY to main table with conflict handling via prepared statement
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"blocks"},
 		[]string{"number", "hash", "parent_hash", "timestamp", "gas_limit", "gas_used", "base_fee_per_gas", "transaction_count", "created_at"},
 		copySource)
+
 	if err != nil {
-		return fmt.Errorf("failed to copy blocks: %w", err)
+		// Fallback to UNNEST method if COPY fails due to conflicts
+		return w.bulkInsertBlocksUnnest(ctx, tx, blocks)
 	}
 
-	// Insert from temp table with conflict handling
-	_, err = tx.Exec(ctx, `
+	return nil
+}
+
+// bulkInsertBlocksUnnest uses UNNEST arrays for medium-sized batches
+func (w *BulkWriter) bulkInsertBlocksUnnest(ctx context.Context, tx pgx.Tx, blocks []*Block) error {
+	// Prepare data arrays
+	numbers := make([]int64, len(blocks))
+	hashes := make([]string, len(blocks))
+	parentHashes := make([]string, len(blocks))
+	timestamps := make([]int64, len(blocks))
+	gasLimits := make([]int64, len(blocks))
+	gasUseds := make([]int64, len(blocks))
+	baseFees := make([]interface{}, len(blocks))
+	txCounts := make([]int32, len(blocks))
+	createdAts := make([]time.Time, len(blocks))
+
+	for i, block := range blocks {
+		numbers[i] = int64(block.Number)
+		hashes[i] = block.Hash
+		parentHashes[i] = block.ParentHash
+		timestamps[i] = block.Timestamp
+		gasLimits[i] = int64(block.GasLimit)
+		gasUseds[i] = int64(block.GasUsed)
+		if block.BaseFeePerGas != nil {
+			baseFees[i] = block.BaseFeePerGas.String()
+		} else {
+			baseFees[i] = nil
+		}
+		txCounts[i] = int32(block.TransactionCount)
+		createdAts[i] = block.CreatedAt
+	}
+
+	query := `
 		INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_limit, gas_used, base_fee_per_gas, transaction_count, created_at)
-		SELECT number, hash, parent_hash, timestamp, gas_limit, gas_used, base_fee_per_gas, transaction_count, created_at
-		FROM temp_blocks
+		SELECT * FROM UNNEST($1::BIGINT[], $2::TEXT[], $3::TEXT[], $4::BIGINT[], $5::BIGINT[], $6::BIGINT[], $7::NUMERIC[], $8::INTEGER[], $9::TIMESTAMPTZ[])
 		ON CONFLICT (number) DO UPDATE SET
 			hash = EXCLUDED.hash,
 			parent_hash = EXCLUDED.parent_hash,
@@ -158,114 +185,188 @@ func (w *BulkWriter) bulkInsertBlocks(ctx context.Context, tx pgx.Tx, blocks []*
 			gas_limit = EXCLUDED.gas_limit,
 			gas_used = EXCLUDED.gas_used,
 			base_fee_per_gas = EXCLUDED.base_fee_per_gas,
-			transaction_count = EXCLUDED.transaction_count
-	`)
+			transaction_count = EXCLUDED.transaction_count`
+
+	_, err := tx.Exec(ctx, query, numbers, hashes, parentHashes, timestamps, gasLimits, gasUseds, baseFees, txCounts, createdAts)
 	if err != nil {
-		return fmt.Errorf("failed to upsert blocks from temp table: %w", err)
+		return fmt.Errorf("failed to bulk insert blocks using UNNEST: %w", err)
 	}
 
 	return nil
 }
 
-// bulkInsertTransactions uses COPY to insert transactions in bulk
+// bulkInsertTransactions uses optimized bulk insert methods
 func (w *BulkWriter) bulkInsertTransactions(ctx context.Context, tx pgx.Tx, transactions []*Transaction) error {
 	if len(transactions) == 0 {
 		return nil
 	}
 
-	// Create temporary table
-	_, err := tx.Exec(ctx, `
-		CREATE TEMPORARY TABLE temp_transactions (
-			hash TEXT,
-			block_number BIGINT,
-			transaction_index INTEGER,
-			from_address TEXT,
-			to_address TEXT,
-			value NUMERIC,
-			gas_limit BIGINT,
-			gas_price NUMERIC,
-			gas_used BIGINT,
-			nonce BIGINT,
-			input TEXT,
-			transaction_type INTEGER,
-			status INTEGER,
-			created_at TIMESTAMPTZ
-		) ON COMMIT DROP
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create temp transactions table: %w", err)
+	// For very large batches, use COPY approach for best performance
+	if len(transactions) > 2000 {
+		return w.bulkInsertTransactionsCopy(ctx, tx, transactions)
 	}
 
-	// Use COPY to insert into temp table
+	// For smaller batches, use UNNEST for better performance than temp tables
+	return w.bulkInsertTransactionsUnnest(ctx, tx, transactions)
+}
+
+// bulkInsertTransactionsCopy uses COPY method for very large transaction batches
+func (w *BulkWriter) bulkInsertTransactionsCopy(ctx context.Context, tx pgx.Tx, transactions []*Transaction) error {
 	copySource := &transactionCopySource{transactions: transactions}
-	_, err = tx.CopyFrom(ctx, pgx.Identifier{"temp_transactions"},
+
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"transactions"},
 		[]string{"hash", "block_number", "transaction_index", "from_address", "to_address", "value", "gas_limit", "gas_price", "gas_used", "nonce", "input", "transaction_type", "status", "created_at"},
 		copySource)
-	if err != nil {
-		return fmt.Errorf("failed to copy transactions: %w", err)
-	}
 
-	// Insert from temp table with conflict handling
-	_, err = tx.Exec(ctx, `
-		INSERT INTO transactions (hash, block_number, transaction_index, from_address, to_address, value, gas_limit, gas_price, gas_used, nonce, input, transaction_type, status, created_at)
-		SELECT hash, block_number, transaction_index, from_address, to_address, value, gas_limit, gas_price, gas_used, nonce, input, transaction_type, status, created_at
-		FROM temp_transactions
-		ON CONFLICT (hash) DO UPDATE SET
-			block_number = EXCLUDED.block_number,
-			transaction_index = EXCLUDED.transaction_index
-	`)
 	if err != nil {
-		return fmt.Errorf("failed to upsert transactions from temp table: %w", err)
+		// Fallback to UNNEST method if COPY fails due to conflicts
+		return w.bulkInsertTransactionsUnnest(ctx, tx, transactions)
 	}
 
 	return nil
 }
 
-// bulkInsertEventLogs uses COPY to insert event logs in bulk
+// bulkInsertTransactionsUnnest uses UNNEST arrays for medium-sized transaction batches
+func (w *BulkWriter) bulkInsertTransactionsUnnest(ctx context.Context, tx pgx.Tx, transactions []*Transaction) error {
+	// Prepare data arrays
+	hashes := make([]string, len(transactions))
+	blockNumbers := make([]int64, len(transactions))
+	txIndexes := make([]int32, len(transactions))
+	fromAddrs := make([]string, len(transactions))
+	toAddrs := make([]interface{}, len(transactions))
+	values := make([]interface{}, len(transactions))
+	gasLimits := make([]int64, len(transactions))
+	gasPrices := make([]interface{}, len(transactions))
+	gasUseds := make([]int64, len(transactions))
+	nonces := make([]int64, len(transactions))
+	inputs := make([]string, len(transactions))
+	txTypes := make([]int32, len(transactions))
+	statuses := make([]int32, len(transactions))
+	createdAts := make([]time.Time, len(transactions))
+
+	for i, txn := range transactions {
+		hashes[i] = txn.Hash
+		blockNumbers[i] = int64(txn.BlockNumber)
+		txIndexes[i] = int32(txn.TransactionIndex)
+		fromAddrs[i] = txn.FromAddress
+		if txn.ToAddress != nil {
+			toAddrs[i] = *txn.ToAddress
+		} else {
+			toAddrs[i] = nil
+		}
+		if txn.Value != nil {
+			values[i] = txn.Value.String()
+		} else {
+			values[i] = nil
+		}
+		gasLimits[i] = int64(txn.GasLimit)
+		if txn.GasPrice != nil {
+			gasPrices[i] = txn.GasPrice.String()
+		} else {
+			gasPrices[i] = nil
+		}
+		gasUseds[i] = int64(txn.GasUsed)
+		nonces[i] = int64(txn.Nonce)
+		inputs[i] = txn.Input
+		txTypes[i] = int32(txn.TransactionType)
+		statuses[i] = int32(txn.Status)
+		createdAts[i] = txn.CreatedAt
+	}
+
+	query := `
+		INSERT INTO transactions (hash, block_number, transaction_index, from_address, to_address, value, gas_limit, gas_price, gas_used, nonce, input, transaction_type, status, created_at)
+		SELECT * FROM UNNEST($1::TEXT[], $2::BIGINT[], $3::INTEGER[], $4::TEXT[], $5::TEXT[], $6::NUMERIC[], $7::BIGINT[], $8::NUMERIC[], $9::BIGINT[], $10::BIGINT[], $11::TEXT[], $12::INTEGER[], $13::INTEGER[], $14::TIMESTAMPTZ[])
+		ON CONFLICT (hash) DO UPDATE SET
+			block_number = EXCLUDED.block_number,
+			transaction_index = EXCLUDED.transaction_index`
+
+	_, err := tx.Exec(ctx, query, hashes, blockNumbers, txIndexes, fromAddrs, toAddrs, values, gasLimits, gasPrices, gasUseds, nonces, inputs, txTypes, statuses, createdAts)
+	if err != nil {
+		return fmt.Errorf("failed to bulk insert transactions using UNNEST: %w", err)
+	}
+
+	return nil
+}
+
+// bulkInsertEventLogs uses optimized bulk insert methods
 func (w *BulkWriter) bulkInsertEventLogs(ctx context.Context, tx pgx.Tx, eventLogs []*EventLog) error {
 	if len(eventLogs) == 0 {
 		return nil
 	}
 
-	// Create temporary table
-	_, err := tx.Exec(ctx, `
-		CREATE TEMPORARY TABLE temp_event_logs (
-			block_number BIGINT,
-			block_hash TEXT,
-			transaction_hash TEXT,
-			transaction_index INTEGER,
-			log_index INTEGER,
-			address TEXT,
-			topics JSONB,
-			data TEXT,
-			removed BOOLEAN,
-			created_at TIMESTAMPTZ
-		) ON COMMIT DROP
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create temp event_logs table: %w", err)
+	// For very large batches, use COPY approach for best performance
+	if len(eventLogs) > 5000 {
+		return w.bulkInsertEventLogsCopy(ctx, tx, eventLogs)
 	}
 
-	// Use COPY to insert into temp table
+	// For smaller batches, use UNNEST for better performance than temp tables
+	return w.bulkInsertEventLogsUnnest(ctx, tx, eventLogs)
+}
+
+// bulkInsertEventLogsCopy uses COPY method for very large event log batches
+func (w *BulkWriter) bulkInsertEventLogsCopy(ctx context.Context, tx pgx.Tx, eventLogs []*EventLog) error {
 	copySource := &eventLogCopySource{eventLogs: eventLogs}
-	_, err = tx.CopyFrom(ctx, pgx.Identifier{"temp_event_logs"},
+
+	_, err := tx.CopyFrom(ctx, pgx.Identifier{"event_logs"},
 		[]string{"block_number", "block_hash", "transaction_hash", "transaction_index", "log_index", "address", "topics", "data", "removed", "created_at"},
 		copySource)
+
 	if err != nil {
-		return fmt.Errorf("failed to copy event logs: %w", err)
+		// Fallback to UNNEST method if COPY fails due to conflicts
+		return w.bulkInsertEventLogsUnnest(ctx, tx, eventLogs)
 	}
 
-	// Insert from temp table with conflict handling
-	_, err = tx.Exec(ctx, `
+	return nil
+}
+
+// bulkInsertEventLogsUnnest uses UNNEST arrays for medium-sized event log batches
+func (w *BulkWriter) bulkInsertEventLogsUnnest(ctx context.Context, tx pgx.Tx, eventLogs []*EventLog) error {
+	// Prepare data arrays
+	blockNumbers := make([]int64, len(eventLogs))
+	blockHashes := make([]string, len(eventLogs))
+	txHashes := make([]string, len(eventLogs))
+	txIndexes := make([]int32, len(eventLogs))
+	logIndexes := make([]int32, len(eventLogs))
+	addresses := make([]string, len(eventLogs))
+	topics := make([]interface{}, len(eventLogs))
+	data := make([]string, len(eventLogs))
+	removed := make([]bool, len(eventLogs))
+	createdAts := make([]time.Time, len(eventLogs))
+
+	for i, log := range eventLogs {
+		blockNumbers[i] = int64(log.BlockNumber)
+		blockHashes[i] = log.BlockHash
+		txHashes[i] = log.TransactionHash
+		txIndexes[i] = int32(log.TransactionIndex)
+		logIndexes[i] = int32(log.LogIndex)
+		addresses[i] = log.Address
+
+		// Convert topics to JSON string for JSONB
+		if log.Topics != nil {
+			topicsBytes, err := json.Marshal(log.Topics)
+			if err != nil {
+				return fmt.Errorf("failed to marshal topics to JSON: %w", err)
+			}
+			topics[i] = string(topicsBytes)
+		} else {
+			topics[i] = "[]" // Empty JSON array
+		}
+
+		data[i] = log.Data
+		removed[i] = log.Removed
+		createdAts[i] = log.CreatedAt
+	}
+
+	query := `
 		INSERT INTO event_logs (block_number, block_hash, transaction_hash, transaction_index, log_index, address, topics, data, removed, created_at)
-		SELECT block_number, block_hash, transaction_hash, transaction_index, log_index, address, topics, data, removed, created_at
-		FROM temp_event_logs
+		SELECT * FROM UNNEST($1::BIGINT[], $2::TEXT[], $3::TEXT[], $4::INTEGER[], $5::INTEGER[], $6::TEXT[], $7::JSONB[], $8::TEXT[], $9::BOOLEAN[], $10::TIMESTAMPTZ[])
 		ON CONFLICT (block_number, transaction_index, log_index) DO UPDATE SET
 			block_hash = EXCLUDED.block_hash,
-			transaction_hash = EXCLUDED.transaction_hash
-	`)
+			transaction_hash = EXCLUDED.transaction_hash`
+
+	_, err := tx.Exec(ctx, query, blockNumbers, blockHashes, txHashes, txIndexes, logIndexes, addresses, topics, data, removed, createdAts)
 	if err != nil {
-		return fmt.Errorf("failed to upsert event logs from temp table: %w", err)
+		return fmt.Errorf("failed to bulk insert event logs using UNNEST: %w", err)
 	}
 
 	return nil

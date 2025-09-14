@@ -220,6 +220,8 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 		return nil
 	}
 
+	pairAddr := strings.ToLower(event.Address.Hex())
+
 	// Insert swap record
 	query := `
 		INSERT INTO uniswap_v2_swaps (
@@ -239,7 +241,7 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 		event.BlockNumber,
 		event.BlockHash.Hex(),
 		event.Timestamp.Int64(),
-		strings.ToLower(event.Address.Hex()), // pair address
+		pairAddr, // pair address
 		strings.ToLower(sender.Hex()),
 		strings.ToLower(to.Hex()),
 		amount0In.String(),
@@ -403,7 +405,9 @@ func handleSync(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 	
 	// Create sync record ID
 	syncID := fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex)
-	
+
+	pairAddr := strings.ToLower(event.Address.Hex())
+
 	// Insert sync record
 	query := `
 		INSERT INTO uniswap_v2_syncs (
@@ -420,7 +424,7 @@ func handleSync(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 		event.LogIndex,
 		event.BlockNumber,
 		event.Timestamp.Int64(),
-		strings.ToLower(event.Address.Hex()), // pair address
+		pairAddr, // pair address
 		reserve0.String(),
 		reserve1.String(),
 	)
@@ -591,11 +595,12 @@ func pow10Float(n int) float64 {
 
 // handleMint processes Mint events (liquidity additions)
 func handleMint(ctx context.Context, module *UniswapV2Module, event *core.ParsedEvent) error {
+
 	// For Mint events:
 	// topics[0] = event signature
 	// topics[1] = indexed sender address
 	// data contains: amount0, amount1
-	
+
 	// Extract indexed sender from topics
 	var sender common.Address
 	if len(event.Log.Topics) >= 2 {
@@ -677,12 +682,13 @@ func handleMint(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 
 // handleBurn processes Burn events (liquidity removals)
 func handleBurn(ctx context.Context, module *UniswapV2Module, event *core.ParsedEvent) error {
+
 	// For Burn events:
 	// topics[0] = event signature
 	// topics[1] = indexed sender address
 	// topics[2] = indexed to address
 	// data contains: amount0, amount1
-	
+
 	// Extract indexed parameters from topics
 	var sender, to common.Address
 	if len(event.Log.Topics) >= 3 {

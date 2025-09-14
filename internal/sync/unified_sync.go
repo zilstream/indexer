@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/zilstream/indexer/internal/database"
 	"github.com/zilstream/indexer/internal/modules/core"
@@ -24,7 +26,7 @@ type UnifiedSync struct {
 	bulkWriter *database.BulkWriter
 	modules    *core.ModuleRegistry
 	logger     zerolog.Logger
-	
+
 	// Configuration
 	maxBatchSize      int
 	maxRetries        int
@@ -50,11 +52,12 @@ func NewUnifiedSync(
 ) *UnifiedSync {
 	// Create batch client for efficient fetching
 	batchClient := rpc.NewBatchClient(rpcClient.GetEndpoint(), config.MaxBatchSize, logger)
-	
+
 	// Create atomic writer and bulk writer
 	writer := database.NewAtomicBlockWriter(db.Pool(), logger)
 	bulkWriter := database.NewBulkWriter(db.Pool(), logger)
-	
+
+
 	return &UnifiedSync{
 		db:                db,
 		rpc:               rpcClient,
@@ -77,7 +80,8 @@ func (s *UnifiedSync) SyncRange(ctx context.Context, startBlock, endBlock uint64
 		Uint64("end", endBlock).
 		Uint64("total", endBlock-startBlock+1).
 		Msg("Starting sync range")
-	
+
+
 	startTime := time.Now()
 	current := startBlock
 	totalProcessed := uint64(0)
@@ -202,20 +206,7 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 			eventLogs := s.extractEventLogsFromReceipts(blockNum, rawBlock.Hash.Hex(), receipts)
 			if len(eventLogs) > 0 {
 				eventLogsByBlock[blockNum] = eventLogs
-				
-				// Process events through modules
-				if s.modules != nil {
-					for _, dbLog := range eventLogs {
-						ethLog := s.convertToEthLog(dbLog)
-						if err := s.modules.ProcessEvent(ctx, &ethLog); err != nil {
-							s.logger.Error().
-								Err(err).
-								Uint64("block", blockNum).
-								Str("address", ethLog.Address.Hex()).
-								Msg("Failed to process event in modules")
-						}
-					}
-				}
+
 			}
 		}
 	}
@@ -235,6 +226,43 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 		}
 	}
 	
+	// Process events synchronously in the correct order (after database writes)
+	if s.modules != nil && len(eventLogsByBlock) > 0 {
+		// Sort blocks by block number to ensure correct processing order
+		var sortedBlockNums []uint64
+		for blockNum := range eventLogsByBlock {
+			sortedBlockNums = append(sortedBlockNums, blockNum)
+		}
+
+		// Sort block numbers
+		for i := 0; i < len(sortedBlockNums); i++ {
+			for j := i + 1; j < len(sortedBlockNums); j++ {
+				if sortedBlockNums[i] > sortedBlockNums[j] {
+					sortedBlockNums[i], sortedBlockNums[j] = sortedBlockNums[j], sortedBlockNums[i]
+				}
+			}
+		}
+
+		// Process events for each block in order
+		for _, blockNum := range sortedBlockNums {
+			eventLogs := eventLogsByBlock[blockNum]
+
+			// Convert database event logs to ethereum types.Log and process in order
+			for _, dbLog := range eventLogs {
+				ethLog := s.convertToEthLog(dbLog)
+				if err := s.modules.ProcessEvent(ctx, &ethLog); err != nil {
+					s.logger.Error().
+						Err(err).
+						Uint64("block", ethLog.BlockNumber).
+						Str("tx_hash", ethLog.TxHash.Hex()).
+						Uint("log_index", ethLog.Index).
+						Msg("Failed to process event in modules")
+					// Continue processing other events even if one fails
+				}
+			}
+		}
+	}
+
 	// Update last block number
 	if len(dbBlocks) > 0 {
 		lastBlock := dbBlocks[len(dbBlocks)-1]
@@ -242,7 +270,7 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 			return fmt.Errorf("failed to update last block: %w", err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -285,47 +313,17 @@ func (s *UnifiedSync) fetchBlocksWithReceipts(ctx context.Context, startBlock, e
 	
 	s.logger.Debug().Int("tx_count", len(allHashes)).Msg("Fetching receipts for all transactions")
 	
-	// Fetch receipts in optimized chunks with parallel processing  
+	// Fetch receipts in parallel chunks for maximum performance
 	receiptsMap := make(map[uint64][]*types.Receipt)
 	if len(allHashes) > 0 {
-		// Use larger chunks for better performance
-		maxReceiptsPerBatch := 1000
-		if len(allHashes) > 10000 {
-			maxReceiptsPerBatch = 2000 // Even larger chunks for massive syncs
+		allReceipts, err := s.fetchReceiptsParallel(ctx, allHashes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to fetch receipts in parallel: %w", err)
 		}
-		
-		var allReceipts []*types.Receipt
-		for i := 0; i < len(allHashes); i += maxReceiptsPerBatch {
-			end := i + maxReceiptsPerBatch
-			if end > len(allHashes) {
-				end = len(allHashes)
-			}
-			
-			chunk := allHashes[i:end]
-			chunkReceipts, err := s.batch.GetReceiptBatch(ctx, chunk)
-			if err != nil {
-				s.logger.Warn().
-					Err(err).
-					Int("chunk_size", len(chunk)).
-					Int("chunk_start", i).
-					Msg("Failed to fetch receipts chunk, continuing without")
-				// Create empty receipts for this chunk
-				for j := 0; j < len(chunk); j++ {
-					allReceipts = append(allReceipts, nil)
-				}
-				continue
-			}
-			allReceipts = append(allReceipts, chunkReceipts...)
-			
-			// Add small delay for very large batches to avoid overwhelming RPC
-			if len(chunk) > 1500 && i+maxReceiptsPerBatch < len(allHashes) {
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-		
+
 		// Organize receipts by block number
 		for i, receipt := range allReceipts {
-			if receipt != nil {
+			if receipt != nil && i < len(allHashes) {
 				blockNum := hashToBlock[allHashes[i]]
 				if receiptsMap[blockNum] == nil {
 					receiptsMap[blockNum] = make([]*types.Receipt, 0, blockTxCounts[blockNum])
@@ -333,11 +331,98 @@ func (s *UnifiedSync) fetchBlocksWithReceipts(ctx context.Context, startBlock, e
 				receiptsMap[blockNum] = append(receiptsMap[blockNum], receipt)
 			}
 		}
-		
+
 		s.logger.Debug().Int("receipts_fetched", len(allReceipts)).Msg("Receipts fetched")
 	}
 	
 	return rawBlocks, receiptsMap, nil
+}
+
+// fetchReceiptsParallel fetches receipts in parallel for maximum performance
+func (s *UnifiedSync) fetchReceiptsParallel(ctx context.Context, allHashes []common.Hash) ([]*types.Receipt, error) {
+	totalHashes := len(allHashes)
+	if totalHashes == 0 {
+		return nil, nil
+	}
+
+	// Dynamic chunk sizing based on total hashes for optimal performance
+	chunkSize := 5000
+	if totalHashes > 50000 {
+		chunkSize = 10000 // Larger chunks for massive syncs
+	} else if totalHashes < 1000 {
+		chunkSize = 500 // Smaller chunks for small syncs
+	}
+
+	// Calculate number of chunks
+	numChunks := (totalHashes + chunkSize - 1) / chunkSize
+
+	// Limit concurrent requests to avoid overwhelming RPC
+	maxConcurrency := int64(8)
+	if numChunks < 4 {
+		maxConcurrency = int64(numChunks)
+	}
+	sem := semaphore.NewWeighted(maxConcurrency)
+
+	// Prepare results slice
+	allReceipts := make([]*types.Receipt, totalHashes)
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var fetchErr error
+
+	// Process chunks in parallel
+	for i := 0; i < totalHashes; i += chunkSize {
+		end := i + chunkSize
+		if end > totalHashes {
+			end = totalHashes
+		}
+
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			if err := sem.Acquire(ctx, 1); err != nil {
+				errOnce.Do(func() { fetchErr = err })
+				return
+			}
+			defer sem.Release(1)
+
+			chunk := allHashes[start:end]
+			startTime := time.Now()
+
+			chunkReceipts, err := s.batch.GetReceiptBatch(ctx, chunk)
+			if err != nil {
+				s.logger.Warn().
+					Err(err).
+					Int("chunk_size", len(chunk)).
+					Int("chunk_start", start).
+					Dur("elapsed", time.Since(startTime)).
+					Msg("Failed to fetch receipts chunk, creating empty receipts")
+
+				// Create empty receipts for this chunk
+				chunkReceipts = make([]*types.Receipt, len(chunk))
+			}
+
+			// Copy results to correct position in main slice
+			copy(allReceipts[start:], chunkReceipts)
+
+			s.logger.Debug().
+				Int("chunk_size", len(chunk)).
+				Int("start", start).
+				Int("end", end).
+				Dur("elapsed", time.Since(startTime)).
+				Msg("Receipt chunk fetched")
+		}(i, end)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	if fetchErr != nil {
+		return nil, fmt.Errorf("failed to acquire semaphore: %w", fetchErr)
+	}
+
+	return allReceipts, nil
 }
 
 // fetchBlocksNormal fetches blocks using normal RPC (for small batches)

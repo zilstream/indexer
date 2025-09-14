@@ -19,14 +19,16 @@ database:
   user: "melvin"
   password: ""
   ssl_mode: "disable"
-  max_connections: 10
+  max_connections: 25 # Increased for better performance
 
 processor:
-  batch_size: 100 # Adaptive batch size based on sync gap
-  workers: 5 # Number of parallel workers
-  requests_per_second: 50 # RPC rate limit
+  batch_size: 200 # Increased adaptive batch size
+  workers: 10 # Increased workers for better parallel processing
+  requests_per_second: 100 # Increased RPC rate limit
   max_retries: 3
   retry_delay: 1s
+  event_workers: 6 # Number of async event processing workers
+  event_buffer_size: 15000 # Large buffer for event processing
 
 logging:
   level: "info" # debug, info, warn, error

@@ -509,3 +509,4 @@ func (ld *LogData) ToEthereumLog() (*types.Log, error) {
 		Removed:     ld.Removed,
 	}, nil
 }
+
