@@ -27,7 +27,6 @@ processor:
   requests_per_second: 100 # Increased RPC rate limit
   max_retries: 3
   retry_delay: 1s
-  use_eth_get_logs: true # MASSIVE PERFORMANCE BOOST - use eth_getLogs instead of fetching individual receipts
 
 logging:
   level: "info" # debug, info, warn, error

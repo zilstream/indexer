@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"math/big"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/rs/zerolog"
-	"golang.org/x/sync/semaphore"
 
 	"github.com/zilstream/indexer/internal/database"
 	"github.com/zilstream/indexer/internal/modules/core"
@@ -32,7 +30,6 @@ type UnifiedSync struct {
 	maxRetries        int
 	retryDelay        time.Duration
 	requestsPerSecond int
-	useEthGetLogs     bool
 }
 
 // UnifiedSyncConfig holds configuration for unified sync
@@ -41,7 +38,6 @@ type UnifiedSyncConfig struct {
 	MaxRetries        int
 	RetryDelay        time.Duration
 	RequestsPerSecond int
-	UseEthGetLogs     bool // Use eth_getLogs instead of fetching individual receipts for events
 }
 
 // NewUnifiedSync creates a new unified sync instance
@@ -72,7 +68,6 @@ func NewUnifiedSync(
 		maxRetries:        config.MaxRetries,
 		retryDelay:        config.RetryDelay,
 		requestsPerSecond: config.RequestsPerSecond,
-		useEthGetLogs:     config.UseEthGetLogs,
 	}
 }
 
@@ -182,15 +177,8 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 	// Phase 1: Fetch blocks and events (optimized path)
 	fetchStart := time.Now()
 	var rawBlocks []*rpc.RawBlock
-	var receiptsMap map[uint64][]*types.Receipt
-	var directEventLogs map[uint64][]*database.EventLog
-	var err error
-
-	if s.useEthGetLogs {
-		rawBlocks, directEventLogs, err = s.fetchBlocksWithLogs(ctx, startBlock, endBlock)
-	} else {
-		rawBlocks, receiptsMap, err = s.fetchBlocksWithReceipts(ctx, startBlock, endBlock)
-	}
+	// Always use eth_getLogs for performance
+	rawBlocks, directEventLogs, err := s.fetchBlocksWithLogs(ctx, startBlock, endBlock)
 	if err != nil {
 		return fmt.Errorf("failed to fetch blocks: %w", err)
 	}
@@ -217,26 +205,16 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 		dbBlocks = append(dbBlocks, dbBlock)
 		
 		// Convert raw transactions to database transactions - preserve original data
-		dbTransactions := s.convertRawTransactions(rawBlock, receiptsMap[blockNum])
+		dbTransactions := s.convertRawTransactions(rawBlock, nil)
 		if len(dbTransactions) > 0 {
 			transactionsByBlock[blockNum] = dbTransactions
 			totalTxs += len(dbTransactions)
 		}
 
-		// Extract and convert event logs
-		if directEventLogs != nil {
-			// Use direct event logs from eth_getLogs
-			if eventLogs, ok := directEventLogs[blockNum]; ok && len(eventLogs) > 0 {
-				eventLogsByBlock[blockNum] = eventLogs
-				totalLogs += len(eventLogs)
-			}
-		} else if receipts, ok := receiptsMap[blockNum]; ok {
-			// Extract from receipts (fallback path)
-			eventLogs := s.extractEventLogsFromReceipts(blockNum, rawBlock.Hash.Hex(), receipts)
-			if len(eventLogs) > 0 {
-				eventLogsByBlock[blockNum] = eventLogs
-				totalLogs += len(eventLogs)
-			}
+		// Extract event logs from eth_getLogs results
+		if eventLogs, ok := directEventLogs[blockNum]; ok && len(eventLogs) > 0 {
+			eventLogsByBlock[blockNum] = eventLogs
+			totalLogs += len(eventLogs)
 		}
 	}
 	processDuration := time.Since(processStart)
@@ -343,71 +321,7 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 	return nil
 }
 
-// fetchBlocksWithReceipts fetches blocks and their receipts
-func (s *UnifiedSync) fetchBlocksWithReceipts(ctx context.Context, startBlock, endBlock uint64) ([]*rpc.RawBlock, map[uint64][]*types.Receipt, error) {
-	batchSize := int(endBlock - startBlock + 1)
-	
-	// For small batches, use regular RPC
-	if batchSize <= 10 {
-		return s.fetchBlocksNormal(ctx, startBlock, endBlock)
-	}
-	
-	// For large batches, use batch RPC - get raw blocks to preserve transaction metadata
-	s.logger.Debug().Uint64("start", startBlock).Uint64("end", endBlock).Msg("Fetching raw blocks")
-	rawBlocks, err := s.batch.GetBlockBatchRaw(ctx, s.makeBlockNumbers(startBlock, endBlock))
-	if err != nil {
-		return nil, nil, err
-	}
-	s.logger.Debug().Int("count", len(rawBlocks)).Msg("Fetched raw blocks")
-	
-	// Collect ALL transaction hashes across all blocks
-	allHashes := []common.Hash{}
-	hashToBlock := make(map[common.Hash]uint64) // Map hash to block number
-	blockTxCounts := make(map[uint64]int) // Track tx count per block
-	
-	for _, rawBlock := range rawBlocks {
-		if rawBlock == nil || len(rawBlock.Transactions) == 0 {
-			continue
-		}
-		
-		blockNum := (*big.Int)(rawBlock.Number).Uint64()
-		blockTxCounts[blockNum] = len(rawBlock.Transactions)
-		
-		// Collect transaction hashes directly from raw data
-		for _, tx := range rawBlock.Transactions {
-			allHashes = append(allHashes, tx.Hash)
-			hashToBlock[tx.Hash] = blockNum
-		}
-	}
-	
-	s.logger.Debug().Int("tx_count", len(allHashes)).Msg("Fetching receipts for all transactions")
-	
-	// Fetch receipts in parallel chunks for maximum performance
-	receiptsMap := make(map[uint64][]*types.Receipt)
-	if len(allHashes) > 0 {
-		allReceipts, err := s.fetchReceiptsParallel(ctx, allHashes)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to fetch receipts in parallel: %w", err)
-		}
-
-		// Organize receipts by block number
-		for i, receipt := range allReceipts {
-			if receipt != nil && i < len(allHashes) {
-				blockNum := hashToBlock[allHashes[i]]
-				if receiptsMap[blockNum] == nil {
-					receiptsMap[blockNum] = make([]*types.Receipt, 0, blockTxCounts[blockNum])
-				}
-				receiptsMap[blockNum] = append(receiptsMap[blockNum], receipt)
-			}
-		}
-
-		s.logger.Debug().Int("receipts_fetched", len(allReceipts)).Msg("Receipts fetched")
-	}
-
-	return rawBlocks, receiptsMap, nil
-}
-
-// fetchBlocksWithLogs fetches blocks and their event logs using eth_getLogs (MUCH faster!)
+// fetchBlocksWithLogs fetches blocks and their event logs using eth_getLogs
 func (s *UnifiedSync) fetchBlocksWithLogs(ctx context.Context, startBlock, endBlock uint64) ([]*rpc.RawBlock, map[uint64][]*database.EventLog, error) {
 	batchSize := int(endBlock - startBlock + 1)
 
@@ -422,39 +336,7 @@ func (s *UnifiedSync) fetchBlocksWithLogs(ctx context.Context, startBlock, endBl
 	logsFetchStart := time.Now()
 	allLogs, err := s.batch.GetLogs(ctx, startBlock, endBlock, nil) // nil = all addresses
 	if err != nil {
-		// Fallback to receipt-based approach on getLogs failure
-		s.logger.Warn().
-			Err(err).
-			Uint64("start", startBlock).
-			Uint64("end", endBlock).
-			Msg("eth_getLogs failed, falling back to receipt fetching")
-
-		// Fetch with receipts and convert to the expected return format
-		rawBlocks, receiptsMap, err := s.fetchBlocksWithReceipts(ctx, startBlock, endBlock)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// Convert receipts to event logs format for consistency
-		eventLogsByBlock := make(map[uint64][]*database.EventLog)
-		for blockNum, receipts := range receiptsMap {
-			if len(receipts) > 0 {
-				// Find the block hash from rawBlocks
-				var blockHashStr string
-				for _, rawBlock := range rawBlocks {
-					if (*big.Int)(rawBlock.Number).Uint64() == blockNum {
-						blockHashStr = rawBlock.Hash.Hex()
-						break
-					}
-				}
-				eventLogs := s.extractEventLogsFromReceipts(blockNum, blockHashStr, receipts)
-				if len(eventLogs) > 0 {
-					eventLogsByBlock[blockNum] = eventLogs
-				}
-			}
-		}
-
-		return rawBlocks, eventLogsByBlock, nil
+		return nil, nil, fmt.Errorf("failed to fetch logs with eth_getLogs: %w", err)
 	}
 
 	logsFetchTime := time.Since(logsFetchStart)
@@ -500,127 +382,6 @@ func (s *UnifiedSync) fetchBlocksWithLogs(ctx context.Context, startBlock, endBl
 	return rawBlocks, eventLogsByBlock, nil
 }
 
-// fetchReceiptsParallel fetches receipts in parallel for maximum performance
-func (s *UnifiedSync) fetchReceiptsParallel(ctx context.Context, allHashes []common.Hash) ([]*types.Receipt, error) {
-	totalHashes := len(allHashes)
-	if totalHashes == 0 {
-		return nil, nil
-	}
-
-	// Dynamic chunk sizing based on total hashes for optimal performance
-	chunkSize := 5000
-	if totalHashes > 50000 {
-		chunkSize = 10000 // Larger chunks for massive syncs
-	} else if totalHashes < 1000 {
-		chunkSize = 500 // Smaller chunks for small syncs
-	}
-
-	// Calculate number of chunks
-	numChunks := (totalHashes + chunkSize - 1) / chunkSize
-
-	// Limit concurrent requests to avoid overwhelming RPC
-	maxConcurrency := int64(8)
-	if numChunks < 4 {
-		maxConcurrency = int64(numChunks)
-	}
-	sem := semaphore.NewWeighted(maxConcurrency)
-
-	// Prepare results slice
-	allReceipts := make([]*types.Receipt, totalHashes)
-	var wg sync.WaitGroup
-	var errOnce sync.Once
-	var fetchErr error
-
-	// Process chunks in parallel
-	for i := 0; i < totalHashes; i += chunkSize {
-		end := i + chunkSize
-		if end > totalHashes {
-			end = totalHashes
-		}
-
-		wg.Add(1)
-		go func(start, end int) {
-			defer wg.Done()
-
-			// Acquire semaphore
-			if err := sem.Acquire(ctx, 1); err != nil {
-				errOnce.Do(func() { fetchErr = err })
-				return
-			}
-			defer sem.Release(1)
-
-			chunk := allHashes[start:end]
-			startTime := time.Now()
-
-			chunkReceipts, err := s.batch.GetReceiptBatch(ctx, chunk)
-			if err != nil {
-				s.logger.Warn().
-					Err(err).
-					Int("chunk_size", len(chunk)).
-					Int("chunk_start", start).
-					Dur("elapsed", time.Since(startTime)).
-					Msg("Failed to fetch receipts chunk, creating empty receipts")
-
-				// Create empty receipts for this chunk
-				chunkReceipts = make([]*types.Receipt, len(chunk))
-			}
-
-			// Copy results to correct position in main slice
-			copy(allReceipts[start:], chunkReceipts)
-
-			s.logger.Debug().
-				Int("chunk_size", len(chunk)).
-				Int("start", start).
-				Int("end", end).
-				Dur("elapsed", time.Since(startTime)).
-				Msg("Receipt chunk fetched")
-		}(i, end)
-	}
-
-	// Wait for all goroutines to complete
-	wg.Wait()
-
-	if fetchErr != nil {
-		return nil, fmt.Errorf("failed to acquire semaphore: %w", fetchErr)
-	}
-
-	return allReceipts, nil
-}
-
-// fetchBlocksNormal fetches blocks using normal RPC (for small batches)
-func (s *UnifiedSync) fetchBlocksNormal(ctx context.Context, startBlock, endBlock uint64) ([]*rpc.RawBlock, map[uint64][]*types.Receipt, error) {
-	// Use batch client even for small batches to get raw data
-	blockNumbers := s.makeBlockNumbers(startBlock, endBlock)
-	rawBlocks, err := s.batch.GetBlockBatchRaw(ctx, blockNumbers)
-	if err != nil {
-		return nil, nil, err
-	}
-	
-	receiptsMap := make(map[uint64][]*types.Receipt)
-	for _, rawBlock := range rawBlocks {
-		if rawBlock == nil || len(rawBlock.Transactions) == 0 {
-			continue
-		}
-		
-		blockNum := (*big.Int)(rawBlock.Number).Uint64()
-		
-		// Fetch receipts
-		receipts, err := s.rpc.GetBlockReceipts(ctx, blockNum)
-		if err != nil {
-			s.logger.Warn().
-				Err(err).
-				Uint64("block", blockNum).
-				Msg("Failed to fetch receipts, continuing without")
-			receipts = []*types.Receipt{}
-		}
-		
-		if len(receipts) > 0 {
-			receiptsMap[blockNum] = receipts
-		}
-	}
-	
-	return rawBlocks, receiptsMap, nil
-}
 
 // makeBlockNumbers creates a slice of block numbers
 func (s *UnifiedSync) makeBlockNumbers(start, end uint64) []uint64 {
