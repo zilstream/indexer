@@ -582,72 +582,64 @@ func handleMint(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 	amount0 := new(big.Int).SetBytes(event.Log.Data[0:32])
 	amount1 := new(big.Int).SetBytes(event.Log.Data[32:64])
 
-	// Create mint ID
-	mintID := fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex)
+	// Try to complete a pending mint from the same tx/pair
+	// Fetch block timestamp for USD valuation if needed
+	var ts int64
+	_ = module.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, event.BlockNumber).Scan(&ts)
 
-	// Check for duplicate mint event with same transaction hash
-	dupCheckQuery := `
-		SELECT COUNT(*) FROM uniswap_v2_mints
-		WHERE transaction_hash = $1
-		  AND pair = $2
-		  AND sender = $3
-		  AND amount0 = $4
-		  AND amount1 = $5
-		  AND block_number = $6
-		  AND id != $7`
-	
-	var duplicateCount int
-	err := module.db.Pool().QueryRow(ctx, dupCheckQuery,
-		event.TransactionHash.Hex(),
-		strings.ToLower(event.Address.Hex()),
-		strings.ToLower(sender.Hex()),
-		amount0.String(),
-		amount1.String(),
-		event.BlockNumber,
-		mintID,
-	).Scan(&duplicateCount)
-	
-	if err == nil && duplicateCount > 0 {
-		module.logger.Debug().
-			Str("mint_id", mintID).
-			Int("duplicates", duplicateCount).
-			Msg("Skipping duplicate mint event")
+	// Optional USD
+	var amountUSD string
+	if module.priceRouter != nil {
+	var t0, t1 string
+	if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v2_pairs WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+	minTime := time.Unix(ts, 0).UTC()
+	p0, ok0 := module.priceRouter.PriceTokenUSD(ctx, strings.ToLower(t0), minTime)
+	p1, ok1 := module.priceRouter.PriceTokenUSD(ctx, strings.ToLower(t1), minTime)
+	  if ok0 || ok1 {
+	   dec0 := module.tokenDecimals(ctx, t0)
+	   dec1 := module.tokenDecimals(ctx, t1)
+	  usd0 := "0"
+	  usd1 := "0"
+	  if ok0 { usd0 = mulStr(divBigIntByPow10Str(amount0, dec0), p0) }
+	  if ok1 { usd1 = mulStr(divBigIntByPow10Str(amount1, dec1), p1) }
+	  amountUSD = addStr(usd0, usd1)
+	 }
+	}
+	}
+
+	// Early duplicate guard: if a mint already exists with same tx/pair/sender and amounts, skip
+	var exists int
+	_ = module.db.Pool().QueryRow(ctx, `
+	SELECT COUNT(*) FROM uniswap_v2_mints
+	WHERE transaction_hash=$1 AND pair=$2 AND sender=$3 AND amount0=$4 AND amount1=$5`,
+	event.TransactionHash.Hex(), strings.ToLower(event.Address.Hex()), strings.ToLower(sender.Hex()), amount0.String(), amount1.String(),
+	).Scan(&exists)
+	if exists > 0 {
+	module.logger.Debug().Str("pair", event.Address.Hex()).Msg("Duplicate Mint event skipped")
+	return nil
+	}
+
+	// Complete pending row targeted at non-zero to_address only
+	ct, _ := module.db.Pool().Exec(ctx, `
+	UPDATE uniswap_v2_mints m
+	SET sender = $4, amount0 = $5, amount1 = $6,
+	amount_usd = CASE WHEN $7 = '' THEN amount_usd ELSE $7::numeric END
+	WHERE m.ctid IN (
+	 SELECT ctid FROM uniswap_v2_mints
+	 WHERE transaction_hash = $1 AND pair = $2 AND amount0 = 0 AND amount1 = 0 AND to_address <> $8
+	 ORDER BY log_index ASC
+	 LIMIT 1
+	 )`,
+		event.TransactionHash.Hex(), strings.ToLower(event.Address.Hex()),
+		strings.ToLower(sender.Hex()), amount0.String(), amount1.String(), amountUSD, strings.ToLower(common.Address{}.Hex()),
+	)
+	if ct.RowsAffected() == 0 {
+	 // No pending mint to complete; skip to avoid duplicate rows
+		module.logger.Debug().Str("pair", event.Address.Hex()).Msg("No pending mint to complete; skipping")
 		return nil
 	}
 
-	// Insert mint record
-	query := `
-		INSERT INTO uniswap_v2_mints (
-			id, transaction_hash, log_index, block_number, timestamp,
-			pair, to_address, sender, amount0, amount1
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (id) DO NOTHING`
-
-	// For mints, the 'to' address is usually found from a Transfer event
-	// For now, we'll use the sender as the to_address
-	_, err = module.db.Pool().Exec(ctx, query,
-		mintID,
-		event.TransactionHash.Hex(),
-		event.LogIndex,
-		event.BlockNumber,
-		event.Timestamp.Int64(),
-		strings.ToLower(event.Address.Hex()),
-		strings.ToLower(sender.Hex()), // to_address
-		strings.ToLower(sender.Hex()),
-		amount0.String(),
-		amount1.String(),
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to insert mint: %w", err)
-	}
-
-	module.logger.Debug().
-		Str("pair", event.Address.Hex()).
-		Str("sender", sender.Hex()).
-		Str("mint_id", mintID).
-		Msg("Mint processed")
-
+	module.logger.Debug().Str("pair", event.Address.Hex()).Str("sender", sender.Hex()).Msg("Mint processed")
 	return nil
 }
 
@@ -676,72 +668,59 @@ func handleBurn(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 	amount0 := new(big.Int).SetBytes(event.Log.Data[0:32])
 	amount1 := new(big.Int).SetBytes(event.Log.Data[32:64])
 
-	// Create burn ID
-	burnID := fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex)
+	// Complete a pending burn from the same tx/pair using token amounts
+	var ts int64
+	_ = module.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, event.BlockNumber).Scan(&ts)
 
-	// Check for duplicate burn event with same transaction hash
-	dupCheckQuery := `
-		SELECT COUNT(*) FROM uniswap_v2_burns
-		WHERE transaction_hash = $1
-		  AND pair = $2
-		  AND sender = $3
-		  AND to_address = $4
-		  AND amount0 = $5
-		  AND amount1 = $6
-		  AND block_number = $7
-		  AND id != $8`
-	
-	var duplicateCount int
-	err := module.db.Pool().QueryRow(ctx, dupCheckQuery,
-		event.TransactionHash.Hex(),
-		strings.ToLower(event.Address.Hex()),
-		strings.ToLower(sender.Hex()),
-		strings.ToLower(to.Hex()),
-		amount0.String(),
-		amount1.String(),
-		event.BlockNumber,
-		burnID,
-	).Scan(&duplicateCount)
-	
-	if err == nil && duplicateCount > 0 {
-		module.logger.Debug().
-			Str("burn_id", burnID).
-			Int("duplicates", duplicateCount).
-			Msg("Skipping duplicate burn event")
-		return nil
+	// Optional USD
+	var amountUSD string
+	if module.priceRouter != nil {
+	var t0, t1 string
+	if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v2_pairs WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
+	minTime := time.Unix(ts, 0).UTC()
+	p0, ok0 := module.priceRouter.PriceTokenUSD(ctx, strings.ToLower(t0), minTime)
+	p1, ok1 := module.priceRouter.PriceTokenUSD(ctx, strings.ToLower(t1), minTime)
+	if ok0 || ok1 {
+	dec0 := module.tokenDecimals(ctx, t0)
+	   dec1 := module.tokenDecimals(ctx, t1)
+	   usd0 := "0"
+	   usd1 := "0"
+	  if ok0 { usd0 = mulStr(divBigIntByPow10Str(amount0, dec0), p0) }
+	  if ok1 { usd1 = mulStr(divBigIntByPow10Str(amount1, dec1), p1) }
+	  amountUSD = addStr(usd0, usd1)
+	 }
+	}
 	}
 
-	// Insert burn record
-	query := `
-		INSERT INTO uniswap_v2_burns (
-			id, transaction_hash, log_index, block_number, timestamp,
-			pair, to_address, sender, amount0, amount1
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (id) DO NOTHING`
-
-	_, err = module.db.Pool().Exec(ctx, query,
-		burnID,
-		event.TransactionHash.Hex(),
-		event.LogIndex,
-		event.BlockNumber,
-		event.Timestamp.Int64(),
-		strings.ToLower(event.Address.Hex()),
-		strings.ToLower(to.Hex()),
-		strings.ToLower(sender.Hex()),
-		amount0.String(),
-		amount1.String(),
+	ct, _ := module.db.Pool().Exec(ctx, `
+	 UPDATE uniswap_v2_burns b
+	 SET to_address = $4, amount0 = $5, amount1 = $6,
+	     amount_usd = CASE WHEN $7 = '' THEN amount_usd ELSE $7::numeric END
+	 WHERE b.ctid IN (
+	 	SELECT ctid FROM uniswap_v2_burns
+	 	WHERE transaction_hash = $1 AND pair = $2 AND amount0 = 0 AND amount1 = 0
+	 	ORDER BY log_index ASC
+	 	LIMIT 1
+	 )`,
+	event.TransactionHash.Hex(), strings.ToLower(event.Address.Hex()),
+	strings.ToLower(to.Hex()), strings.ToLower(sender.Hex()), amount0.String(), amount1.String(), amountUSD,
 	)
-
-	if err != nil {
-		return fmt.Errorf("failed to insert burn: %w", err)
+	if ct.RowsAffected() == 0 {
+	 _, _ = module.db.Pool().Exec(ctx, `
+	  INSERT INTO uniswap_v2_burns (
+	  id, transaction_hash, log_index, block_number, timestamp,
+	 pair, to_address, sender, amount0, amount1, liquidity, amount_usd
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$11)
+	 ON CONFLICT (id) DO NOTHING`,
+	 fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex),
+	  event.TransactionHash.Hex(), event.LogIndex, event.BlockNumber, ts,
+	  strings.ToLower(event.Address.Hex()), strings.ToLower(to.Hex()), strings.ToLower(sender.Hex()),
+	 amount0.String(), amount1.String(),
+	 func() string { if amountUSD=="" { return "0" }; return amountUSD }(),
+	)
 	}
 
-	module.logger.Debug().
-		Str("pair", event.Address.Hex()).
-		Str("to", to.Hex()).
-		Str("burn_id", burnID).
-		Msg("Burn processed")
-
+	module.logger.Debug().Str("pair", event.Address.Hex()).Str("to", to.Hex()).Msg("Burn processed")
 	return nil
 }
 
@@ -769,17 +748,126 @@ func handleTransfer(ctx context.Context, module *UniswapV2Module, event *core.Pa
 	
 	value := new(big.Int).SetBytes(event.Log.Data[0:32])
 
-	// Check if this is a mint (from zero address) or burn (to zero address)
+	// Only process transfers emitted by known Uniswap V2 pair contracts
+	var isPair bool
+	if err := module.db.Pool().QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM uniswap_v2_pairs WHERE address = $1)`, strings.ToLower(event.Address.Hex())).Scan(&isPair); err != nil {
+		return nil
+	}
+	if !isPair {
+		return nil
+	}
+
+	// Fetch block timestamp
+	var ts int64
+	_ = module.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, event.BlockNumber).Scan(&ts)
+
 	zero := common.Address{}
-	if from == zero || to == zero {
-		// This is LP token mint/burn, we handle this differently
-		// Could update total supply here
-		module.logger.Debug().
-			Str("pair", event.Address.Hex()).
-			Str("from", from.Hex()).
-			Str("to", to.Hex()).
-			Str("value", value.String()).
-			Msg("LP token transfer processed")
+
+	// Mint start: LP tokens minted (from == zero)
+	if from == zero {
+		// Ignore the initial minimum liquidity lock (to == zero, value == 1000)
+		if to == zero && value.Cmp(big.NewInt(1000)) == 0 {
+			// Still reflect total_supply increase
+			_, _ = module.db.Pool().Exec(ctx, `
+				UPDATE uniswap_v2_pairs
+				SET total_supply = COALESCE(total_supply,0) + $2::numeric,
+				    updated_at = NOW()
+				WHERE address = $1`, strings.ToLower(event.Address.Hex()), value.String())
+			module.logger.Debug().Str("pair", event.Address.Hex()).Str("value", value.String()).Msg("Ignored min-liquidity lock mint row")
+			return nil
+		}
+		// Duplicate guard: same tx/pair/to/liquidity/block
+		var dup int
+		_ = module.db.Pool().QueryRow(ctx, `
+			SELECT COUNT(*) FROM uniswap_v2_mints
+			WHERE transaction_hash=$1 AND pair=$2 AND to_address=$3 AND liquidity=$4 AND block_number=$5`,
+			event.TransactionHash.Hex(), strings.ToLower(event.Address.Hex()), strings.ToLower(to.Hex()), value.String(), event.BlockNumber,
+		).Scan(&dup)
+		if dup == 0 {
+			_, _ = module.db.Pool().Exec(ctx, `
+				INSERT INTO uniswap_v2_mints (
+					id, transaction_hash, log_index, block_number, timestamp,
+					pair, to_address, sender, amount0, amount1, liquidity
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+				ON CONFLICT (id) DO NOTHING`,
+				fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex),
+				event.TransactionHash.Hex(),
+				event.LogIndex,
+				event.BlockNumber,
+				ts,
+				strings.ToLower(event.Address.Hex()),
+				strings.ToLower(to.Hex()),
+				strings.ToLower(zero.Hex()),
+				"0",
+				"0",
+				value.String(),
+			)
+			// Increase pair total_supply
+			_, _ = module.db.Pool().Exec(ctx, `
+				UPDATE uniswap_v2_pairs
+				SET total_supply = COALESCE(total_supply,0) + $2::numeric,
+				    updated_at = NOW()
+				WHERE address = $1`, strings.ToLower(event.Address.Hex()), value.String())
+		}
+		module.logger.Debug().Str("pair", event.Address.Hex()).Str("to", to.Hex()).Str("value", value.String()).Msg("LP mint transfer recorded")
+		return nil
+	}
+
+	// Burn start: LP tokens sent to pair (to == pair)
+	if strings.EqualFold(to.Hex(), event.Address.Hex()) {
+		var dup int
+		_ = module.db.Pool().QueryRow(ctx, `
+			SELECT COUNT(*) FROM uniswap_v2_burns
+			WHERE transaction_hash=$1 AND pair=$2 AND sender=$3 AND liquidity=$4 AND block_number=$5`,
+			event.TransactionHash.Hex(), strings.ToLower(event.Address.Hex()), strings.ToLower(from.Hex()), value.String(), event.BlockNumber,
+		).Scan(&dup)
+		if dup == 0 {
+			_, _ = module.db.Pool().Exec(ctx, `
+				INSERT INTO uniswap_v2_burns (
+					id, transaction_hash, log_index, block_number, timestamp,
+					pair, to_address, sender, amount0, amount1, liquidity
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+				ON CONFLICT (id) DO NOTHING`,
+				fmt.Sprintf("%s-%d", event.TransactionHash.Hex(), event.LogIndex),
+				event.TransactionHash.Hex(),
+				event.LogIndex,
+				event.BlockNumber,
+				ts,
+				strings.ToLower(event.Address.Hex()),
+				strings.ToLower(zero.Hex()),
+				strings.ToLower(from.Hex()),
+				"0",
+				"0",
+				value.String(),
+			)
+		}
+		module.logger.Debug().Str("pair", event.Address.Hex()).Str("from", from.Hex()).Str("value", value.String()).Msg("LP burn transfer (start) recorded")
+		return nil
+	}
+
+	// Burn finalization: LP tokens sent from pair to zero (destroy)
+	if strings.EqualFold(from.Hex(), event.Address.Hex()) && to == zero {
+		// Update the earliest pending burn in this tx/pair (amount0/1 == 0)
+		_, _ = module.db.Pool().Exec(ctx, `
+			UPDATE uniswap_v2_burns b
+			SET to_address = $4,
+			    liquidity  = $3
+			WHERE b.ctid IN (
+				SELECT ctid FROM uniswap_v2_burns
+				WHERE transaction_hash = $1 AND pair = $2 AND amount0 = 0 AND amount1 = 0
+				ORDER BY log_index ASC
+				LIMIT 1
+			)`,
+			event.TransactionHash.Hex(), strings.ToLower(event.Address.Hex()), value.String(), strings.ToLower(zero.Hex()),
+		)
+		// Decrease pair total_supply
+		_, _ = module.db.Pool().Exec(ctx, `
+			UPDATE uniswap_v2_pairs
+			SET total_supply = GREATEST(COALESCE(total_supply,0) - $2::numeric, 0),
+			    updated_at = NOW()
+			WHERE address = $1`, strings.ToLower(event.Address.Hex()), value.String())
+		module.logger.Debug().Str("pair", event.Address.Hex()).Str("value", value.String()).Msg("LP burn transfer (final) applied")
+		return nil
 	}
 
 	return nil

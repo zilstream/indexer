@@ -3,14 +3,14 @@
 server:
   port: 8080
   metrics_port: 9090
-  run_indexer: true  # when false, this server runs API-only
+  run_indexer: true # when false, this server runs API-only
 
 chain:
   name: "zilliqa"
   chain_id: 32769
   rpc_endpoint: "http://176.9.25.203:4202"
   block_time: 1s
-  start_block: 3862930 # Close to first pair creation for testing
+  start_block: 3251550 # Close to first pair creation for testing
 
 database:
   host: "localhost"

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
 )
 
 // initializeABIs sets up the contract ABIs for parsing events
@@ -25,7 +26,9 @@ func (m *UniswapV2Module) initializeABIs() error {
 
 	// Add ABIs to event parser
 	m.parser.AddContract(m.factoryAddress, &factoryABI)
-	// Note: We'll add individual pair contracts as we discover them
+	// Register pair ABI globally so event topics are known even before we see specific pairs
+	m.parser.AddContract(common.Address{}, &pairABI)
+	// Note: We will still add specific pair addresses on PairCreated for completeness
 
 	return nil
 }
