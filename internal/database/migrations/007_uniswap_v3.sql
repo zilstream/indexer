@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS uniswap_v3_pools (
     liquidity NUMERIC(78,0) DEFAULT 0,
     sqrt_price_x96 NUMERIC(78,0) DEFAULT 0,
     tick NUMERIC(78,0) DEFAULT 0,
+    reserve0 NUMERIC(78,0) DEFAULT 0,
+    reserve1 NUMERIC(78,0) DEFAULT 0,
     volume_token0 NUMERIC(78,0) DEFAULT 0,
     volume_token1 NUMERIC(78,0) DEFAULT 0,
     volume_usd NUMERIC(78,18) DEFAULT 0,

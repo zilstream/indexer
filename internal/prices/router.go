@@ -90,17 +90,27 @@ func (r *DBRouter) v2SpotToUSD(ctx context.Context, token string, ts time.Time) 
 	if !r0.Valid || !r1.Valid {
 		return "", false
 	}
-	// choose path
+	// Adjust by decimals: price(token0 in token1) = (r1/10^d1) / (r0/10^d0) = (r1/r0) * 10^(d0-d1)
+	d0 := r.getDecimals(ctx, t0)
+	d1 := r.getDecimals(ctx, t1)
 	if strings.ToLower(t0) == strings.ToLower(token) {
-		// price token0 in token1 = r1/r0
-		p, ok := divStrings(r1.String, r0.String)
+		pBase, ok := divStrings(r1.String, r0.String)
 		if !ok { return "", false }
-		return r.toUSD(ctx, strings.ToLower(t1), ts, p)
+		// scale by 10^(d0-d1)
+		scale := pow10Float(d0 - d1)
+		p := new(big.Rat)
+		if _, ok := p.SetString(pBase); !ok { return "", false }
+		p.Mul(p, new(big.Rat).SetFloat64(scale))
+		return r.toUSD(ctx, strings.ToLower(t1), ts, p.FloatString(18))
 	}
-	// token is token1: price token1 in token0 = r0/r1
-	p, ok := divStrings(r0.String, r1.String)
+	// token is token1: price(token1 in token0) = (r0/r1) * 10^(d1-d0)
+	pBase, ok := divStrings(r0.String, r1.String)
 	if !ok { return "", false }
-	return r.toUSD(ctx, strings.ToLower(t0), ts, p)
+	scale := pow10Float(d1 - d0)
+	p := new(big.Rat)
+	if _, ok := p.SetString(pBase); !ok { return "", false }
+	p.Mul(p, new(big.Rat).SetFloat64(scale))
+	return r.toUSD(ctx, strings.ToLower(t0), ts, p.FloatString(18))
 }
 
 // v3SpotToUSD tries via a V3 pool spot price in uniswap_v3_pools (sqrt_price_x96) to WZIL or stablecoin.
@@ -169,7 +179,7 @@ func (r *DBRouter) getDecimals(ctx context.Context, token string) int {
 
 // pricesFromSqrtX96 returns price0 (token0 in token1) and price1 (token1 in token0) as decimal strings.
 func pricesFromSqrtX96(sqrtStr string, dec0, dec1 int) (price0, price1 string, ok bool) {
-	// price0 = (sqrt^2 / 2^192) * 10^(dec1-dec0)
+	// price0 = (sqrt^2 / 2^192) * 10^(dec0-dec1)
 	// Using big.Rat for precision
 	sqrt := new(big.Int)
 	_, ok = sqrt.SetString(sqrtStr, 10)
@@ -177,8 +187,8 @@ func pricesFromSqrtX96(sqrtStr string, dec0, dec1 int) (price0, price1 string, o
 	num := new(big.Int).Mul(sqrt, sqrt)              // sqrt^2
 	den := new(big.Int).Lsh(big.NewInt(1), 192)     // 2^192
 	ratio := new(big.Rat).SetFrac(num, den)
-	// scale by decimals
-	pow10 := new(big.Rat).SetFloat64(pow10Float(dec1 - dec0))
+	// scale by decimals (normalize to human units)
+	pow10 := new(big.Rat).SetFloat64(pow10Float(dec0 - dec1))
 	ratio.Mul(ratio, pow10)
 	price0 = ratio.FloatString(18)
 	// price1 is inverse adjusted: 1/price0

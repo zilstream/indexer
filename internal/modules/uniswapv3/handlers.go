@@ -213,7 +213,41 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 		func() string { if tick != nil { return tick.String() }; return "0" }(),
 	)
 	if err != nil { return err }
+	// Update pool's rolling state: liquidity and prices
+	if liquidity != nil || sqrtPriceX96 != nil || tick != nil {
+		_, _ = module.db.Pool().Exec(ctx, `
+			UPDATE uniswap_v3_pools
+			SET 
+				liquidity = COALESCE($2::numeric, liquidity),
+				sqrt_price_x96 = COALESCE($3::numeric, sqrt_price_x96),
+				tick = COALESCE($4::numeric, tick),
+				updated_at = CURRENT_TIMESTAMP
+			WHERE address = $1`,
+			strings.ToLower(event.Address.Hex()),
+			func() *string { if liquidity != nil { s := liquidity.String(); return &s }; return nil }(),
+			func() *string { if sqrtPriceX96 != nil { s := sqrtPriceX96.String(); return &s }; return nil }(),
+			func() *string { if tick != nil { s := tick.String(); return &s }; return nil }(),
+		)
+	}
+	// Seed reserves once if empty (start mid-history) using on-chain balances
+	module.refreshReservesIfEmpty(ctx, event.Address)
+	// Update reserves based on signed deltas from Swap (amount0/amount1 are int256 deltas of pool balances)
+	{
+		var d0, d1 string
+		if amount0 != nil { d0 = amount0.String() } else { d0 = "0" }
+		if amount1 != nil { d1 = amount1.String() } else { d1 = "0" }
+		_, _ = module.db.Pool().Exec(ctx, `
+			UPDATE uniswap_v3_pools
+			SET 
+				reserve0 = GREATEST(COALESCE(reserve0, 0) + $2::numeric, 0),
+				reserve1 = GREATEST(COALESCE(reserve1, 0) + $3::numeric, 0),
+				updated_at = CURRENT_TIMESTAMP
+			WHERE address = $1`,
+			strings.ToLower(event.Address.Hex()), d0, d1,
+		)
+	}
 	// Compute amount_usd using stablecoin/ZIL direct paths, then router fallback
+	var usd string
 	if module.priceProvider != nil {
 		var t0, t1 string
 		if err := module.db.Pool().QueryRow(ctx, `SELECT token0, token1 FROM uniswap_v3_pools WHERE address = $1`, strings.ToLower(event.Address.Hex())).Scan(&t0, &t1); err == nil {
@@ -223,7 +257,6 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 			// Resolve block timestamp via DB, fallback to RPC if DB row not yet visible
 			minute, ok := module.blockTime(ctx, event.BlockNumber)
 			if ok {
-				var usd string
 				// Stablecoin direct
 				if module.isStablecoin(l0) && amount0 != nil {
 					dec := module.tokenDecimals(ctx, l0)
@@ -264,6 +297,21 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 							volume_usd = COALESCE(volume_usd,0) + $2::numeric,
 							fees_usd = COALESCE(fees_usd,0) + ($2::numeric * (COALESCE(fee,0)::numeric / 1000000.0))
 						WHERE address = $1`, strings.ToLower(event.Address.Hex()), usd)
+					// Increment token-level volumes
+					_, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET total_volume_usd = COALESCE(total_volume_usd,0) + $2::numeric, updated_at = NOW() WHERE address = $1`, l0, usd)
+					_, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET total_volume_usd = COALESCE(total_volume_usd,0) + $2::numeric, updated_at = NOW() WHERE address = $1`, l1, usd)
+					// Update token prices if router/provider available
+					if module.priceRouter != nil {
+						if p0, ok := module.priceRouter.PriceTokenUSD(ctx, l0, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l0, p0) }
+						if p1, ok := module.priceRouter.PriceTokenUSD(ctx, l1, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l1, p1) }
+					} else {
+						// Ensure ZIL price at least
+						if l0 == zilAddr { if p, ok := module.priceProvider.PriceZILUSD(ctx, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l0, p) } }
+						if l1 == zilAddr { if p, ok := module.priceProvider.PriceZILUSD(ctx, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l1, p) } }
+					}
+					// Recompute liquidity for both tokens
+					recomputeTokenLiquidityUSD(ctx, module, l0)
+					recomputeTokenLiquidityUSD(ctx, module, l1)
 				}
 			}
 		}
@@ -333,6 +381,19 @@ func handleMint(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 		func() string { if amount1 != nil { return amount1.String() }; return "0" }(),
 	)
 	if err != nil { return err }
+	// Update reserves: Mint deposits tokens into the pool (amount0/amount1 are uint256)
+	{
+		var a0, a1 string
+		if amount0 != nil { a0 = amount0.String() } else { a0 = "0" }
+		if amount1 != nil { a1 = amount1.String() } else { a1 = "0" }
+		_, _ = module.db.Pool().Exec(ctx, `
+			UPDATE uniswap_v3_pools
+			SET 
+				reserve0 = GREATEST(COALESCE(reserve0, 0) + $2::numeric, 0),
+				reserve1 = GREATEST(COALESCE(reserve1, 0) + $3::numeric, 0),
+				updated_at = CURRENT_TIMESTAMP
+			WHERE address = $1`, strings.ToLower(event.Address.Hex()), a0, a1)
+	}
 	// Compute amount_usd (sum of both legs) for mint
 	if module.priceProvider != nil {
 		var t0, t1 string
@@ -350,6 +411,14 @@ func handleMint(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 				if total != "0" {
 					_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v3_mints SET amount_usd = $2::numeric WHERE id = $1`, id, total)
 				}
+				// Update token prices if router/provider available
+				if module.priceRouter != nil {
+					if p0, ok := module.priceRouter.PriceTokenUSD(ctx, l0, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l0, p0) }
+					if p1, ok := module.priceRouter.PriceTokenUSD(ctx, l1, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l1, p1) }
+				}
+				// Recompute liquidity for both tokens
+				recomputeTokenLiquidityUSD(ctx, module, l0)
+				recomputeTokenLiquidityUSD(ctx, module, l1)
 			}
 		}
 	}
@@ -418,6 +487,8 @@ func handleBurn(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 		func() string { if amount1 != nil { return amount1.String() }; return "0" }(),
 	)
 	if err != nil { return err }
+	// Note: Burn does not transfer tokens; balances are adjusted on Collect.
+	// No reserve update here.
 	// Compute amount_usd (sum of both legs) for burn
 	if module.priceProvider != nil {
 		var t0, t1 string
@@ -435,6 +506,14 @@ func handleBurn(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 				if total != "0" {
 					_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v3_burns SET amount_usd = $2::numeric WHERE id = $1`, id, total)
 				}
+				// Update token prices if router/provider available
+				if module.priceRouter != nil {
+					if p0, ok := module.priceRouter.PriceTokenUSD(ctx, l0, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l0, p0) }
+					if p1, ok := module.priceRouter.PriceTokenUSD(ctx, l1, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l1, p1) }
+				}
+				// Recompute liquidity for both tokens
+				recomputeTokenLiquidityUSD(ctx, module, l0)
+				recomputeTokenLiquidityUSD(ctx, module, l1)
 			}
 		}
 	}
@@ -504,6 +583,21 @@ func handleCollect(ctx context.Context, module *UniswapV3Module, event *core.Par
 		func() string { if amount1 != nil { return amount1.String() }; return "0" }(),
 	)
 	if err != nil { return err }
+	// Seed reserves once if empty (start mid-history) before subtracting
+	module.refreshReservesIfEmpty(ctx, event.Address)
+	// Update reserves: Collect withdraws fees from the pool
+	{
+		var c0, c1 string
+		if amount0 != nil { c0 = amount0.String() } else { c0 = "0" }
+		if amount1 != nil { c1 = amount1.String() } else { c1 = "0" }
+		_, _ = module.db.Pool().Exec(ctx, `
+			UPDATE uniswap_v3_pools
+			SET 
+				reserve0 = GREATEST(COALESCE(reserve0, 0) - $2::numeric, 0),
+				reserve1 = GREATEST(COALESCE(reserve1, 0) - $3::numeric, 0),
+				updated_at = CURRENT_TIMESTAMP
+			WHERE address = $1`, strings.ToLower(event.Address.Hex()), c0, c1)
+	}
 	// Compute amount_usd (sum of both legs) for collect
 	if module.priceProvider != nil {
 		var t0, t1 string
@@ -521,6 +615,14 @@ func handleCollect(ctx context.Context, module *UniswapV3Module, event *core.Par
 				if total != "0" {
 					_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v3_collects SET amount_usd = $2::numeric WHERE id = $1`, id, total)
 				}
+				// Update token prices if router/provider available
+				if module.priceRouter != nil {
+					if p0, ok := module.priceRouter.PriceTokenUSD(ctx, l0, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l0, p0) }
+					if p1, ok := module.priceRouter.PriceTokenUSD(ctx, l1, minute); ok { _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, l1, p1) }
+				}
+				// Recompute liquidity for both tokens
+				recomputeTokenLiquidityUSD(ctx, module, l0)
+				recomputeTokenLiquidityUSD(ctx, module, l1)
 			}
 		}
 	}
@@ -624,4 +726,40 @@ func pow10Float(n int) float64 {
 	if n > 0 { for i:=0; i<n; i++ { v *= 10 } }
 	if n < 0 { for i:=0; i<(-n); i++ { v /= 10 } }
 	return v
+}
+
+// recomputeTokenLiquidityUSD recalculates tokens.total_liquidity_usd as the sum of the token's
+// reserve USD across all Uniswap V2 pairs and Uniswap V3 pools.
+func recomputeTokenLiquidityUSD(ctx context.Context, module *UniswapV3Module, addr string) {
+	q := `
+	WITH v2 AS (
+		SELECT COALESCE(SUM(
+			CASE 
+				WHEN p.token0 = $1 THEN (COALESCE(p.reserve0,0) / POWER(10::numeric, COALESCE(t0.decimals,18))) * COALESCE(t0.price_usd,0)
+				WHEN p.token1 = $1 THEN (COALESCE(p.reserve1,0) / POWER(10::numeric, COALESCE(t1.decimals,18))) * COALESCE(t1.price_usd,0)
+				ELSE 0
+			END
+		),0) AS usd
+		FROM uniswap_v2_pairs p
+		LEFT JOIN tokens t0 ON t0.address = p.token0
+		LEFT JOIN tokens t1 ON t1.address = p.token1
+		WHERE p.token0 = $1 OR p.token1 = $1
+	), v3 AS (
+		SELECT COALESCE(SUM(
+			CASE 
+				WHEN p.token0 = $1 THEN (COALESCE(p.reserve0,0) / POWER(10::numeric, COALESCE(t0.decimals,18))) * COALESCE(t0.price_usd,0)
+				WHEN p.token1 = $1 THEN (COALESCE(p.reserve1,0) / POWER(10::numeric, COALESCE(t1.decimals,18))) * COALESCE(t1.price_usd,0)
+				ELSE 0
+			END
+		),0) AS usd
+		FROM uniswap_v3_pools p
+		LEFT JOIN tokens t0 ON t0.address = p.token0
+		LEFT JOIN tokens t1 ON t1.address = p.token1
+		WHERE p.token0 = $1 OR p.token1 = $1
+	)
+	UPDATE tokens t
+	SET total_liquidity_usd = COALESCE((SELECT v2.usd FROM v2),0) + COALESCE((SELECT v3.usd FROM v3),0),
+		updated_at = NOW()
+	WHERE t.address = $1`
+	_, _ = module.db.Pool().Exec(ctx, q, strings.ToLower(addr))
 }

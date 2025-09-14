@@ -37,6 +37,16 @@ build-load-zil-prices:
 	@echo "Building CSV loader..."
 	@go build $(LDFLAGS) -o bin/load_zil_prices_csv cmd/load_zil_prices_csv/main.go
 
+## build-backfill: Build the backfill binary
+build-backfill:
+	@echo "Building backfill tool..."
+	@go build $(LDFLAGS) -o bin/backfill cmd/backfill/main.go
+
+## backfill: Run backfill for a module (usage: make backfill MODULE=uniswap-v2 FROM=0 TO=0)
+backfill:
+	@echo "Running backfill for MODULE=$(MODULE) FROM=$(FROM) TO=$(TO)"
+	@go run cmd/backfill/main.go --config=$(CONFIG) --module=$(MODULE) --from=$(FROM) --to=$(TO)
+
 ## clean: Clean build artifacts and test cache
 clean:
 	@echo "Cleaning..."

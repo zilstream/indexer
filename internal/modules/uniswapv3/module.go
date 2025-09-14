@@ -2,6 +2,7 @@ package uniswapv3
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math/big"
 	"strings"
@@ -291,6 +292,46 @@ func (m *UniswapV3Module) fetchTokenMetadata(ctx context.Context, tokenAddress c
 	}
 
 	return metadata, nil
+}
+
+// fetchPoolBalances reads token balances held by the pool contract via balanceOf
+func (m *UniswapV3Module) fetchPoolBalances(ctx context.Context, pool common.Address, token0, token1 common.Address) (*big.Int, *big.Int, error) {
+	if m.rpcClient == nil {
+		return nil, nil, fmt.Errorf("no RPC client for balance fetch")
+	}
+	const abiStr = `[{"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}]`
+	erc20ABI, err := abi.JSON(strings.NewReader(abiStr))
+	if err != nil { return nil, nil, fmt.Errorf("parse balanceOf ABI: %w", err) }
+	c0 := bind.NewBoundContract(token0, erc20ABI, m.rpcClient, m.rpcClient, m.rpcClient)
+	c1 := bind.NewBoundContract(token1, erc20ABI, m.rpcClient, m.rpcClient, m.rpcClient)
+	// call balanceOf(pool)
+	var out0, out1 []interface{}
+	out0 = make([]interface{}, 1)
+	out0[0] = new(*big.Int)
+	if err := c0.Call(nil, &out0, "balanceOf", pool); err != nil { return nil, nil, err }
+	b0, _ := out0[0].(**big.Int)
+	if b0 == nil || *b0 == nil { bz := big.NewInt(0); b0 = &bz }
+	out1 = make([]interface{}, 1)
+	out1[0] = new(*big.Int)
+	if err := c1.Call(nil, &out1, "balanceOf", pool); err != nil { return nil, nil, err }
+	b1, _ := out1[0].(**big.Int)
+	if b1 == nil || *b1 == nil { bz := big.NewInt(0); b1 = &bz }
+	return *b0, *b1, nil
+}
+
+// refreshReservesIfEmpty seeds reserves from on-chain balances if both are zero/NULL
+func (m *UniswapV3Module) refreshReservesIfEmpty(ctx context.Context, pool common.Address) {
+	var r0, r1 sql.NullString
+	var t0, t1 string
+	addr := strings.ToLower(pool.Hex())
+	if err := m.db.Pool().QueryRow(ctx, `SELECT reserve0, reserve1, token0, token1 FROM uniswap_v3_pools WHERE address = $1`, addr).Scan(&r0, &r1, &t0, &t1); err != nil {
+		return
+	}
+	isZero := (!r0.Valid || r0.String == "0") && (!r1.Valid || r1.String == "0")
+	if !isZero || m.rpcClient == nil { return }
+	b0, b1, err := m.fetchPoolBalances(ctx, pool, common.HexToAddress(t0), common.HexToAddress(t1))
+	if err != nil { return }
+	_, _ = m.db.Pool().Exec(ctx, `UPDATE uniswap_v3_pools SET reserve0 = $2::numeric, reserve1 = $3::numeric, updated_at = CURRENT_TIMESTAMP WHERE address = $1`, addr, b0.String(), b1.String())
 }
 
 // HandleEvent processes a single event log

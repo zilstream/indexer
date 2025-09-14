@@ -41,7 +41,8 @@ config *Config
 	handlers map[common.Hash]EventHandler
 
 	// Pricing
-priceProvider prices.Provider
+	priceProvider prices.Provider
+	priceRouter   prices.TokenRouter
 }
 
 // Config represents the module configuration
@@ -166,12 +167,12 @@ m.db = db
 
 // Connect to RPC if we have an endpoint configured
 if m.config != nil && m.config.RPCEndpoint != "" {
- client, err := ethclient.Dial(m.config.RPCEndpoint)
- if err != nil {
- m.logger.Warn().Err(err).Msg("Failed to connect to RPC for token metadata fetching")
- } else {
-  m.rpcClient = client
-  m.logger.Info().Str("endpoint", m.config.RPCEndpoint).Msg("Connected to RPC for token metadata")
+client, err := ethclient.Dial(m.config.RPCEndpoint)
+if err != nil {
+m.logger.Warn().Err(err).Msg("Failed to connect to RPC for token metadata fetching")
+} else {
+m.rpcClient = client
+m.logger.Info().Str("endpoint", m.config.RPCEndpoint).Msg("Connected to RPC for token metadata")
 }
 }
 
@@ -184,17 +185,27 @@ startBlock = *m.manifest.DataSources[0].Source.StartBlock
 query := `
 INSERT INTO uniswap_v2_factory (address, pair_count, created_at_block, created_at_timestamp, updated_at)
 VALUES ($1, 0, $2, extract(epoch from now())::bigint, NOW())
- ON CONFLICT (address) DO NOTHING`
-	
-	_, err := db.Pool().Exec(ctx, query, strings.ToLower(m.factoryAddress.Hex()), startBlock)
-	if err != nil {
-		return fmt.Errorf("failed to initialize factory: %w", err)
+ON CONFLICT (address) DO NOTHING`
+
+_, err := db.Pool().Exec(ctx, query, strings.ToLower(m.factoryAddress.Hex()), startBlock)
+if err != nil {
+return fmt.Errorf("failed to initialize factory: %w", err)
 }
 
-m.logger.Info().
- Str("factory", m.factoryAddress.Hex()).
-		Msg("UniswapV2 module initialized")
-return nil
+// Build price router if provider is available
+if m.priceProvider != nil {
+  // collect stablecoin addresses from config
+    stables := make([]string, 0, len(m.config.Stablecoins))
+     for _, s := range m.config.Stablecoins {
+         stables = append(stables, strings.ToLower(s.Address))
+     }
+     m.priceRouter = prices.NewDBRouter(db.Pool(), m.priceProvider, m.wethAddress.Hex(), stables)
+ }
+ 
+ m.logger.Info().
+  Str("factory", m.factoryAddress.Hex()).
+ 		Msg("UniswapV2 module initialized")
+ return nil
 }
 
 // HandleEvent processes a single event log
@@ -267,6 +278,15 @@ var ts int64
 row := m.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, blockNumber)
 if err := row.Scan(&ts); err != nil { return time.Time{}, err }
 return time.Unix(ts, 0).UTC(), nil
+}
+
+// tokenDecimals fetches token decimals from DB, fallback 18
+func (m *UniswapV2Module) tokenDecimals(ctx context.Context, addr string) int {
+ var d int
+ if err := m.db.Pool().QueryRow(ctx, `SELECT COALESCE(decimals, 18) FROM tokens WHERE address = $1`, strings.ToLower(addr)).Scan(&d); err != nil {
+     return 18
+ }
+ return d
 }
 
 // GetEventFilters returns the event filters this module is interested in
