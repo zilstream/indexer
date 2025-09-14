@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"strings"
 
@@ -68,11 +69,16 @@ func (p *EventParser) ParseEvent(log *types.Log) (*ParsedEvent, error) {
 	if len(log.Topics) == 0 {
 		return nil, ErrInvalidEvent{Reason: "no topics in log"}
 	}
-	
+
 	// Find the event by topic0 (event signature)
 	eventABI, exists := p.events[log.Topics[0]]
 	if !exists {
 		return nil, ErrUnknownEvent{Topic: log.Topics[0].Hex()}
+	}
+
+	// Special check for Mint event to debug the issue
+	if eventABI.Name == "Mint" && len(log.Topics) < 2 {
+		return nil, ErrInvalidEvent{Reason: fmt.Sprintf("Mint event has insufficient topics: expected at least 2, got %d", len(log.Topics))}
 	}
 	
 	// Parse the event data
@@ -80,13 +86,15 @@ func (p *EventParser) ParseEvent(log *types.Log) (*ParsedEvent, error) {
 	
 	// Parse indexed parameters (topics[1:])
 	indexedArgs := make([]interface{}, 0)
-	for i, input := range eventABI.Inputs {
+	topicIndex := 1 // Start from topics[1] since topics[0] is the event signature
+	for _, input := range eventABI.Inputs {
 		if input.Indexed {
-			if i+1 < len(log.Topics) {
+			if topicIndex < len(log.Topics) {
 				// Convert topic to appropriate type
-				value := p.parseIndexedArg(log.Topics[i+1], input.Type)
+				value := p.parseIndexedArg(log.Topics[topicIndex], input.Type)
 				args[input.Name] = value
 				indexedArgs = append(indexedArgs, value)
+				topicIndex++
 			}
 		}
 	}

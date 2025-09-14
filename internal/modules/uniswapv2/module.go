@@ -200,7 +200,14 @@ if m.priceProvider != nil {
      for _, s := range m.config.Stablecoins {
          stables = append(stables, strings.ToLower(s.Address))
      }
+     m.logger.Info().
+         Strs("stablecoins", stables).
+         Str("weth", m.wethAddress.Hex()).
+         Int("num_stablecoins", len(stables)).
+         Msg("Initializing price router with stablecoins")
      m.priceRouter = prices.NewDBRouter(db.Pool(), m.priceProvider, m.wethAddress.Hex(), stables)
+ } else {
+     m.logger.Warn().Msg("No price provider available, USD calculations will be limited")
  }
  
  m.logger.Info().
@@ -425,6 +432,149 @@ func (m *UniswapV2Module) Backfill(ctx context.Context, fromBlock, toBlock uint6
 	return nil
 }
 
+// updatePairStatistics updates pair reserves, volumes, and transaction counts from processed events
+func (m *UniswapV2Module) updatePairStatistics(ctx context.Context, tx pgx.Tx, swapEvents, syncEvents []*types.Log) error {
+	// Update reserves from the latest sync events per pair
+	if len(syncEvents) > 0 {
+		// Group syncs by pair and find the latest one for each
+		latestSyncByPair := make(map[string]*types.Log)
+		for _, event := range syncEvents {
+			pairAddr := strings.ToLower(event.Address.Hex())
+			if existing, ok := latestSyncByPair[pairAddr]; !ok || event.BlockNumber > existing.BlockNumber ||
+				(event.BlockNumber == existing.BlockNumber && event.Index > existing.Index) {
+				latestSyncByPair[pairAddr] = event
+			}
+		}
+
+		// Update reserves for each pair with its latest sync
+		for pairAddr, event := range latestSyncByPair {
+			if len(event.Data) < 64 {
+				continue
+			}
+			reserve0 := new(big.Int).SetBytes(event.Data[0:32])
+			reserve1 := new(big.Int).SetBytes(event.Data[32:64])
+
+			_, err := tx.Exec(ctx, `
+				UPDATE uniswap_v2_pairs
+				SET reserve0 = $2::numeric, reserve1 = $3::numeric, updated_at = NOW()
+				WHERE address = $1`,
+				pairAddr, reserve0.String(), reserve1.String())
+
+			if err != nil {
+				m.logger.Error().Err(err).Str("pair", pairAddr).Msg("Failed to update reserves")
+			} else {
+				m.logger.Debug().
+					Str("pair", pairAddr).
+					Str("reserve0", reserve0.String()).
+					Str("reserve1", reserve1.String()).
+					Msg("Updated pair reserves from batch")
+			}
+
+			// Update reserve_usd if we have pricing
+			if m.priceRouter != nil {
+				// This would require fetching token addresses and calculating USD values
+				// For now, we'll rely on a separate process to update USD values
+			}
+		}
+	}
+
+	// Update volumes and transaction counts from swaps
+	if len(swapEvents) > 0 {
+		// Group swaps by pair to update statistics
+		swapsByPair := make(map[string][]*types.Log)
+		for _, event := range swapEvents {
+			pairAddr := strings.ToLower(event.Address.Hex())
+			swapsByPair[pairAddr] = append(swapsByPair[pairAddr], event)
+		}
+
+		for pairAddr, pairSwaps := range swapsByPair {
+			var totalVolume0, totalVolume1 big.Int
+
+			for _, event := range pairSwaps {
+				if len(event.Data) < 128 {
+					continue
+				}
+				amount0In := new(big.Int).SetBytes(event.Data[0:32])
+				amount1In := new(big.Int).SetBytes(event.Data[32:64])
+				amount0Out := new(big.Int).SetBytes(event.Data[64:96])
+				amount1Out := new(big.Int).SetBytes(event.Data[96:128])
+
+				// Volume is the absolute difference between in and out
+				vol0 := new(big.Int).Sub(amount0Out, amount0In)
+				vol0.Abs(vol0)
+				totalVolume0.Add(&totalVolume0, vol0)
+
+				vol1 := new(big.Int).Sub(amount1Out, amount1In)
+				vol1.Abs(vol1)
+				totalVolume1.Add(&totalVolume1, vol1)
+			}
+
+			// Update volumes and transaction count
+			_, err := tx.Exec(ctx, `
+				UPDATE uniswap_v2_pairs
+				SET
+					volume_token0 = COALESCE(volume_token0, 0) + $2::numeric,
+					volume_token1 = COALESCE(volume_token1, 0) + $3::numeric,
+					txn_count = COALESCE(txn_count, 0) + $4,
+					updated_at = NOW()
+				WHERE address = $1`,
+				pairAddr, totalVolume0.String(), totalVolume1.String(), len(pairSwaps))
+
+			if err != nil {
+				m.logger.Error().Err(err).Str("pair", pairAddr).Msg("Failed to update volumes")
+			} else {
+				m.logger.Debug().
+					Str("pair", pairAddr).
+					Str("volume0_added", totalVolume0.String()).
+					Str("volume1_added", totalVolume1.String()).
+					Int("swaps", len(pairSwaps)).
+					Msg("Updated pair volumes from batch")
+			}
+		}
+
+		// Update volume_usd from the sum of swap amounts_usd
+		_, err := tx.Exec(ctx, `
+			UPDATE uniswap_v2_pairs p
+			SET volume_usd = (
+				SELECT COALESCE(SUM(s.amount_usd), 0)
+				FROM uniswap_v2_swaps s
+				WHERE s.pair = p.address
+			)
+			WHERE p.address IN (SELECT DISTINCT pair FROM uniswap_v2_swaps)`)
+
+		if err != nil {
+			m.logger.Error().Err(err).Msg("Failed to update volume_usd")
+		}
+	}
+
+	// Update reserve_usd based on current prices
+	if m.priceRouter != nil {
+		// Update reserve_usd based on prices
+		_, err := tx.Exec(ctx, `
+			UPDATE uniswap_v2_pairs p
+			SET reserve_usd = COALESCE(
+				CASE
+					WHEN t0.price_usd IS NOT NULL AND t1.price_usd IS NOT NULL THEN
+						((p.reserve0::numeric / POWER(10, COALESCE(t0.decimals, 18))) * t0.price_usd) +
+						((p.reserve1::numeric / POWER(10, COALESCE(t1.decimals, 18))) * t1.price_usd)
+					WHEN t0.price_usd IS NOT NULL THEN
+						2 * ((p.reserve0::numeric / POWER(10, COALESCE(t0.decimals, 18))) * t0.price_usd)
+					WHEN t1.price_usd IS NOT NULL THEN
+						2 * ((p.reserve1::numeric / POWER(10, COALESCE(t1.decimals, 18))) * t1.price_usd)
+					ELSE reserve_usd
+				END, reserve_usd)
+			FROM tokens t0, tokens t1
+			WHERE t0.address = p.token0 AND t1.address = p.token1
+				AND (p.reserve0 > 0 OR p.reserve1 > 0)`)
+
+		if err != nil {
+			m.logger.Error().Err(err).Msg("Failed to update reserve_usd")
+		}
+	}
+
+	return nil
+}
+
 // GetSyncState returns the last processed block for this module
 func (m *UniswapV2Module) GetSyncState(ctx context.Context) (uint64, error) {
 	var lastBlock uint64
@@ -615,6 +765,15 @@ func (m *UniswapV2Module) HandleEventBatch(ctx context.Context, events []*types.
 	if len(burnEvents) > 0 {
 		if err := m.batchHandleBurns(ctx, tx, burnEvents); err != nil {
 			return fmt.Errorf("batch Burns failed: %w", err)
+		}
+	}
+
+	// Update pair aggregate statistics based on the events we just processed
+	// This updates reserves from syncs, volumes from swaps, and transaction counts
+	if len(swapEvents) > 0 || len(syncEvents) > 0 {
+		if err := m.updatePairStatistics(ctx, tx, swapEvents, syncEvents); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to update pair statistics")
+			// Don't fail the whole batch for statistics updates
 		}
 	}
 
@@ -1069,23 +1228,52 @@ func (m *UniswapV2Module) batchHandleMints(ctx context.Context, tx pgx.Tx, event
 	// Process each Mint event - they need to update existing "pending" mint rows
 	// created by Transfer events (from == 0x0)
 	for _, event := range events {
-		// Extract indexed sender from topics
+		// Extract sender - some contracts have it indexed, others don't
 		var sender common.Address
 		if len(event.Topics) >= 2 {
+			// Standard: sender is indexed (second topic)
 			sender = common.BytesToAddress(event.Topics[1].Bytes())
+		} else if len(event.Data) >= 96 {
+			// Non-standard: sender is in data field (first 32 bytes)
+			// This happens with some non-standard Uniswap V2 implementations
+			sender = common.BytesToAddress(event.Data[0:32])
+			m.logger.Debug().
+				Str("tx_hash", event.TxHash.Hex()).
+				Str("sender", sender.Hex()).
+				Msg("Extracted sender from data field (non-standard Mint event)")
 		} else {
-			m.logger.Error().Msg("Insufficient topics for Mint event")
-			continue
+			// Fallback: use zero address
+			m.logger.Warn().
+				Int("topic_count", len(event.Topics)).
+				Int("data_len", len(event.Data)).
+				Str("tx_hash", event.TxHash.Hex()).
+				Uint64("block", event.BlockNumber).
+				Str("address", event.Address.Hex()).
+				Msg("Cannot extract sender from Mint event, using zero address")
+			sender = common.Address{}
 		}
 
 		// Parse amounts from data field
-		if len(event.Data) < 64 {
-			m.logger.Error().Msg("Insufficient data for Mint event")
-			continue
+		// Standard: amount0 and amount1 are at positions 0 and 32
+		// Non-standard: amount0 and amount1 are at positions 32 and 64 (after sender)
+		var amount0, amount1 *big.Int
+		if len(event.Topics) >= 2 {
+			// Standard format: amounts start at position 0
+			if len(event.Data) < 64 {
+				m.logger.Error().Msg("Insufficient data for standard Mint event")
+				continue
+			}
+			amount0 = new(big.Int).SetBytes(event.Data[0:32])
+			amount1 = new(big.Int).SetBytes(event.Data[32:64])
+		} else {
+			// Non-standard format: amounts start at position 32 (after sender)
+			if len(event.Data) < 96 {
+				m.logger.Error().Msg("Insufficient data for non-standard Mint event")
+				continue
+			}
+			amount0 = new(big.Int).SetBytes(event.Data[32:64])
+			amount1 = new(big.Int).SetBytes(event.Data[64:96])
 		}
-
-		amount0 := new(big.Int).SetBytes(event.Data[0:32])
-		amount1 := new(big.Int).SetBytes(event.Data[32:64])
 
 		// Check for duplicates first
 		var exists int

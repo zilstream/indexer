@@ -242,6 +242,11 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 	// Phase 4: Process events synchronously in the correct order
 	var eventProcessDuration time.Duration
 	processedEvents := 0
+	if s.modules == nil {
+		s.logger.Warn().Msg("No module registry available, skipping event processing")
+	} else if len(eventLogsByBlock) == 0 {
+		s.logger.Debug().Msg("No events to process in this batch")
+	}
 	if s.modules != nil && len(eventLogsByBlock) > 0 {
 		eventProcessStart := time.Now()
 
@@ -275,6 +280,9 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 
 		// Process all events in a single batch for maximum performance
 		if len(allEvents) > 0 {
+			s.logger.Info().
+				Int("event_count", len(allEvents)).
+				Msg("Sending events to module registry for processing")
 			if err := s.modules.ProcessEventBatch(ctx, allEvents); err != nil {
 				s.logger.Error().
 					Err(err).
@@ -282,6 +290,10 @@ func (s *UnifiedSync) processBatch(ctx context.Context, startBlock, endBlock uin
 					Msg("Failed to process event batch in modules")
 				// Note: Individual module errors are handled within ProcessEventBatch
 			}
+		} else {
+			s.logger.Debug().
+				Int("blocks", len(sortedBlockNums)).
+				Msg("No events to send to modules")
 		}
 		eventProcessDuration = time.Since(eventProcessStart)
 	}

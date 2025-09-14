@@ -100,6 +100,7 @@ func handlePairCreated(ctx context.Context, module *UniswapV2Module, event *core
 	}
 
 	// Ensure tokens exist in the universal tokens table
+	// This will also set stablecoin prices to $1 if they're configured stablecoins
 	if err := module.ensureToken(ctx, token0, event.BlockNumber, event.Timestamp.Int64()); err != nil {
 		return fmt.Errorf("failed to ensure token0: %w", err)
 	}
@@ -256,18 +257,39 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 
 	// Update pair token volumes (raw units) and transaction count
 	// For each token side, add the absolute net amount swapped: abs(out - in)
-	_, _ = module.db.Pool().Exec(ctx, `
+	pairAddrSwap := strings.ToLower(event.Address.Hex())
+	module.logger.Info().
+		Str("pair", pairAddrSwap).
+		Str("amount0In", amount0In.String()).
+		Str("amount0Out", amount0Out.String()).
+		Str("amount1In", amount1In.String()).
+		Str("amount1Out", amount1Out.String()).
+		Msg("Updating pair volumes from Swap event")
+
+	resultSwap, err := module.db.Pool().Exec(ctx, `
 		UPDATE uniswap_v2_pairs
-		SET 
+		SET
 			volume_token0 = COALESCE(volume_token0,0) + ABS(($2::numeric) - ($3::numeric)),
 			volume_token1 = COALESCE(volume_token1,0) + ABS(($4::numeric) - ($5::numeric)),
 			txn_count = COALESCE(txn_count,0) + 1,
 			updated_at = NOW()
 		WHERE address = $1`,
-		strings.ToLower(event.Address.Hex()),
-		amount0In.String(), amount0Out.String(),
-		amount1In.String(), amount1Out.String(),
+		pairAddrSwap,
+		amount0Out.String(), amount0In.String(),
+		amount1Out.String(), amount1In.String(),
 	)
+
+	if err != nil {
+		module.logger.Error().
+			Err(err).
+			Str("pair", pairAddrSwap).
+			Msg("Failed to update pair volumes and txn_count")
+	} else {
+		module.logger.Info().
+			Str("pair", pairAddrSwap).
+			Int64("rows_affected", resultSwap.RowsAffected()).
+			Msg("Pair volumes update result")
+	}
 
 	// Compute USD notional for swaps when pricing is available
 	var swapUSD string
@@ -323,9 +345,27 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 					usd1 := ""
 					if p0, ok := module.priceRouter.PriceTokenUSD(ctx, strings.ToLower(t0), minute); ok {
 						usd0 = mulStr(divBigIntByPow10Str(vol0, dec0), p0)
+						module.logger.Debug().
+							Str("token", t0).
+							Str("price", p0).
+							Str("volume_usd", usd0).
+							Msg("Token0 USD price from router")
+					} else {
+						module.logger.Debug().
+							Str("token", t0).
+							Msg("No USD price for token0 from router")
 					}
 					if p1, ok := module.priceRouter.PriceTokenUSD(ctx, strings.ToLower(t1), minute); ok {
 						usd1 = mulStr(divBigIntByPow10Str(vol1, dec1), p1)
+						module.logger.Debug().
+							Str("token", t1).
+							Str("price", p1).
+							Str("volume_usd", usd1).
+							Msg("Token1 USD price from router")
+					} else {
+						module.logger.Debug().
+							Str("token", t1).
+							Msg("No USD price for token1 from router")
 					}
 					// choose the non-empty, else max of both if both present
 					sel := ""
@@ -435,19 +475,30 @@ func handleSync(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 	
 	// Update pair reserves
 	updatePairQuery := `
-	UPDATE uniswap_v2_pairs 
-	SET reserve0 = $2, reserve1 = $3, updated_at = CURRENT_TIMESTAMP
+	UPDATE uniswap_v2_pairs
+	SET reserve0 = $2::numeric, reserve1 = $3::numeric, updated_at = CURRENT_TIMESTAMP
 	WHERE address = $1`
 
-	_, err = module.db.Pool().Exec(ctx, updatePairQuery,
-		strings.ToLower(event.Address.Hex()),
+	module.logger.Info().
+		Str("pair", pairAddr).
+		Str("reserve0", reserve0.String()).
+		Str("reserve1", reserve1.String()).
+		Msg("Updating pair reserves from Sync event")
+
+	resultSync, err := module.db.Pool().Exec(ctx, updatePairQuery,
+		pairAddr,
 		reserve0.String(),
 		reserve1.String(),
 	)
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to update pair reserves: %w", err)
 	}
+
+	module.logger.Info().
+		Str("pair", pairAddr).
+		Int64("rows_affected", resultSync.RowsAffected()).
+		Msg("Pair reserves update result")
 
 	// Update reserve_usd and token prices, then recompute token liquidity
 	if module.priceProvider != nil {
@@ -601,21 +652,62 @@ func handleMint(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 	// topics[1] = indexed sender address
 	// data contains: amount0, amount1
 
-	// Extract indexed sender from topics
+	// Debug log the raw event data
+	module.logger.Debug().
+		Int("topics_count", len(event.Log.Topics)).
+		Str("tx_hash", event.TransactionHash.Hex()).
+		Uint64("block", event.BlockNumber).
+		Str("address", event.Address.Hex()).
+		Interface("topics", event.Log.Topics).
+		Int("data_len", len(event.Log.Data)).
+		Hex("data", event.Log.Data).
+		Interface("parsed_args", event.Args).
+		Msg("Processing Mint event raw data")
+
+	// Extract sender - some contracts have it indexed, others don't
 	var sender common.Address
 	if len(event.Log.Topics) >= 2 {
+		// Standard: sender is indexed (second topic)
 		sender = common.BytesToAddress(event.Log.Topics[1].Bytes())
+	} else if len(event.Log.Data) >= 96 {
+		// Non-standard: sender is in data field (first 32 bytes)
+		// This happens with some non-standard Uniswap V2 implementations
+		sender = common.BytesToAddress(event.Log.Data[0:32])
+		module.logger.Debug().
+			Str("tx_hash", event.TransactionHash.Hex()).
+			Str("sender", sender.Hex()).
+			Msg("Extracted sender from data field (non-standard Mint event)")
 	} else {
-		return fmt.Errorf("insufficient topics for Mint event")
+		// Fallback: use zero address
+		module.logger.Warn().
+			Int("topic_count", len(event.Log.Topics)).
+			Int("data_len", len(event.Log.Data)).
+			Str("tx_hash", event.TransactionHash.Hex()).
+			Uint64("block", event.BlockNumber).
+			Str("address", event.Address.Hex()).
+			Msg("Cannot extract sender from Mint event, using zero address")
+		sender = common.Address{}
 	}
 
 	// Parse amounts from data field
-	if len(event.Log.Data) < 64 { // Need at least 2 * 32 bytes
-		return fmt.Errorf("insufficient data for Mint event")
+	// Standard: amount0 and amount1 are at positions 0 and 32
+	// Non-standard: amount0 and amount1 are at positions 32 and 64 (after sender)
+	var amount0, amount1 *big.Int
+	if len(event.Log.Topics) >= 2 {
+		// Standard format: amounts start at position 0
+		if len(event.Log.Data) < 64 {
+			return fmt.Errorf("insufficient data for standard Mint event")
+		}
+		amount0 = new(big.Int).SetBytes(event.Log.Data[0:32])
+		amount1 = new(big.Int).SetBytes(event.Log.Data[32:64])
+	} else {
+		// Non-standard format: amounts start at position 32 (after sender)
+		if len(event.Log.Data) < 96 {
+			return fmt.Errorf("insufficient data for non-standard Mint event")
+		}
+		amount0 = new(big.Int).SetBytes(event.Log.Data[32:64])
+		amount1 = new(big.Int).SetBytes(event.Log.Data[64:96])
 	}
-
-	amount0 := new(big.Int).SetBytes(event.Log.Data[0:32])
-	amount1 := new(big.Int).SetBytes(event.Log.Data[32:64])
 
 	// Try to complete a pending mint from the same tx/pair
 	// Fetch block timestamp for USD valuation if needed
@@ -943,28 +1035,54 @@ func (m *UniswapV2Module) ensureToken(ctx context.Context, tokenAddress common.A
 		}
 	}
 
-	// Insert token with metadata
+	// Check if this is a stablecoin
+	tokenAddrLower := strings.ToLower(tokenAddress.Hex())
+	isStablecoin := false
+	var stablecoinPrice float64 = 1.0 // Default price for stablecoins
+
+	for _, stable := range m.config.Stablecoins {
+		if strings.ToLower(stable.Address) == tokenAddrLower {
+			isStablecoin = true
+			break
+		}
+	}
+
+	// Insert token with metadata (and price if it's a stablecoin)
 	insertQuery := `
-		INSERT INTO tokens (address, name, symbol, decimals, total_supply, first_seen_block, first_seen_timestamp)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO tokens (address, name, symbol, decimals, total_supply, first_seen_block, first_seen_timestamp, price_usd)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (address) DO UPDATE SET
 			name = COALESCE(tokens.name, EXCLUDED.name),
 			symbol = COALESCE(tokens.symbol, EXCLUDED.symbol),
 			decimals = COALESCE(tokens.decimals, EXCLUDED.decimals),
-			total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply)`
+			total_supply = COALESCE(EXCLUDED.total_supply, tokens.total_supply),
+			price_usd = COALESCE(tokens.price_usd, EXCLUDED.price_usd)` // Only set price if not already set
+
+	var priceToSet *float64
+	if isStablecoin {
+		priceToSet = &stablecoinPrice
+	}
 
 	_, err = m.db.Pool().Exec(ctx, insertQuery,
-		strings.ToLower(tokenAddress.Hex()),
+		tokenAddrLower,
 		tokenInfo.Name,
 		tokenInfo.Symbol,
 		tokenInfo.Decimals,
 		tokenInfo.TotalSupply.String(),
 		firstSeenBlock,
 		firstSeenTimestamp,
+		priceToSet, // Will be NULL for non-stablecoins
 	)
 
 	if err != nil {
 		return fmt.Errorf("failed to insert token: %w", err)
+	}
+
+	if isStablecoin {
+		m.logger.Info().
+			Str("token", tokenAddrLower).
+			Str("symbol", tokenInfo.Symbol).
+			Msg("Created stablecoin token with $1 price")
 	}
 
 	m.logger.Info().

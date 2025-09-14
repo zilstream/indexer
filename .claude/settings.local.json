@@ -9,7 +9,8 @@
       "WebFetch(domain:github.com)",
       "WebSearch",
       "Bash(psql:*)",
-      "Bash(make:*)"
+      "Bash(make:*)",
+      "Bash(./indexer:*)"
     ],
     "deny": [],
     "ask": []

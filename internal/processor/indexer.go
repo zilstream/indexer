@@ -227,13 +227,15 @@ func (i *Indexer) waitForShutdown() {
 // initializeModules initializes the module system
 func (i *Indexer) initializeModules(ctx context.Context) error {
 	i.logger.Info().Msg("Initializing modules")
-	
+
 	// Load manifests from directory
 	manifestLoader := loader.NewManifestLoader(i.logger)
 	manifests, err := manifestLoader.LoadFromDirectory("manifests")
 	if err != nil {
 		return fmt.Errorf("failed to load manifests: %w", err)
 	}
+
+	i.logger.Info().Int("count", len(manifests)).Msg("Loaded manifests")
 	
 	// Initialize each module based on manifest
 	// Create shared price provider
