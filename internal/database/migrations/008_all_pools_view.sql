@@ -9,6 +9,10 @@ SELECT
     p.address                        AS address,
     p.token0                         AS token0,
     p.token1                         AS token1,
+    t0.symbol                        AS token0_symbol,
+    t0.name                          AS token0_name,
+    t1.symbol                        AS token1_symbol,
+    t1.name                          AS token1_name,
     NULL::numeric                    AS fee,              -- V2 has no fee tier per pool
     p.reserve0                       AS reserve0,         -- V2 reserves
     p.reserve1                       AS reserve1,
@@ -36,6 +40,8 @@ SELECT
     END                               AS last_activity,   -- datetime
     COALESCE(v24.volume_usd_24h, 0)::numeric AS volume_usd_24h -- rolling 24h USD volume
 FROM uniswap_v2_pairs p
+LEFT JOIN tokens t0 ON t0.address = p.token0
+LEFT JOIN tokens t1 ON t1.address = p.token1
 LEFT JOIN LATERAL (
   SELECT SUM(s.amount_usd) AS volume_usd_24h
   FROM uniswap_v2_swaps s
@@ -61,6 +67,10 @@ SELECT
     p.address                        AS address,
     p.token0                         AS token0,
     p.token1                         AS token1,
+    t0.symbol                        AS token0_symbol,
+    t0.name                          AS token0_name,
+    t1.symbol                        AS token1_symbol,
+    t1.name                          AS token1_name,
     p.fee                            AS fee,              -- V3 fee tier
     p.reserve0                       AS reserve0,
     p.reserve1                       AS reserve1,

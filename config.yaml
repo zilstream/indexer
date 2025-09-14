@@ -3,6 +3,7 @@
 server:
   port: 8080
   metrics_port: 9090
+  run_indexer: true  # when false, this server runs API-only
 
 chain:
   name: "zilliqa"

@@ -22,10 +22,10 @@ build:
 	@echo "Building $(BINARY_NAME)..."
 	@go build $(LDFLAGS) -o bin/$(BINARY_NAME) cmd/indexer/main.go
 
-## run: Run the indexer
+## run: Run the API server (and indexer if server.run_indexer=true)
 run:
-	@echo "Running indexer..."
-	@go run cmd/indexer/main.go --config=$(CONFIG)
+	@echo "Running server (API + optional indexer)..."
+	@go run cmd/server/main.go --config=$(CONFIG)
 
 ## load-zil-prices: Load historical ZIL/USD prices from CSV into prices_zil_usd_minute
 load-zil-prices:

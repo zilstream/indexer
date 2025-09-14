@@ -16,8 +16,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port        int `mapstructure:"port"`
-	MetricsPort int `mapstructure:"metrics_port"`
+	Port        int  `mapstructure:"port"`
+	MetricsPort int  `mapstructure:"metrics_port"`
+	RunIndexer  bool `mapstructure:"run_indexer"`
 }
 
 type ChainConfig struct {
@@ -59,6 +60,7 @@ func Load(configPath string) (*Config, error) {
 	// Set defaults
 	viper.SetDefault("server.port", 8080)
 	viper.SetDefault("server.metrics_port", 9090)
+	viper.SetDefault("server.run_indexer", true)
 	viper.SetDefault("chain.block_time", "1s")
 	viper.SetDefault("database.ssl_mode", "disable")
 	viper.SetDefault("database.max_connections", 10)
