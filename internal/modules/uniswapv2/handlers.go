@@ -252,6 +252,21 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 		return fmt.Errorf("failed to insert swap: %w", err)
 	}
 
+	// Update pair token volumes (raw units) and transaction count
+	// For each token side, add the absolute net amount swapped: abs(out - in)
+	_, _ = module.db.Pool().Exec(ctx, `
+		UPDATE uniswap_v2_pairs
+		SET 
+			volume_token0 = COALESCE(volume_token0,0) + ABS(($2::numeric) - ($3::numeric)),
+			volume_token1 = COALESCE(volume_token1,0) + ABS(($4::numeric) - ($5::numeric)),
+			txn_count = COALESCE(txn_count,0) + 1,
+			updated_at = NOW()
+		WHERE address = $1`,
+		strings.ToLower(event.Address.Hex()),
+		amount0In.String(), amount0Out.String(),
+		amount1In.String(), amount1Out.String(),
+	)
+
 	// Compute USD notional for swaps when pricing is available
 	var swapUSD string
 	if module.priceProvider != nil {

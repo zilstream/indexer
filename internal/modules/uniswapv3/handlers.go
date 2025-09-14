@@ -213,6 +213,8 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 		func() string { if tick != nil { return tick.String() }; return "0" }(),
 	)
 	if err != nil { return err }
+	// Increment transaction count for this pool
+	_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v3_pools SET txn_count = COALESCE(txn_count,0) + 1, updated_at = CURRENT_TIMESTAMP WHERE address = $1`, strings.ToLower(event.Address.Hex()))
 	// Update pool's rolling state: liquidity and prices
 	if liquidity != nil || sqrtPriceX96 != nil || tick != nil {
 		_, _ = module.db.Pool().Exec(ctx, `
