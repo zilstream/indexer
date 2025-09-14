@@ -5,7 +5,6 @@ import (
 "fmt"
 "math/big"
 "strings"
-	"time"
 
 "github.com/ethereum/go-ethereum/accounts/abi"
 "github.com/ethereum/go-ethereum/common"
@@ -272,12 +271,22 @@ return nil
 return nil
 }
 
-// helper: fetch block timestamp (seconds) -> time.Time
-func (m *UniswapV2Module) blockTime(ctx context.Context, blockNumber uint64) (time.Time, error) {
-var ts int64
-row := m.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, blockNumber)
-if err := row.Scan(&ts); err != nil { return time.Time{}, err }
-return time.Unix(ts, 0).UTC(), nil
+// helper: fetch block timestamp (seconds); falls back to RPC when DB not yet visible
+func (m *UniswapV2Module) getBlockTimestamp(ctx context.Context, blockNumber uint64) int64 {
+   // Try DB first
+   var ts int64
+   _ = m.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, blockNumber).Scan(&ts)
+   if ts > 0 {
+        return ts
+    }
+    // Fallback: RPC header (helps during in-tx processing when DB row not visible yet)
+    if m.rpcClient != nil {
+        hdr, err := m.rpcClient.HeaderByNumber(ctx, new(big.Int).SetUint64(blockNumber))
+        if err == nil && hdr != nil {
+            return int64(hdr.Time)
+        }
+    }
+    return 0
 }
 
 // tokenDecimals fetches token decimals from DB, fallback 18
