@@ -100,11 +100,11 @@ func handlePairCreated(ctx context.Context, module *UniswapV2Module, event *core
 	}
 
 	// Ensure tokens exist in the universal tokens table
-	if err := module.ensureToken(ctx, token0); err != nil {
+	if err := module.ensureToken(ctx, token0, event.BlockNumber, event.Timestamp.Int64()); err != nil {
 		return fmt.Errorf("failed to ensure token0: %w", err)
 	}
 
-	if err := module.ensureToken(ctx, token1); err != nil {
+	if err := module.ensureToken(ctx, token1, event.BlockNumber, event.Timestamp.Int64()); err != nil {
 		return fmt.Errorf("failed to ensure token1: %w", err)
 	}
 
@@ -283,19 +283,55 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 							UPDATE uniswap_v2_pairs
 							SET volume_usd = COALESCE(volume_usd,0) + COALESCE((SELECT amount_usd FROM uniswap_v2_swaps WHERE id = $1),0)
 							WHERE address = $2`, swapID, strings.ToLower(event.Address.Hex()))
-						// record ZIL token price snapshot
-						_, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, zilAddr, price)
+						// record ZIL token price snapshot (single update incl. price_eth=1 and market cap)
+						_, _ = module.db.Pool().Exec(ctx, `
+							UPDATE tokens
+							SET price_usd = $2,
+							    price_eth = 1,
+							    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+							    updated_at = NOW()
+							WHERE address = $1`, zilAddr, price)
 						// Also attempt to update counterparty token prices via router
 						if module.priceRouter != nil {
 							minTime := time.Unix(ts, 0).UTC()
 							if strings.ToLower(t0) != zilAddr {
 								if p, ok := module.priceRouter.PriceTokenUSD(ctx, strings.ToLower(t0), minTime); ok {
-									_, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, strings.ToLower(t0), p)
+									if zil, ok2 := module.priceProvider.PriceZILUSD(ctx, minTime); ok2 {
+										_, _ = module.db.Pool().Exec(ctx, `
+											UPDATE tokens
+											SET price_usd = $2,
+											    price_eth = ($2 / $3::numeric),
+											    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+											    updated_at = NOW()
+											WHERE address = $1`, strings.ToLower(t0), p, zil)
+									} else {
+										_, _ = module.db.Pool().Exec(ctx, `
+											UPDATE tokens
+											SET price_usd = $2,
+											    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+											    updated_at = NOW()
+											WHERE address = $1`, strings.ToLower(t0), p)
+									}
 								}
 							}
 							if strings.ToLower(t1) != zilAddr {
 								if p, ok := module.priceRouter.PriceTokenUSD(ctx, strings.ToLower(t1), minTime); ok {
-									_, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, strings.ToLower(t1), p)
+									if zil, ok2 := module.priceProvider.PriceZILUSD(ctx, minTime); ok2 {
+										_, _ = module.db.Pool().Exec(ctx, `
+											UPDATE tokens
+											SET price_usd = $2,
+											    price_eth = ($2 / $3::numeric),
+											    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+											    updated_at = NOW()
+											WHERE address = $1`, strings.ToLower(t1), p, zil)
+									} else {
+										_, _ = module.db.Pool().Exec(ctx, `
+											UPDATE tokens
+											SET price_usd = $2,
+											    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+											    updated_at = NOW()
+											WHERE address = $1`, strings.ToLower(t1), p)
+									}
 								}
 							}
 						}
@@ -396,8 +432,14 @@ func handleSync(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 							UPDATE uniswap_v2_pairs
 							SET reserve_usd = ( ($2::numeric) / 1e18::numeric ) * 2 * $3::numeric
 							WHERE address = $1`, strings.ToLower(event.Address.Hex()), reserve0.String(), price)
-						// update ZIL price
-						_, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, zilAddr, price)
+						// update ZIL token price with single update (price_eth=1 + market cap)
+						_, _ = module.db.Pool().Exec(ctx, `
+							UPDATE tokens
+							SET price_usd = $2,
+							    price_eth = 1,
+							    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+							    updated_at = NOW()
+							WHERE address = $1`, zilAddr, price)
 					}
 				} else if strings.ToLower(t1) == zilAddr {
 					if price, ok := module.priceProvider.PriceZILUSD(ctx, minTime); ok {
@@ -405,8 +447,14 @@ func handleSync(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 							UPDATE uniswap_v2_pairs
 							SET reserve_usd = ( ($2::numeric) / 1e18::numeric ) * 2 * $3::numeric
 							WHERE address = $1`, strings.ToLower(event.Address.Hex()), reserve1.String(), price)
-						// update ZIL price
-						_, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, zilAddr, price)
+						// update ZIL token price with single update (price_eth=1 + market cap)
+						_, _ = module.db.Pool().Exec(ctx, `
+							UPDATE tokens
+							SET price_usd = $2,
+							    price_eth = 1,
+							    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+							    updated_at = NOW()
+							WHERE address = $1`, zilAddr, price)
 					}
 				} else if module.priceRouter != nil {
 					// General case: sum(reserve0*price0 + reserve1*price1) in USD
@@ -417,8 +465,44 @@ func handleSync(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 						dec1 := module.tokenDecimals(ctx, t1)
 						usd0 := "0"
 						usd1 := "0"
-						if ok0 { usd0 = mulStr(divBigIntByPow10Str(reserve0, dec0), p0); _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, strings.ToLower(t0), p0) }
-						if ok1 { usd1 = mulStr(divBigIntByPow10Str(reserve1, dec1), p1); _, _ = module.db.Pool().Exec(ctx, `UPDATE tokens SET price_usd = $2, updated_at = NOW() WHERE address = $1`, strings.ToLower(t1), p1) }
+						if ok0 {
+							usd0 = mulStr(divBigIntByPow10Str(reserve0, dec0), p0)
+							if zil, ok2 := module.priceProvider.PriceZILUSD(ctx, minTime); ok2 {
+								_, _ = module.db.Pool().Exec(ctx, `
+									UPDATE tokens
+									SET price_usd = $2,
+									    price_eth = ($2 / $3::numeric),
+									    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+									    updated_at = NOW()
+									WHERE address = $1`, strings.ToLower(t0), p0, zil)
+							} else {
+								_, _ = module.db.Pool().Exec(ctx, `
+									UPDATE tokens
+									SET price_usd = $2,
+									    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+									    updated_at = NOW()
+									WHERE address = $1`, strings.ToLower(t0), p0)
+							}
+						}
+						if ok1 {
+							usd1 = mulStr(divBigIntByPow10Str(reserve1, dec1), p1)
+							if zil, ok2 := module.priceProvider.PriceZILUSD(ctx, minTime); ok2 {
+								_, _ = module.db.Pool().Exec(ctx, `
+									UPDATE tokens
+									SET price_usd = $2,
+									    price_eth = ($2 / $3::numeric),
+									    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+									    updated_at = NOW()
+									WHERE address = $1`, strings.ToLower(t1), p1, zil)
+							} else {
+								_, _ = module.db.Pool().Exec(ctx, `
+									UPDATE tokens
+									SET price_usd = $2,
+									    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+									    updated_at = NOW()
+									WHERE address = $1`, strings.ToLower(t1), p1)
+							}
+						}
 						total := addStr(usd0, usd1)
 						if total != "0" {
 							_, _ = module.db.Pool().Exec(ctx, `
@@ -704,7 +788,7 @@ func handleTransfer(ctx context.Context, module *UniswapV2Module, event *core.Pa
 // Helper functions
 
 // ensureToken makes sure a token exists in the tokens table
-func (m *UniswapV2Module) ensureToken(ctx context.Context, tokenAddress common.Address) error {
+func (m *UniswapV2Module) ensureToken(ctx context.Context, tokenAddress common.Address, firstSeenBlock uint64, firstSeenTimestamp int64) error {
 	// Check if token already exists
 	var exists bool
 	query := `SELECT EXISTS(SELECT 1 FROM tokens WHERE address = $1)`
@@ -748,8 +832,8 @@ func (m *UniswapV2Module) ensureToken(ctx context.Context, tokenAddress common.A
 		tokenInfo.Symbol,
 		tokenInfo.Decimals,
 		tokenInfo.TotalSupply.String(),
-		0, // Will be updated with real block number
-		0, // Will be updated with real timestamp
+		firstSeenBlock,
+		firstSeenTimestamp,
 	)
 
 	if err != nil {
@@ -898,5 +982,19 @@ func recomputeTokenLiquidityUSD(ctx context.Context, module *UniswapV2Module, ad
 	SET total_liquidity_usd = COALESCE((SELECT v2.usd FROM v2),0) + COALESCE((SELECT v3.usd FROM v3),0),
 		updated_at = NOW()
 	WHERE t.address = $1`
+	_, _ = module.db.Pool().Exec(ctx, q, strings.ToLower(addr))
+}
+
+// recomputeTokenMarketCapUSD updates tokens.market_cap_usd = (total_supply / 10^decimals) * price_usd
+// Uses NULL when either total_supply or price_usd is NULL. Decimals default to 18 when NULL.
+func recomputeTokenMarketCapUSD(ctx context.Context, module *UniswapV2Module, addr string) {
+	q := `
+		UPDATE tokens t
+		SET market_cap_usd = CASE 
+			WHEN t.price_usd IS NULL OR t.total_supply IS NULL THEN NULL
+			ELSE ( (t.total_supply / POWER(10::numeric, COALESCE(t.decimals,18))) * t.price_usd )
+		END,
+		updated_at = NOW()
+		WHERE t.address = $1`
 	_, _ = module.db.Pool().Exec(ctx, q, strings.ToLower(addr))
 }
