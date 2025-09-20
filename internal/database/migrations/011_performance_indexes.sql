@@ -1,5 +1,6 @@
 -- 011_performance_indexes.sql
 -- Critical performance indexes for high-speed sync operations
+-- +no-transaction
 
 -- Indexes for blocks table
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_blocks_number_hash
@@ -62,7 +63,7 @@ ON uniswap_v2_pairs(address);
 
 -- For pair lookups by pair address
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_uniswap_v2_swaps_pair_block
-ON uniswap_v2_swaps(pair_address, block_number DESC);
+ON uniswap_v2_swaps(pair, block_number DESC);
 
 -- For recent swaps by pair
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_uniswap_v2_swaps_timestamp
@@ -75,8 +76,8 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_indexer_state_chain_updated
 ON indexer_state(chain_id, updated_at);
 
 -- For indexer state monitoring
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_gaps_start_end
-ON gaps(start_block, end_block);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sync_gaps_start_end
+ON sync_gaps(start_block, end_block);
 
 -- For gap detection and filling operations
 

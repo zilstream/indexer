@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/zilstream/indexer/internal/config"
+	"github.com/zilstream/indexer/internal/database"
 	"github.com/zilstream/indexer/internal/processor"
 )
 
@@ -34,6 +35,15 @@ func main() {
 		Str("config", configPath).
 		Msg("Starting Zilstream Indexer")
 
+	ctx := context.Background()
+
+	if cfg.Bootstrap.AutoMigrate {
+		logger.Info().Msg("Running database migrations")
+		if err := database.RunMigrations(ctx, &cfg.Database, logger); err != nil {
+			logger.Fatal().Err(err).Msg("Failed to run migrations")
+		}
+	}
+
 	// Create and start indexer
 	indexer, err := processor.NewIndexer(cfg, logger)
 	if err != nil {
@@ -41,7 +51,6 @@ func main() {
 	}
 
 	// Start indexer (blocks until shutdown)
-	ctx := context.Background()
 	if err := indexer.Start(ctx); err != nil {
 		logger.Fatal().Err(err).Msg("Indexer failed")
 	}

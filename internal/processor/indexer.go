@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
-	"strings"
 
 	"github.com/rs/zerolog"
 	"github.com/zilstream/indexer/internal/api"
@@ -17,9 +17,9 @@ import (
 	"github.com/zilstream/indexer/internal/modules/loader"
 	"github.com/zilstream/indexer/internal/modules/uniswapv2"
 	"github.com/zilstream/indexer/internal/modules/uniswapv3"
+	"github.com/zilstream/indexer/internal/prices"
 	"github.com/zilstream/indexer/internal/rpc"
 	"github.com/zilstream/indexer/internal/sync"
-	"github.com/zilstream/indexer/internal/prices"
 )
 
 // Indexer is the main indexer that coordinates block processing
@@ -34,29 +34,40 @@ type Indexer struct {
 
 // NewIndexer creates a new indexer instance
 func NewIndexer(cfg *config.Config, logger zerolog.Logger) (*Indexer, error) {
+	ctx := context.Background()
+
 	// Extract RPC endpoint from config
 	rpcEndpoint := cfg.Chain.RPCEndpoint
 	if rpcEndpoint == "" {
 		return nil, fmt.Errorf("RPC endpoint not configured")
 	}
-	
+
 	// Connect to RPC
 	rpcClient, err := rpc.NewClient(rpcEndpoint, int64(cfg.Chain.ChainID), logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create RPC client: %w", err)
 	}
-	
+
 	// Connect to database
-	db, err := database.New(context.Background(), &cfg.Database, logger)
+	db, err := database.New(ctx, &cfg.Database, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
-	
-	// Migrations are run separately, not here
-	
+
+	if cfg.Bootstrap.ZILPrices.AutoLoad {
+		if _, err := prices.EnsureHistoricalPrices(ctx, db.Pool(), prices.LoaderConfig{
+			CSVPath:   cfg.Bootstrap.ZILPrices.CSVPath,
+			Source:    cfg.Bootstrap.ZILPrices.Source,
+			BatchSize: cfg.Bootstrap.ZILPrices.BatchSize,
+		}, logger); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("bootstrap ZIL prices: %w", err)
+		}
+	}
+
 	// Create module registry
 	moduleRegistry := core.NewModuleRegistry(db, logger)
-	
+
 	return &Indexer{
 		config:         cfg,
 		rpcClient:      rpcClient,
@@ -70,12 +81,12 @@ func NewIndexer(cfg *config.Config, logger zerolog.Logger) (*Indexer, error) {
 // Start starts the indexer
 func (i *Indexer) Start(ctx context.Context) error {
 	i.logger.Info().Msg("Starting indexer")
-	
+
 	// Initialize modules
 	if err := i.initializeModules(ctx); err != nil {
 		return fmt.Errorf("failed to initialize modules: %w", err)
 	}
-	
+
 	// Start health server
 	healthServer := api.NewHealthServer(i, i.logger)
 	go func() {
@@ -85,18 +96,18 @@ func (i *Indexer) Start(ctx context.Context) error {
 			i.logger.Error().Err(err).Msg("Health server error")
 		}
 	}()
-	
+
 	// Start initial sync if needed
 	if err := i.syncOnce(ctx); err != nil {
 		i.logger.Error().Err(err).Msg("Initial sync failed")
 	}
-	
+
 	// Start continuous sync
 	go i.continuousSync(ctx)
-	
+
 	// Wait for shutdown
 	i.waitForShutdown()
-	
+
 	return nil
 }
 
@@ -104,7 +115,7 @@ func (i *Indexer) Start(ctx context.Context) error {
 func (i *Indexer) continuousSync(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -127,18 +138,18 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get last block: %w", err)
 	}
-	
+
 	latestBlock, err := i.rpcClient.GetLatestBlockNumber(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get latest block: %w", err)
 	}
-	
+
 	// Determine start block
 	startBlock := lastBlock + 1
 	if lastBlock == 0 && i.config.Chain.StartBlock > 0 {
 		startBlock = uint64(i.config.Chain.StartBlock)
 		i.logger.Info().Uint64("start_block", startBlock).Msg("Starting from configured block")
-		
+
 		// Set initial block number
 		if err := i.db.UpdateLastBlockNumber(ctx, startBlock-1, ""); err != nil {
 			i.logger.Warn().Err(err).Uint64("block", startBlock-1).Msg("Failed to set initial block number")
@@ -147,14 +158,14 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 	if startBlock == 0 {
 		startBlock = 1 // Start from block 1 if not specified
 	}
-	
+
 	// Calculate how far behind we are
 	if latestBlock <= startBlock {
 		return nil // Already caught up
 	}
-	
+
 	blocksToSync := latestBlock - startBlock
-	
+
 	if blocksToSync > 0 {
 		// Create unified sync config
 		syncConfig := sync.UnifiedSyncConfig{
@@ -163,7 +174,7 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 			RetryDelay:        i.config.Processor.RetryDelay,
 			RequestsPerSecond: i.config.Processor.RequestsPerSecond,
 		}
-		
+
 		// Create unified sync instance
 		unifiedSync := sync.NewUnifiedSync(
 			i.db,
@@ -173,20 +184,20 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 			i.logger,
 		)
 		defer unifiedSync.Close()
-		
+
 		// Determine end block (don't go all the way to latest for safety)
 		endBlock := latestBlock
 		if blocksToSync > 100 {
 			// Leave a small buffer for very recent blocks
 			endBlock = latestBlock - 10
 		}
-		
+
 		// Run sync
 		if err := unifiedSync.SyncRange(ctx, startBlock, endBlock); err != nil {
 			return fmt.Errorf("sync failed: %w", err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -215,12 +226,12 @@ func (i *Indexer) GetStatus(ctx context.Context) (map[string]interface{}, error)
 func (i *Indexer) waitForShutdown() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	
+
 	<-sigChan
 	i.logger.Info().Msg("Shutdown signal received")
-	
+
 	close(i.shutdown)
-	
+
 	i.logger.Info().Msg("Indexer stopped")
 }
 
@@ -236,7 +247,7 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 	}
 
 	i.logger.Info().Int("count", len(manifests)).Msg("Loaded manifests")
-	
+
 	// Initialize each module based on manifest
 	// Create shared price provider
 	priceProvider := prices.NewPostgresProvider(i.db.Pool(), 10_000)
@@ -270,40 +281,40 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 			m.SetPriceProvider(priceProvider)
 			module = m
 		}
-		
+
 		// Initialize module with database
 		if err := module.Initialize(ctx, i.db); err != nil {
 			i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to initialize module")
 			continue
 		}
-		
+
 		// Register module
 		if err := i.moduleRegistry.RegisterModule(module); err != nil {
 			i.logger.Error().Err(err).Str("module", manifest.Name).Msg("Failed to register module")
 			continue
 		}
-		
+
 		i.logger.Info().Str("module", manifest.Name).Str("version", manifest.Version).Msg("Module registered")
 	}
-	
+
 	// Start module registry
 	i.moduleRegistry.Start()
-	
+
 	i.logger.Info().
 		Int("modules", len(manifests)).
 		Msg("Module system initialized")
-	
+
 	return nil
 }
 
 // Close closes the indexer
 func (i *Indexer) Close() error {
 	close(i.shutdown)
-	
+
 	if i.moduleRegistry != nil {
 		i.moduleRegistry.Stop()
 	}
-	
+
 	i.db.Close()
 	return nil
 }

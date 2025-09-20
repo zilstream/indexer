@@ -1,11 +1,11 @@
 package config
 
 import (
-    "fmt"
-    "time"
-    "strings"
+	"fmt"
+	"strings"
+	"time"
 
-    "github.com/spf13/viper"
+	"github.com/spf13/viper"
 )
 
 type Config struct {
@@ -14,6 +14,7 @@ type Config struct {
 	Database  DatabaseConfig  `mapstructure:"database"`
 	Processor ProcessorConfig `mapstructure:"processor"`
 	Logging   LoggingConfig   `mapstructure:"logging"`
+	Bootstrap BootstrapConfig `mapstructure:"bootstrap"`
 }
 
 type ServerConfig struct {
@@ -53,12 +54,24 @@ type LoggingConfig struct {
 	Format string `mapstructure:"format"`
 }
 
+type BootstrapConfig struct {
+	AutoMigrate bool               `mapstructure:"auto_migrate"`
+	ZILPrices   ZILPricesBootstrap `mapstructure:"zil_prices"`
+}
+
+type ZILPricesBootstrap struct {
+	AutoLoad  bool   `mapstructure:"auto_load"`
+	CSVPath   string `mapstructure:"csv_path"`
+	Source    string `mapstructure:"source"`
+	BatchSize int    `mapstructure:"batch_size"`
+}
+
 func Load(configPath string) (*Config, error) {
-    viper.SetConfigFile(configPath)
-    viper.SetEnvPrefix("INDEXER")
-    // Allow env vars like INDEXER_DATABASE_HOST to override database.host
-    viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-    viper.AutomaticEnv()
+	viper.SetConfigFile(configPath)
+	viper.SetEnvPrefix("INDEXER")
+	// Allow env vars like INDEXER_DATABASE_HOST to override database.host
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
 
 	// Set defaults
 	viper.SetDefault("server.port", 8080)
@@ -74,6 +87,11 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("processor.retry_delay", "1s")
 	viper.SetDefault("logging.level", "info")
 	viper.SetDefault("logging.format", "json")
+	viper.SetDefault("bootstrap.auto_migrate", true)
+	viper.SetDefault("bootstrap.zil_prices.auto_load", true)
+	viper.SetDefault("bootstrap.zil_prices.csv_path", "data/zilliqa_historical_prices.csv")
+	viper.SetDefault("bootstrap.zil_prices.source", "bootstrap_csv")
+	viper.SetDefault("bootstrap.zil_prices.batch_size", 50_000)
 
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("failed to read config: %w", err)

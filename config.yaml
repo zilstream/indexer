@@ -31,3 +31,11 @@ processor:
 logging:
   level: "info" # debug, info, warn, error
   format: "console" # json or console
+
+bootstrap:
+  auto_migrate: true
+  zil_prices:
+    auto_load: true
+    csv_path: "data/zilliqa_historical_prices.csv"
+    source: "bootstrap_csv"
+    batch_size: 50000

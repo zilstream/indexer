@@ -35,6 +35,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.Bootstrap.AutoMigrate {
+		logger.Info().Msg("Running database migrations")
+		if err := database.RunMigrations(ctx, &cfg.Database, logger); err != nil {
+			logger.Fatal().Err(err).Msg("Failed to run migrations")
+		}
+	}
+
 	// Database pool
 	db, err := database.New(ctx, &cfg.Database, logger)
 	if err != nil {
@@ -80,10 +87,12 @@ func startWorker(ctx context.Context, cfg *config.Config, logger zerolog.Logger)
 func setupLogger(cfg config.LoggingConfig) zerolog.Logger {
 	zerolog.TimeFieldFormat = time.RFC3339Nano
 	level, err := zerolog.ParseLevel(cfg.Level)
-	if err != nil { level = zerolog.InfoLevel }
+	if err != nil {
+		level = zerolog.InfoLevel
+	}
 	var logger zerolog.Logger
 	if cfg.Format == "console" {
-		output := zerolog.ConsoleWriter{ Out: os.Stdout, TimeFormat: "15:04:05.000" }
+		output := zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: "15:04:05.000"}
 		logger = zerolog.New(output).Level(level).With().Timestamp().Caller().Logger()
 	} else {
 		logger = zerolog.New(os.Stdout).Level(level).With().Timestamp().Caller().Logger()
