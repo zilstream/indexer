@@ -18,6 +18,10 @@ proxy:
   ssl: true
   host: v2-api.zilstream.com
   app_port: 8080
+  healthcheck:
+    interval: 15
+    path: /health
+    timeout: 15
 
 # Credentials for your image host.
 registry:
