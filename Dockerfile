@@ -27,8 +27,11 @@ WORKDIR /app
 # Create non-root user
 RUN adduser -D -s /bin/sh appuser
 
-# Copy the binary from builder
+# Copy runtime assets
 COPY --from=builder /app/indexer ./indexer
+COPY --from=builder /app/config.yaml ./config.yaml
+COPY --from=builder /app/manifests ./manifests
+COPY --from=builder /app/data ./data
 
 # Change ownership to non-root user
 RUN chown appuser:appuser /app/indexer
