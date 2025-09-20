@@ -47,7 +47,7 @@ env:
     # Change this if your host uses a different docker bridge or you prefer a static LAN IP.
     INDEXER_DATABASE_HOST: 172.17.0.1
     INDEXER_DATABASE_NAME: zilstream
-    INDEXER_DATABASE_PORT: 6432
+    INDEXER_DATABASE_PORT: 5432
     INDEXER_DATABASE_USER: postgres
     INDEXER_DATABASE_PASSWORD: zilstream
 # Aliases are triggered with "bin/kamal <alias>". You can overwrite arguments on invocation:
