@@ -39,7 +39,9 @@ builder:
 # Inject ENV variables into containers (secrets come from .kamal/secrets).
 env:
   clear:
-    INDEXER_DATABASE_HOST: host.docker.internal
+    # 172.17.0.1 is the default bridge address that maps back to the host from containers.
+    # Change this if your host uses a different docker bridge or you prefer a static LAN IP.
+    INDEXER_DATABASE_HOST: 172.17.0.1
     INDEXER_DATABASE_NAME: zilstream
     INDEXER_DATABASE_PORT: 6432
     INDEXER_DATABASE_USER: postgres
