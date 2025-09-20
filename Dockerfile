@@ -14,8 +14,8 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build the indexer binary explicitly from cmd/indexer
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o indexer ./cmd/indexer
+# Build the combined API + indexer binary from cmd/server
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o server ./cmd/server
 
 FROM alpine:latest
 
@@ -28,15 +28,15 @@ WORKDIR /app
 RUN adduser -D -s /bin/sh appuser
 
 # Copy runtime assets
-COPY --from=builder /app/indexer ./indexer
+COPY --from=builder /app/server ./server
 COPY --from=builder /app/config.yaml ./config.yaml
 COPY --from=builder /app/manifests ./manifests
 COPY --from=builder /app/data ./data
 
 # Change ownership to non-root user
-RUN chown appuser:appuser /app/indexer
+RUN chown appuser:appuser /app/server
 
 # Switch to non-root user
 USER appuser
 
-CMD ["./indexer"]
+CMD ["./server"]
