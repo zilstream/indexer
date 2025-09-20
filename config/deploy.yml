@@ -39,11 +39,11 @@ builder:
 # Inject ENV variables into containers (secrets come from .kamal/secrets).
 env:
   clear:
-    INDEXER_DB_HOST: 127.0.0.1
-    INDEXER_DB_NAME: zilstream
-    INDEXER_DB_PORT: 6432
-    INDEXER_DB_USER: postgres
-    INDEXER_DB_PASSWORD: ""
+    INDEXER_DATABASE_HOST: host.docker.internal
+    INDEXER_DATABASE_NAME: zilstream
+    INDEXER_DATABASE_PORT: 6432
+    INDEXER_DATABASE_USER: postgres
+    INDEXER_DATABASE_PASSWORD: ""
 # Aliases are triggered with "bin/kamal <alias>". You can overwrite arguments on invocation:
 # "bin/kamal app logs -r job" will tail logs from the first server in the job section.
 #
