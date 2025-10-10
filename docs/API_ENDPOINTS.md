@@ -208,6 +208,56 @@ Same structure as single transaction item above.
 
 ---
 
+## Addresses
+
+### `GET /addresses/{address}/transactions`
+Returns all transactions for a specific address (where the address is either sender or receiver).
+
+**Path Parameters:**
+- `address`: The Ethereum address (with 0x prefix)
+
+**Query Parameters:**
+- `page`: Page number
+- `per_page`: Items per page
+
+**Response:**
+```json
+{
+  "data": [
+    {
+      "hash": "0x789abc...",
+      "block_number": 8470100,
+      "transaction_index": 5,
+      "from_address": "0x123...",
+      "to_address": "0x456...",
+      "value": "1000000000000000000",
+      "gas_price": "1000000000",
+      "gas_limit": 21000,
+      "gas_used": 21000,
+      "nonce": 42,
+      "status": 1,
+      "transaction_type": 2,
+      "original_type_hex": null,
+      "max_fee_per_gas": "2000000000",
+      "max_priority_fee_per_gas": "1000000000",
+      "effective_gas_price": "1500000000",
+      "contract_address": null,
+      "cumulative_gas_used": 123456
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "per_page": 25,
+    "has_next": true
+  }
+}
+```
+
+**Fields:**
+Same as transaction fields described in the Transactions section above.
+
+---
+
 ## Health & Status
 
 ### `GET /health`

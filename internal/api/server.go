@@ -81,6 +81,9 @@ func (s *APIServer) registerRoutes() {
 	// Pair-scoped prefix for events
 	s.mux.HandleFunc("/pairs/", s.handlePairPrefix)
 	
+	// Address-scoped prefix for transactions
+	s.mux.HandleFunc("/addresses/", s.handleAddressPrefix)
+	
 	// Block and transaction detail endpoints
 	s.mux.HandleFunc("/blocks/", s.handleBlockDetail)
 	s.mux.HandleFunc("/transactions/", s.handleTransactionDetail)
@@ -217,4 +220,32 @@ func (s *APIServer) handleTransactionDetail(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	JSON(w, http.StatusOK, tx, nil)
+}
+
+func (s *APIServer) handleAddressPrefix(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/addresses/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 {
+		Error(w, http.StatusNotFound, "not found")
+		return
+	}
+	address, sub := parts[0], parts[1]
+	switch sub {
+	case "transactions":
+		s.handleAddressTransactions(w, r, address)
+	default:
+		Error(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *APIServer) handleAddressTransactions(w http.ResponseWriter, r *http.Request, address string) {
+	ctx := r.Context()
+	limit, offset, page, perPage := parsePagination(r)
+	items, err := database.ListTransactionsByAddress(ctx, s.db, address, limit, offset)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
+	JSON(w, http.StatusOK, items, pg)
 }

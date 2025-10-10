@@ -209,11 +209,11 @@ func GetStats(ctx context.Context, pool *pgxpool.Pool) (*StatsDTO, error) {
 	q := `
 		SELECT 
 			COUNT(DISTINCT address) AS total_pairs,
-			to_char(COALESCE(SUM(liquidity_usd), 0), 'FM9999999999999999999999999999999999990.999999999999999999') AS total_liquidity,
-			to_char(COALESCE(SUM(volume_usd_24h), 0), 'FM9999999999999999999999999999999999990.999999999999999999') AS total_volume_24h,
-			to_char(COALESCE(SUM(volume_usd), 0), 'FM9999999999999999999999999999999999990.999999999999999999') AS total_volume_all
+			COALESCE(to_char(SUM(liquidity_usd), 'FM999999999999999999999990.99'), '0') AS total_liquidity,
+			COALESCE(to_char(SUM(volume_usd_24h), 'FM999999999999999999999990.99'), '0') AS total_volume_24h,
+			COALESCE(to_char(SUM(volume_usd), 'FM999999999999999999999990.99'), '0') AS total_volume_all
 		FROM dex_pools
-		WHERE liquidity_usd > 0
+		WHERE liquidity_usd > 0 AND liquidity_usd < 1e15
 	`
 	
 	var stats StatsDTO
@@ -289,6 +289,39 @@ func ListTransactions(ctx context.Context, pool *pgxpool.Pool, limit, offset int
 	rows, err := pool.Query(ctx, q, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("ListTransactions query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var out []TransactionDTO
+	for rows.Next() {
+		var tx TransactionDTO
+		if err := rows.Scan(&tx.Hash, &tx.BlockNumber, &tx.TransactionIndex, &tx.FromAddress, &tx.ToAddress,
+			&tx.Value, &tx.GasPrice, &tx.GasLimit, &tx.GasUsed, &tx.Nonce, &tx.Status,
+			&tx.TransactionType, &tx.OriginalTypeHex,
+			&tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.EffectiveGasPrice, &tx.ContractAddress, &tx.CumulativeGasUsed); err != nil {
+			return nil, err
+		}
+		out = append(out, tx)
+	}
+	return out, nil
+}
+
+// ListTransactionsByAddress returns a paginated list of transactions for a specific address
+func ListTransactionsByAddress(ctx context.Context, pool *pgxpool.Pool, address string, limit, offset int) ([]TransactionDTO, error) {
+	q := `
+		SELECT hash, block_number, transaction_index, from_address, to_address,
+		       CAST(value AS TEXT), CAST(gas_price AS TEXT), gas_limit, gas_used, nonce, status,
+		       transaction_type, original_type_hex,
+		       CAST(max_fee_per_gas AS TEXT), CAST(max_priority_fee_per_gas AS TEXT),
+		       CAST(effective_gas_price AS TEXT), contract_address, cumulative_gas_used
+		FROM transactions
+		WHERE from_address = $1 OR to_address = $1
+		ORDER BY block_number DESC, transaction_index DESC
+		LIMIT $2 OFFSET $3`
+
+	rows, err := pool.Query(ctx, q, address, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("ListTransactionsByAddress query failed: %w", err)
 	}
 	defer rows.Close()
 
