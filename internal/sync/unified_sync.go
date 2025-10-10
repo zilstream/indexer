@@ -106,31 +106,56 @@ func (s *UnifiedSync) SyncRange(ctx context.Context, startBlock, endBlock uint64
 		
 		err := s.processBatch(ctx, current, batchEnd)
 		if err != nil {
-			// Retry with exponential backoff
-			for retry := 1; retry <= s.maxRetries; retry++ {
-				delay := s.retryDelay * time.Duration(1<<(retry-1))
+			// Check if error is "Response is too big" - need to split batch
+			if s.isResponseTooBigError(err) {
 				s.logger.Warn().
 					Err(err).
-					Uint64("block", current).
-					Int("retry", retry).
-					Dur("delay", delay).
-					Msg("Batch failed, retrying")
+					Uint64("start", current).
+					Uint64("end", batchEnd).
+					Int("batch_size", batchSize).
+					Msg("Response too big, splitting batch")
 				
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(delay):
+				// Split and process recursively
+				if err := s.processSplitBatch(ctx, current, batchEnd); err != nil {
+					return fmt.Errorf("failed to process split batch %d-%d: %w", current, batchEnd, err)
+				}
+			} else {
+				// Retry with exponential backoff for other errors
+				for retry := 1; retry <= s.maxRetries; retry++ {
+					delay := s.retryDelay * time.Duration(1<<(retry-1))
+					s.logger.Warn().
+						Err(err).
+						Uint64("block", current).
+						Int("retry", retry).
+						Dur("delay", delay).
+						Msg("Batch failed, retrying")
+					
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(delay):
+					}
+					
+					err = s.processBatch(ctx, current, batchEnd)
+					if err == nil {
+						break
+					}
+					
+					// If we hit response too big during retry, split instead
+					if s.isResponseTooBigError(err) {
+						s.logger.Warn().Msg("Response too big on retry, switching to split strategy")
+						if err := s.processSplitBatch(ctx, current, batchEnd); err != nil {
+							return fmt.Errorf("failed to process split batch %d-%d: %w", current, batchEnd, err)
+						}
+						err = nil
+						break
+					}
 				}
 				
-				err = s.processBatch(ctx, current, batchEnd)
-				if err == nil {
-					break
+				if err != nil {
+					return fmt.Errorf("failed to process batch %d-%d after %d retries: %w", 
+						current, batchEnd, s.maxRetries, err)
 				}
-			}
-			
-			if err != nil {
-				return fmt.Errorf("failed to process batch %d-%d after %d retries: %w", 
-					current, batchEnd, s.maxRetries, err)
 			}
 		}
 		
@@ -418,6 +443,87 @@ func (s *UnifiedSync) calculateBatchSize(gap uint64) int {
 	default:
 		return s.maxBatchSize // Huge gap: maximum speed
 	}
+}
+
+// isResponseTooBigError checks if error is due to RPC response being too large
+func (s *UnifiedSync) isResponseTooBigError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return contains(errStr, "Response is too big") || 
+		   contains(errStr, "response too large") ||
+		   contains(errStr, "result exceeds")
+}
+
+// processSplitBatch splits a batch in half and processes recursively
+func (s *UnifiedSync) processSplitBatch(ctx context.Context, startBlock, endBlock uint64) error {
+	blockCount := endBlock - startBlock + 1
+	
+	// If batch is 1 block, we can't split further
+	if blockCount == 1 {
+		return fmt.Errorf("cannot split single block %d - response too big", startBlock)
+	}
+	
+	// Split in half
+	midBlock := startBlock + (blockCount / 2)
+	
+	s.logger.Info().
+		Uint64("original_start", startBlock).
+		Uint64("original_end", endBlock).
+		Uint64("split_point", midBlock).
+		Msg("Splitting batch into two smaller batches")
+	
+	// Process first half
+	if err := s.processBatchWithSplit(ctx, startBlock, midBlock-1); err != nil {
+		return fmt.Errorf("failed to process first half %d-%d: %w", startBlock, midBlock-1, err)
+	}
+	
+	// Process second half
+	if err := s.processBatchWithSplit(ctx, midBlock, endBlock); err != nil {
+		return fmt.Errorf("failed to process second half %d-%d: %w", midBlock, endBlock, err)
+	}
+	
+	return nil
+}
+
+// processBatchWithSplit processes a batch and handles splitting if response is too big
+func (s *UnifiedSync) processBatchWithSplit(ctx context.Context, startBlock, endBlock uint64) error {
+	err := s.processBatch(ctx, startBlock, endBlock)
+	if err != nil && s.isResponseTooBigError(err) {
+		// Split and retry
+		return s.processSplitBatch(ctx, startBlock, endBlock)
+	}
+	return err
+}
+
+// contains checks if string contains substring (case-insensitive)
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && containsHelper(s, substr)))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		match := true
+		for j := 0; j < len(substr); j++ {
+			if toLower(s[i+j]) != toLower(substr[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func toLower(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + 32
+	}
+	return b
 }
 
 // convertRawBlock converts a raw RPC block to database model
