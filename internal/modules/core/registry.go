@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/rs/zerolog"
 
@@ -518,6 +519,106 @@ func (r *ModuleRegistry) cacheModuleStatus(name string, status ModuleStatus) {
 	r.statusMu.Lock()
 	defer r.statusMu.Unlock()
 	r.moduleStatus[name] = status
+}
+
+// RecoverRecentBlocks reprocesses recent blocks for all modules to ensure data consistency after restart
+func (r *ModuleRegistry) RecoverRecentBlocks(ctx context.Context, lastCoreBlock uint64, numBlocks uint64) error {
+	if numBlocks == 0 {
+		return nil
+	}
+
+	fromBlock := uint64(1)
+	if lastCoreBlock > numBlocks {
+		fromBlock = lastCoreBlock - numBlocks + 1
+	}
+
+	r.logger.Info().
+		Uint64("from_block", fromBlock).
+		Uint64("to_block", lastCoreBlock).
+		Uint64("blocks_to_recover", numBlocks).
+		Msg("Starting module recovery for recent blocks")
+
+	// Fetch event logs for the block range from database
+	query := `
+		SELECT block_number, block_hash, transaction_hash, transaction_index, 
+		       log_index, address, topics, data, removed
+		FROM event_logs
+		WHERE block_number BETWEEN $1 AND $2
+		ORDER BY block_number ASC, transaction_index ASC, log_index ASC`
+
+	rows, err := r.db.Pool().Query(ctx, query, fromBlock, lastCoreBlock)
+	if err != nil {
+		return fmt.Errorf("failed to query event logs: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*types.Log
+	for rows.Next() {
+		var dbLog database.EventLog
+		var topics []string
+
+		err := rows.Scan(
+			&dbLog.BlockNumber,
+			&dbLog.BlockHash,
+			&dbLog.TransactionHash,
+			&dbLog.TransactionIndex,
+			&dbLog.LogIndex,
+			&dbLog.Address,
+			&topics,
+			&dbLog.Data,
+			&dbLog.Removed,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to scan event log: %w", err)
+		}
+
+		dbLog.Topics = topics
+		ethLog := convertDBLogToEthLog(&dbLog)
+		events = append(events, &ethLog)
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating event logs: %w", err)
+	}
+
+	r.logger.Info().
+		Int("events", len(events)).
+		Uint64("from_block", fromBlock).
+		Uint64("to_block", lastCoreBlock).
+		Msg("Loaded events from database for recovery")
+
+	// Process events through modules
+	if len(events) > 0 {
+		if err := r.ProcessEventBatch(ctx, events); err != nil {
+			return fmt.Errorf("failed to process recovery events: %w", err)
+		}
+	}
+
+	r.logger.Info().
+		Int("events_processed", len(events)).
+		Msg("Module recovery completed successfully")
+
+	return nil
+}
+
+// convertDBLogToEthLog converts database event log to ethereum types.Log
+func convertDBLogToEthLog(dbLog *database.EventLog) types.Log {
+	topics := make([]common.Hash, len(dbLog.Topics))
+	for i, topicStr := range dbLog.Topics {
+		topics[i] = common.HexToHash(topicStr)
+	}
+
+	return types.Log{
+		Address:     common.HexToAddress(dbLog.Address),
+		Topics:      topics,
+		Data:        common.Hex2Bytes(dbLog.Data),
+		BlockNumber: dbLog.BlockNumber,
+		TxHash:      common.HexToHash(dbLog.TransactionHash),
+		TxIndex:     uint(dbLog.TransactionIndex),
+		BlockHash:   common.HexToHash(dbLog.BlockHash),
+		Index:       uint(dbLog.LogIndex),
+		Removed:     dbLog.Removed,
+	}
 }
 
 // TriggerBackfill starts backfilling for a module

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,9 +74,16 @@ func (s *APIServer) registerRoutes() {
 	// Collections
 	s.mux.HandleFunc("/tokens", s.handleTokens)
 	s.mux.HandleFunc("/pairs", s.handlePairs)
+	s.mux.HandleFunc("/stats", s.handleStats)
+	s.mux.HandleFunc("/blocks", s.handleBlocks)
+	s.mux.HandleFunc("/transactions", s.handleTransactions)
 
 	// Pair-scoped prefix for events
 	s.mux.HandleFunc("/pairs/", s.handlePairPrefix)
+	
+	// Block and transaction detail endpoints
+	s.mux.HandleFunc("/blocks/", s.handleBlockDetail)
+	s.mux.HandleFunc("/transactions/", s.handleTransactionDetail)
 }
 
 func (s *APIServer) logMiddleware(next http.Handler) http.Handler {
@@ -116,7 +124,15 @@ func (s *APIServer) handleTokens(w http.ResponseWriter, r *http.Request) {
 func (s *APIServer) handlePairs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit, offset, page, perPage := parsePagination(r)
-	items, err := database.ListPairs(ctx, s.db, limit, offset)
+	sortBy := r.URL.Query().Get("sort_by")
+	if sortBy == "" {
+		sortBy = "volume_24h" // default
+	}
+	sortOrder := r.URL.Query().Get("sort_order")
+	if sortOrder == "" {
+		sortOrder = "desc" // default
+	}
+	items, err := database.ListPairs(ctx, s.db, limit, offset, sortBy, sortOrder)
 	if err != nil { Error(w, http.StatusInternalServerError, err.Error()); return }
 	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
 	JSON(w, http.StatusOK, items, pg)
@@ -149,4 +165,56 @@ func (s *APIServer) handlePairEvents(w http.ResponseWriter, r *http.Request, add
 	if err != nil { Error(w, http.StatusInternalServerError, err.Error()); return }
 	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
 	JSON(w, http.StatusOK, items, pg)
+}
+
+func (s *APIServer) handleStats(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	stats, err := database.GetStats(ctx, s.db)
+	if err != nil { Error(w, http.StatusInternalServerError, err.Error()); return }
+	JSON(w, http.StatusOK, stats, nil)
+}
+
+func (s *APIServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	limit, offset, page, perPage := parsePagination(r)
+	items, err := database.ListBlocks(ctx, s.db, limit, offset)
+	if err != nil { Error(w, http.StatusInternalServerError, err.Error()); return }
+	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
+	JSON(w, http.StatusOK, items, pg)
+}
+
+func (s *APIServer) handleBlockDetail(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	numberStr := strings.TrimPrefix(r.URL.Path, "/blocks/")
+	number, err := strconv.ParseInt(numberStr, 10, 64)
+	if err != nil {
+		Error(w, http.StatusBadRequest, "invalid block number")
+		return
+	}
+	block, err := database.GetBlock(ctx, s.db, number)
+	if err != nil {
+		Error(w, http.StatusNotFound, "block not found")
+		return
+	}
+	JSON(w, http.StatusOK, block, nil)
+}
+
+func (s *APIServer) handleTransactions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	limit, offset, page, perPage := parsePagination(r)
+	items, err := database.ListTransactions(ctx, s.db, limit, offset)
+	if err != nil { Error(w, http.StatusInternalServerError, err.Error()); return }
+	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
+	JSON(w, http.StatusOK, items, pg)
+}
+
+func (s *APIServer) handleTransactionDetail(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	hash := strings.TrimPrefix(r.URL.Path, "/transactions/")
+	tx, err := database.GetTransaction(ctx, s.db, hash)
+	if err != nil {
+		Error(w, http.StatusNotFound, "transaction not found")
+		return
+	}
+	JSON(w, http.StatusOK, tx, nil)
 }

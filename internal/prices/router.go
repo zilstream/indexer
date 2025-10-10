@@ -97,19 +97,19 @@ func (r *DBRouter) v2SpotToUSD(ctx context.Context, token string, ts time.Time) 
 		pBase, ok := divStrings(r1.String, r0.String)
 		if !ok { return "", false }
 		// scale by 10^(d0-d1)
-		scale := pow10Float(d0 - d1)
+		scale := pow10BigRat(d0 - d1)
 		p := new(big.Rat)
 		if _, ok := p.SetString(pBase); !ok { return "", false }
-		p.Mul(p, new(big.Rat).SetFloat64(scale))
+		p.Mul(p, scale)
 		return r.toUSD(ctx, strings.ToLower(t1), ts, p.FloatString(18))
 	}
 	// token is token1: price(token1 in token0) = (r0/r1) * 10^(d1-d0)
 	pBase, ok := divStrings(r0.String, r1.String)
 	if !ok { return "", false }
-	scale := pow10Float(d1 - d0)
+	scale := pow10BigRat(d1 - d0)
 	p := new(big.Rat)
 	if _, ok := p.SetString(pBase); !ok { return "", false }
-	p.Mul(p, new(big.Rat).SetFloat64(scale))
+	p.Mul(p, scale)
 	return r.toUSD(ctx, strings.ToLower(t0), ts, p.FloatString(18))
 }
 
@@ -188,7 +188,7 @@ func pricesFromSqrtX96(sqrtStr string, dec0, dec1 int) (price0, price1 string, o
 	den := new(big.Int).Lsh(big.NewInt(1), 192)     // 2^192
 	ratio := new(big.Rat).SetFrac(num, den)
 	// scale by decimals (normalize to human units)
-	pow10 := new(big.Rat).SetFloat64(pow10Float(dec0 - dec1))
+	pow10 := pow10BigRat(dec0 - dec1)
 	ratio.Mul(ratio, pow10)
 	price0 = ratio.FloatString(18)
 	// price1 is inverse adjusted: 1/price0
@@ -198,12 +198,22 @@ func pricesFromSqrtX96(sqrtStr string, dec0, dec1 int) (price0, price1 string, o
 	return price0, price1, true
 }
 
-func pow10Float(n int) float64 {
-	// small helper for decimal scaling; n in [-36, 36] typical
-	v := 1.0
-	if n > 0 { for i:=0; i<n; i++ { v *= 10 } }
-	if n < 0 { for i:=0; i<(-n); i++ { v /= 10 } }
-	return v
+// pow10BigRat returns 10^n as a big.Rat with exact precision (no float64 loss).
+func pow10BigRat(n int) *big.Rat {
+	if n == 0 {
+		return big.NewRat(1, 1)
+	}
+	// 10^n = (10^abs(n), 1) if n>0, else (1, 10^abs(n))
+	abs := n
+	if abs < 0 {
+		abs = -abs
+	}
+	ten := big.NewInt(10)
+	pow := new(big.Int).Exp(ten, big.NewInt(int64(abs)), nil)
+	if n > 0 {
+		return new(big.Rat).SetFrac(pow, big.NewInt(1))
+	}
+	return new(big.Rat).SetFrac(big.NewInt(1), pow)
 }
 
 func divStrings(a, b string) (string, bool) {

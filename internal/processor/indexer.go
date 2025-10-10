@@ -87,6 +87,11 @@ func (i *Indexer) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize modules: %w", err)
 	}
 
+	// Recover recent blocks for modules after restart (prevents data loss from interrupted deployments)
+	if err := i.recoverModuleData(ctx); err != nil {
+		i.logger.Warn().Err(err).Msg("Module recovery failed, continuing anyway")
+	}
+
 	// Start health server
 	healthServer := api.NewHealthServer(i, i.logger)
 	go func() {
@@ -303,6 +308,38 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 	i.logger.Info().
 		Int("modules", len(manifests)).
 		Msg("Module system initialized")
+
+	return nil
+}
+
+// recoverModuleData reprocesses recent blocks to ensure module data consistency after restart
+func (i *Indexer) recoverModuleData(ctx context.Context) error {
+	// Get last indexed block
+	lastBlock, err := i.db.GetLastBlockNumber(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get last block: %w", err)
+	}
+
+	if lastBlock == 0 {
+		i.logger.Info().Msg("No blocks indexed yet, skipping module recovery")
+		return nil
+	}
+
+	// Reprocess last 10 blocks to ensure module data is complete
+	// This handles cases where core data was committed but module processing was interrupted
+	numBlocksToRecover := uint64(10)
+	if lastBlock < numBlocksToRecover {
+		numBlocksToRecover = lastBlock
+	}
+
+	i.logger.Info().
+		Uint64("last_block", lastBlock).
+		Uint64("recovery_blocks", numBlocksToRecover).
+		Msg("Starting module data recovery after restart")
+
+	if err := i.moduleRegistry.RecoverRecentBlocks(ctx, lastBlock, numBlocksToRecover); err != nil {
+		return fmt.Errorf("module recovery failed: %w", err)
+	}
 
 	return nil
 }
