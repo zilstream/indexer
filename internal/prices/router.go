@@ -63,11 +63,15 @@ func (r *DBRouter) PriceTokenUSD(ctx context.Context, token string, ts time.Time
 	}
 	// Try direct to WZIL via V2 reserves
 	if p, ok := r.v2SpotToUSD(ctx, addr, ts); ok {
-		return p, true
+		if sanitizePrice(p) {
+			return p, true
+		}
 	}
 	// Try direct to WZIL/stable via V3 sqrt price
 	if p, ok := r.v3SpotToUSD(ctx, addr, ts); ok {
-		return p, true
+		if sanitizePrice(p) {
+			return p, true
+		}
 	}
 	return "", false
 }
@@ -75,11 +79,13 @@ func (r *DBRouter) PriceTokenUSD(ctx context.Context, token string, ts time.Time
 // v2SpotToUSD tries to find a Uniswap V2 pair with WZIL or a stablecoin and derive USD.
 func (r *DBRouter) v2SpotToUSD(ctx context.Context, token string, ts time.Time) (string, bool) {
 	// Find any pair where token is token0 or token1 and the counter is wzil or stablecoin
+	// Require minimum reserves and order by reserve_usd to prefer high-liquidity pools
 	query := `
 		SELECT token0, token1, reserve0::numeric, reserve1::numeric
 		FROM uniswap_v2_pairs
 		WHERE (token0 = $1 AND (token1 = $2 OR token1 = ANY($3)))
 		   OR (token1 = $1 AND (token0 = $2 OR token0 = ANY($3)))
+		ORDER BY COALESCE(reserve_usd, 0) DESC
 		LIMIT 1`
 	var t0, t1 string
 	var r0, r1 sql.NullString
@@ -89,6 +95,20 @@ func (r *DBRouter) v2SpotToUSD(ctx context.Context, token string, ts time.Time) 
 	}
 	if !r0.Valid || !r1.Valid {
 		return "", false
+	}
+	// Require minimum reserves in the counter token (WZIL or stablecoin)
+	// This prevents deriving prices from dust pools
+	minReserve := "100000000000000000" // 0.1 tokens (in wei, 18 decimals)
+	if strings.ToLower(t0) == strings.ToLower(token) {
+		// token is t0, counter is t1 - check r1
+		if lessThan(r1.String, minReserve) {
+			return "", false
+		}
+	} else {
+		// token is t1, counter is t0 - check r0
+		if lessThan(r0.String, minReserve) {
+			return "", false
+		}
 	}
 	// Adjust by decimals: price(token0 in token1) = (r1/10^d1) / (r0/10^d0) = (r1/r0) * 10^(d0-d1)
 	d0 := r.getDecimals(ctx, t0)
@@ -115,19 +135,34 @@ func (r *DBRouter) v2SpotToUSD(ctx context.Context, token string, ts time.Time) 
 
 // v3SpotToUSD tries via a V3 pool spot price in uniswap_v3_pools (sqrt_price_x96) to WZIL or stablecoin.
 func (r *DBRouter) v3SpotToUSD(ctx context.Context, token string, ts time.Time) (string, bool) {
+	// Order by liquidity to prefer high-TVL pools and require minimum reserves
 	q := `
-		SELECT token0, token1, sqrt_price_x96::numeric
+		SELECT token0, token1, sqrt_price_x96::numeric, reserve0::numeric, reserve1::numeric
 		FROM uniswap_v3_pools
 		WHERE (token0 = $1 AND (token1 = $2 OR token1 = ANY($3)))
 		   OR (token1 = $1 AND (token0 = $2 OR token0 = ANY($3)))
+		ORDER BY COALESCE(liquidity, 0) DESC
 		LIMIT 1`
 	var t0, t1 string
-	var sp sql.NullString
+	var sp, r0, r1 sql.NullString
 	stableList := r.stableList()
-	if err := r.pool.QueryRow(ctx, q, token, r.wzil, stableList).Scan(&t0, &t1, &sp); err != nil {
+	if err := r.pool.QueryRow(ctx, q, token, r.wzil, stableList).Scan(&t0, &t1, &sp, &r0, &r1); err != nil {
 		return "", false
 	}
-	if !sp.Valid { return "", false }
+	if !sp.Valid || !r0.Valid || !r1.Valid { return "", false }
+	// Require minimum reserves in counter token
+	minReserve := "100000000000000000" // 0.1 tokens (18 decimals)
+	if strings.ToLower(t0) == strings.ToLower(token) {
+		// token is t0, counter is t1 - check r1
+		if lessThan(r1.String, minReserve) {
+			return "", false
+		}
+	} else {
+		// token is t1, counter is t0 - check r0
+		if lessThan(r0.String, minReserve) {
+			return "", false
+		}
+	}
 	sqrtStr := sp.String
 	// Convert sqrt_price_x96 to price0 and price1 with decimals
 	dec0 := r.getDecimals(ctx, t0)
@@ -233,4 +268,23 @@ func mulStrings(a, b string) (string, bool) {
 	if _, ok := y.SetString(b); !ok { return "", false }
 	x.Mul(x, y)
 	return x.FloatString(18), true
+}
+
+func lessThan(a, b string) bool {
+	x := new(big.Rat)
+	if _, ok := x.SetString(a); !ok { return false }
+	y := new(big.Rat)
+	if _, ok := y.SetString(b); !ok { return false }
+	return x.Cmp(y) < 0
+}
+
+// sanitizePrice rejects prices that are unreasonably high (likely due to low liquidity)
+// Max price of $10M per token is generous but prevents astronomical values
+func sanitizePrice(price string) bool {
+	maxPrice := "10000000" // $10M per token
+	p := new(big.Rat)
+	if _, ok := p.SetString(price); !ok { return false }
+	max := new(big.Rat)
+	if _, ok := max.SetString(maxPrice); !ok { return false }
+	return p.Cmp(max) <= 0 && p.Sign() >= 0
 }

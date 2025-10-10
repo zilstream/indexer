@@ -209,9 +209,9 @@ func GetStats(ctx context.Context, pool *pgxpool.Pool) (*StatsDTO, error) {
 	q := `
 		SELECT 
 			COUNT(DISTINCT address) AS total_pairs,
-			CAST(COALESCE(SUM(liquidity_usd), 0) AS TEXT) AS total_liquidity,
-			CAST(COALESCE(SUM(volume_usd_24h), 0) AS TEXT) AS total_volume_24h,
-			CAST(COALESCE(SUM(volume_usd), 0) AS TEXT) AS total_volume_all
+			to_char(COALESCE(SUM(liquidity_usd), 0), 'FM9999999999999999999999999999999999990.999999999999999999') AS total_liquidity,
+			to_char(COALESCE(SUM(volume_usd_24h), 0), 'FM9999999999999999999999999999999999990.999999999999999999') AS total_volume_24h,
+			to_char(COALESCE(SUM(volume_usd), 0), 'FM9999999999999999999999999999999999990.999999999999999999') AS total_volume_all
 		FROM dex_pools
 		WHERE liquidity_usd > 0
 	`
