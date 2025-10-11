@@ -228,23 +228,40 @@ func (w *BulkWriter) bulkInsertTransactionsCopy(ctx context.Context, tx pgx.Tx, 
 
 // bulkInsertTransactionsUnnest uses UNNEST arrays for medium-sized transaction batches
 func (w *BulkWriter) bulkInsertTransactionsUnnest(ctx context.Context, tx pgx.Tx, transactions []*Transaction) error {
-	// Prepare data arrays
-	hashes := make([]string, len(transactions))
-	blockNumbers := make([]int64, len(transactions))
-	txIndexes := make([]int32, len(transactions))
-	fromAddrs := make([]string, len(transactions))
-	toAddrs := make([]interface{}, len(transactions))
-	values := make([]interface{}, len(transactions))
-	gasLimits := make([]int64, len(transactions))
-	gasPrices := make([]interface{}, len(transactions))
-	gasUseds := make([]int64, len(transactions))
-	nonces := make([]int64, len(transactions))
-	inputs := make([]string, len(transactions))
-	txTypes := make([]int32, len(transactions))
-	statuses := make([]int32, len(transactions))
-	createdAts := make([]time.Time, len(transactions))
+	// Deduplicate transactions by hash to prevent "ON CONFLICT DO UPDATE command cannot affect row a second time" error
+	seen := make(map[string]bool)
+	dedupedTxs := make([]*Transaction, 0, len(transactions))
+	for _, txn := range transactions {
+		if !seen[txn.Hash] {
+			seen[txn.Hash] = true
+			dedupedTxs = append(dedupedTxs, txn)
+		}
+	}
 
-	for i, txn := range transactions {
+	if len(dedupedTxs) != len(transactions) {
+		w.logger.Warn().
+			Int("original", len(transactions)).
+			Int("deduped", len(dedupedTxs)).
+			Msg("Removed duplicate transactions from batch")
+	}
+
+	// Prepare data arrays
+	hashes := make([]string, len(dedupedTxs))
+	blockNumbers := make([]int64, len(dedupedTxs))
+	txIndexes := make([]int32, len(dedupedTxs))
+	fromAddrs := make([]string, len(dedupedTxs))
+	toAddrs := make([]interface{}, len(dedupedTxs))
+	values := make([]interface{}, len(dedupedTxs))
+	gasLimits := make([]int64, len(dedupedTxs))
+	gasPrices := make([]interface{}, len(dedupedTxs))
+	gasUseds := make([]int64, len(dedupedTxs))
+	nonces := make([]int64, len(dedupedTxs))
+	inputs := make([]string, len(dedupedTxs))
+	txTypes := make([]int32, len(dedupedTxs))
+	statuses := make([]int32, len(dedupedTxs))
+	createdAts := make([]time.Time, len(dedupedTxs))
+
+	for i, txn := range dedupedTxs {
 		hashes[i] = txn.Hash
 		blockNumbers[i] = int64(txn.BlockNumber)
 		txIndexes[i] = int32(txn.TransactionIndex)
