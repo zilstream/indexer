@@ -28,6 +28,7 @@ type Indexer struct {
 	rpcClient      *rpc.Client
 	db             *database.Database
 	moduleRegistry *core.ModuleRegistry
+	pricePoller    *prices.Poller
 	logger         zerolog.Logger
 	shutdown       chan struct{}
 }
@@ -68,11 +69,17 @@ func NewIndexer(cfg *config.Config, logger zerolog.Logger) (*Indexer, error) {
 	// Create module registry
 	moduleRegistry := core.NewModuleRegistry(db, logger)
 
+	// Create price poller
+	pricePoller := prices.NewPoller(db.Pool(), prices.PollerConfig{
+		Interval: cfg.Processor.PricePollInterval,
+	}, logger)
+
 	return &Indexer{
 		config:         cfg,
 		rpcClient:      rpcClient,
 		db:             db,
 		moduleRegistry: moduleRegistry,
+		pricePoller:    pricePoller,
 		logger:         logger.With().Str("component", "indexer").Logger(),
 		shutdown:       make(chan struct{}),
 	}, nil
@@ -101,6 +108,20 @@ func (i *Indexer) Start(ctx context.Context) error {
 			i.logger.Error().Err(err).Msg("Health server error")
 		}
 	}()
+
+	// Start price poller early (before sync to avoid blocking)
+	i.logger.Info().Msg("Starting price poller")
+	if i.pricePoller != nil {
+		go func() {
+			if err := i.pricePoller.Start(ctx); err != nil && err != context.Canceled {
+				i.logger.Error().Err(err).Msg("Price poller error")
+			}
+		}()
+		time.Sleep(100 * time.Millisecond)
+		i.logger.Info().Msg("Price poller started")
+	} else {
+		i.logger.Warn().Msg("Price poller is nil, skipping")
+	}
 
 	// Start initial sync if needed
 	if err := i.syncOnce(ctx); err != nil {
