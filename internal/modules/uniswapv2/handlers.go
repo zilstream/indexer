@@ -311,10 +311,10 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 				}
 				if zilDelta != nil && zilDelta.Sign() != 0 {
 					if price, ok := module.priceProvider.PriceZILUSD(ctx, minute); ok {
-						// amount_usd = abs(zilDelta)/1e18 * price
+						// amount_usd = abs(zilDelta)/1e18 * price * 2 (both sides)
 						_, _ = module.db.Pool().Exec(ctx, `
 							UPDATE uniswap_v2_swaps
-							SET amount_usd = (abs($2::numeric) / 1e18::numeric) * $3::numeric
+							SET amount_usd = (abs($2::numeric) / 1e18::numeric) * $3::numeric * 2
 							WHERE id = $1`, swapID, zilDelta.String(), price)
 						// capture value for token updates
 						swapUSD = ""
@@ -367,16 +367,16 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 							Str("token", t1).
 							Msg("No USD price for token1 from router")
 					}
-					// choose the non-empty, else max of both if both present
+					// sum both sides if both present
 					sel := ""
 					if usd0 != "" && usd1 != "" {
-						// pick the larger to avoid double counting
 						r0 := new(big.Rat)
 						_, _ = r0.SetString(usd0)
 						r1 := new(big.Rat)
 						_, _ = r1.SetString(usd1)
-						if r0.Cmp(r1) >= 0 { sel = usd0 } else { sel = usd1 }
-					} else if usd0 != "" { sel = usd0 } else if usd1 != "" { sel = usd1 }
+						sum := new(big.Rat).Add(r0, r1)
+						sel = sum.FloatString(18)
+					} else if usd0 != "" { sel = mulStr(usd0, "2") } else if usd1 != "" { sel = mulStr(usd1, "2") }
 					if sel != "" {
 						swapUSD = sel
 						_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v2_swaps SET amount_usd = $2::numeric WHERE id = $1`, swapID, sel)
@@ -393,12 +393,13 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 						if p0db != "" { usd0 = mulStr(divBigIntByPow10Str(vol0, dec0), p0db) }
 						if p1db != "" { usd1 = mulStr(divBigIntByPow10Str(vol1, dec1), p1db) }
 						if usd0 != "" || usd1 != "" {
-							sel2 := usd0
-							if sel2 == "" { sel2 = usd1 } else if usd1 != "" {
+							sel2 := ""
+							if usd0 != "" && usd1 != "" {
 								r0 := new(big.Rat); _, _ = r0.SetString(usd0)
 								r1 := new(big.Rat); _, _ = r1.SetString(usd1)
-								if r1.Cmp(r0) > 0 { sel2 = usd1 }
-							}
+								sum := new(big.Rat).Add(r0, r1)
+								sel2 = sum.FloatString(18)
+							} else if usd0 != "" { sel2 = mulStr(usd0, "2") } else { sel2 = mulStr(usd1, "2") }
 							swapUSD = sel2
 							_, _ = module.db.Pool().Exec(ctx, `UPDATE uniswap_v2_swaps SET amount_usd = $2::numeric WHERE id = $1`, swapID, sel2)
 							_, _ = module.db.Pool().Exec(ctx, `

@@ -259,35 +259,48 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 			// Resolve block timestamp via DB, fallback to RPC if DB row not yet visible
 			minute, ok := module.blockTime(ctx, event.BlockNumber)
 			if ok {
-				// Stablecoin direct
+				var usd0, usd1 string
+				// Calculate USD for both sides
 				if module.isStablecoin(l0) && amount0 != nil {
 					dec := module.tokenDecimals(ctx, l0)
-					usd = divBigIntByPow10Str(absBig(amount0), dec)
-				} else if module.isStablecoin(l1) && amount1 != nil {
-					dec := module.tokenDecimals(ctx, l1)
-					usd = divBigIntByPow10Str(absBig(amount1), dec)
+					usd0 = divBigIntByPow10Str(absBig(amount0), dec)
 				} else if l0 == zilAddr && amount0 != nil {
 					if price, ok := module.priceProvider.PriceZILUSD(ctx, minute); ok {
-						usd = mulStr(divBigIntByPow10Str(absBig(amount0), 18), price)
+						usd0 = mulStr(divBigIntByPow10Str(absBig(amount0), 18), price)
 					}
+				} else if module.priceRouter != nil && amount0 != nil {
+					if p, ok := module.priceRouter.PriceTokenUSD(ctx, l0, minute); ok {
+						dec0 := module.tokenDecimals(ctx, l0)
+						usd0 = mulStr(divBigIntByPow10Str(absBig(amount0), dec0), p)
+					}
+				}
+				
+				if module.isStablecoin(l1) && amount1 != nil {
+					dec := module.tokenDecimals(ctx, l1)
+					usd1 = divBigIntByPow10Str(absBig(amount1), dec)
 				} else if l1 == zilAddr && amount1 != nil {
 					if price, ok := module.priceProvider.PriceZILUSD(ctx, minute); ok {
-						usd = mulStr(divBigIntByPow10Str(absBig(amount1), 18), price)
+						usd1 = mulStr(divBigIntByPow10Str(absBig(amount1), 18), price)
 					}
-				} else if module.priceRouter != nil {
-					// Router fallback: try token0 then token1
-					if amount0 != nil {
-						if p, ok := module.priceRouter.PriceTokenUSD(ctx, l0, minute); ok {
-							dec0 := module.tokenDecimals(ctx, l0)
-							usd = mulStr(divBigIntByPow10Str(absBig(amount0), dec0), p)
-						}
+				} else if module.priceRouter != nil && amount1 != nil {
+					if p, ok := module.priceRouter.PriceTokenUSD(ctx, l1, minute); ok {
+						dec1 := module.tokenDecimals(ctx, l1)
+						usd1 = mulStr(divBigIntByPow10Str(absBig(amount1), dec1), p)
 					}
-					if usd == "" && amount1 != nil {
-						if p, ok := module.priceRouter.PriceTokenUSD(ctx, l1, minute); ok {
-							dec1 := module.tokenDecimals(ctx, l1)
-							usd = mulStr(divBigIntByPow10Str(absBig(amount1), dec1), p)
-						}
-					}
+				}
+				
+				// Sum both sides if both present, else double the available one
+				if usd0 != "" && usd1 != "" {
+					r0 := new(big.Rat)
+					_, _ = r0.SetString(usd0)
+					r1 := new(big.Rat)
+					_, _ = r1.SetString(usd1)
+					sum := new(big.Rat).Add(r0, r1)
+					usd = sum.FloatString(18)
+				} else if usd0 != "" {
+					usd = mulStr(usd0, "2")
+				} else if usd1 != "" {
+					usd = mulStr(usd1, "2")
 				}
 				if usd != "" {
 					// Set swap amount_usd
