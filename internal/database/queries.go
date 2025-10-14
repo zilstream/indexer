@@ -126,6 +126,27 @@ func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sear
 }
 
 // ListPairs reads from dex_pools view to be protocol-agnostic (V2+V3)
+func GetPair(ctx context.Context, pool *pgxpool.Pool, address string) (*PairDTO, error) {
+	q := `
+		SELECT protocol, address, token0, token1,
+		       token0_symbol, token0_name, token1_symbol, token1_name,
+		       CAST(fee AS TEXT), CAST(reserve0 AS TEXT), CAST(reserve1 AS TEXT), CAST(liquidity AS TEXT),
+		       CAST(liquidity_usd AS TEXT), CAST(volume_usd AS TEXT), CAST(volume_usd_24h AS TEXT), txn_count
+		FROM dex_pools
+		WHERE address = $1`
+
+	var p PairDTO
+	err := pool.QueryRow(ctx, q, address).Scan(
+		&p.Protocol, &p.Address, &p.Token0, &p.Token1,
+		&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name,
+		&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity,
+		&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.TxnCount)
+	if err != nil {
+		return nil, fmt.Errorf("GetPair query failed: %w", err)
+	}
+	return &p, nil
+}
+
 func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortBy, sortOrder string) ([]PairDTO, error) {
 	// Map user-friendly sort options to column names
 	sortColumn := "volume_usd_24h"

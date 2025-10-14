@@ -144,17 +144,32 @@ func (s *APIServer) handlePairs(w http.ResponseWriter, r *http.Request) {
 func (s *APIServer) handlePairPrefix(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/pairs/")
 	parts := strings.Split(path, "/")
-	if len(parts) < 2 {
+	if len(parts) == 0 || parts[0] == "" {
 		Error(w, http.StatusNotFound, "not found")
 		return
 	}
-	address, sub := parts[0], parts[1]
+	address := parts[0]
+	if len(parts) == 1 {
+		s.handlePairDetail(w, r, address)
+		return
+	}
+	sub := parts[1]
 	switch sub {
 	case "events":
 		s.handlePairEvents(w, r, address)
 	default:
 		Error(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (s *APIServer) handlePairDetail(w http.ResponseWriter, r *http.Request, address string) {
+	ctx := r.Context()
+	pair, err := database.GetPair(ctx, s.db, address)
+	if err != nil {
+		Error(w, http.StatusNotFound, "pair not found")
+		return
+	}
+	JSON(w, http.StatusOK, pair, nil)
 }
 
 func (s *APIServer) handlePairEvents(w http.ResponseWriter, r *http.Request, address string) {
