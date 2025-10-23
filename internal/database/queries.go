@@ -173,7 +173,7 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 		       CAST(liquidity_usd AS TEXT), CAST(volume_usd AS TEXT), CAST(volume_usd_24h AS TEXT), txn_count
 		FROM dex_pools
 		WHERE liquidity_usd > 0
-		ORDER BY %s %s NULLS LAST
+		ORDER BY %s %s NULLS LAST, liquidity_usd DESC NULLS LAST
 		LIMIT $1 OFFSET $2`, sortColumn, strings.ToUpper(sortOrder))
 
 	rows, err := pool.Query(ctx, q, limit, offset)
