@@ -248,8 +248,8 @@ return fmt.Errorf("failed to parse event: %w", err)
 }
 
 // Add timestamp to parsed event (from block)
-// We'll need to fetch this if not available in the event
-parsedEvent.Timestamp = big.NewInt(0) // TODO: Add proper timestamp
+blockTimestamp := m.getBlockTimestamp(ctx, log.BlockNumber)
+parsedEvent.Timestamp = big.NewInt(blockTimestamp)
 
 // Call the specific handler
 m.logger.Debug().

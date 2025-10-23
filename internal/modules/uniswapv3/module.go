@@ -372,7 +372,8 @@ func (m *UniswapV3Module) HandleEvent(ctx context.Context, log *types.Log) error
 			return nil
 		}
 	}
-	parsedEvent.Timestamp = big.NewInt(0)
+	blockTimestamp := m.getBlockTimestamp(ctx, log.BlockNumber)
+	parsedEvent.Timestamp = big.NewInt(blockTimestamp)
 
 	if err := handler(ctx, m, parsedEvent); err != nil {
 		m.logger.Error().Err(err).Str("event", parsedEvent.EventName).Str("address", parsedEvent.Address.Hex()).Msg("V3 handler failed")
@@ -381,6 +382,24 @@ func (m *UniswapV3Module) HandleEvent(ctx context.Context, log *types.Log) error
 	}
 	m.updateModuleState(ctx, log.BlockNumber, "active")
 	return nil
+}
+
+// getBlockTimestamp fetches block timestamp (seconds); falls back to RPC when DB not yet visible
+func (m *UniswapV3Module) getBlockTimestamp(ctx context.Context, blockNumber uint64) int64 {
+	// Try DB first
+	var ts int64
+	_ = m.db.Pool().QueryRow(ctx, `SELECT timestamp FROM blocks WHERE number = $1`, blockNumber).Scan(&ts)
+	if ts > 0 {
+		return ts
+	}
+	// Fallback: RPC header (helps during in-tx processing when DB row not visible yet)
+	if m.rpcClient != nil {
+		hdr, err := m.rpcClient.HeaderByNumber(ctx, new(big.Int).SetUint64(blockNumber))
+		if err == nil && hdr != nil {
+			return int64(hdr.Time)
+		}
+	}
+	return 0
 }
 
 // GetEventFilters returns the event filters this module is interested in
