@@ -47,6 +47,16 @@ backfill:
 	@echo "Running backfill for MODULE=$(MODULE) FROM=$(FROM) TO=$(TO)"
 	@go run cmd/backfill/main.go --config=$(CONFIG) --module=$(MODULE) --from=$(FROM) --to=$(TO)
 
+## update-token-metrics: Update token metrics (24h volume, liquidity, price changes)
+update-token-metrics:
+	@echo "Updating token metrics..."
+	@go run cmd/update_token_metrics/main.go --config=$(CONFIG)
+
+## build-update-token-metrics: Build the update token metrics binary
+build-update-token-metrics:
+	@echo "Building update token metrics tool..."
+	@go build $(LDFLAGS) -o bin/update_token_metrics cmd/update_token_metrics/main.go
+
 ## clean: Clean build artifacts and test cache
 clean:
 	@echo "Cleaning..."

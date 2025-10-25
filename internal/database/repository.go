@@ -207,3 +207,103 @@ func (r *TransactionRepository) GetByHash(ctx context.Context, hash string) (*Tr
 
 	return &tx, nil
 }
+
+// UpdateTokenMetrics updates aggregated metrics for a specific token
+func UpdateTokenMetrics(ctx context.Context, pool any, tokenAddress string) error {
+	type Pooler interface {
+		Exec(ctx context.Context, sql string, arguments ...any) (any, error)
+	}
+	
+	pooler, ok := pool.(Pooler)
+	if !ok {
+		return fmt.Errorf("invalid pool type")
+	}
+
+	query := `
+		WITH token_data AS (
+			-- Get current price from tokens table
+			SELECT address, price_usd, EXTRACT(EPOCH FROM NOW())::bigint AS now_ts
+			FROM tokens WHERE address = $1
+		),
+		-- Calculate 24h volume from swaps
+		vol_24h AS (
+			SELECT COALESCE(SUM(amount_usd), 0) as volume_24h
+			FROM (
+				SELECT amount_usd, timestamp 
+				FROM uniswap_v2_swaps s 
+				JOIN uniswap_v2_pairs p ON s.pair = p.address
+				WHERE (p.token0 = $1 OR p.token1 = $1)
+				  AND s.timestamp >= (SELECT now_ts FROM token_data) - 86400
+				UNION ALL
+				SELECT amount_usd, timestamp
+				FROM uniswap_v3_swaps s
+				JOIN uniswap_v3_pools p ON s.pool = p.address  
+				WHERE (p.token0 = $1 OR p.token1 = $1)
+				  AND s.timestamp >= (SELECT now_ts FROM token_data) - 86400
+			) combined
+		),
+		-- Calculate total liquidity from all pairs/pools
+		liq AS (
+			SELECT COALESCE(SUM(liq_usd), 0) as total_liq
+			FROM (
+				-- V2 pairs
+				SELECT 
+					CASE 
+						WHEN p.token0 = $1 THEN (p.reserve0::numeric / POWER(10, COALESCE(t.decimals, 18))) * COALESCE(t.price_usd, 0)
+						WHEN p.token1 = $1 THEN (p.reserve1::numeric / POWER(10, COALESCE(t.decimals, 18))) * COALESCE(t.price_usd, 0)
+						ELSE 0
+					END as liq_usd
+				FROM uniswap_v2_pairs p
+				JOIN tokens t ON t.address = $1
+				WHERE p.token0 = $1 OR p.token1 = $1
+				UNION ALL
+				-- V3 pools
+				SELECT
+					CASE
+						WHEN p.token0 = $1 THEN (p.liquidity::numeric / POWER(10, COALESCE(t.decimals, 18))) * COALESCE(t.price_usd, 0)
+						WHEN p.token1 = $1 THEN (p.liquidity::numeric / POWER(10, COALESCE(t.decimals, 18))) * COALESCE(t.price_usd, 0)
+						ELSE 0
+					END as liq_usd
+				FROM uniswap_v3_pools p
+				JOIN tokens t ON t.address = $1
+				WHERE p.token0 = $1 OR p.token1 = $1
+			) combined_liq
+		),
+		-- Get historical prices for price changes
+		price_24h_ago AS (
+			SELECT price FROM prices_zil_usd_minute
+			WHERE token_address = $1
+			  AND minute <= (SELECT now_ts FROM token_data) - 86400
+			ORDER BY minute DESC LIMIT 1
+		),
+		price_7d_ago AS (
+			SELECT price FROM prices_zil_usd_minute
+			WHERE token_address = $1
+			  AND minute <= (SELECT now_ts FROM token_data) - (7 * 86400)
+			ORDER BY minute DESC LIMIT 1
+		)
+		UPDATE tokens t
+		SET 
+			volume_24h_usd = (SELECT volume_24h FROM vol_24h),
+			total_liquidity_usd = (SELECT total_liq FROM liq),
+			price_change_24h = CASE 
+				WHEN (SELECT price FROM price_24h_ago) > 0 AND t.price_usd IS NOT NULL
+				THEN ((t.price_usd - (SELECT price FROM price_24h_ago)) / (SELECT price FROM price_24h_ago) * 100)
+				ELSE NULL
+			END,
+			price_change_7d = CASE
+				WHEN (SELECT price FROM price_7d_ago) > 0 AND t.price_usd IS NOT NULL
+				THEN ((t.price_usd - (SELECT price FROM price_7d_ago)) / (SELECT price FROM price_7d_ago) * 100)
+				ELSE NULL
+			END,
+			updated_at = NOW()
+		WHERE t.address = $1
+	`
+	
+	_, err := pooler.Exec(ctx, query, tokenAddress)
+	if err != nil {
+		return fmt.Errorf("failed to update token metrics for %s: %w", tokenAddress, err)
+	}
+	
+	return nil
+}

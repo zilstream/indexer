@@ -10,13 +10,16 @@ import (
 
 // DTOs for API responses (lightweight, no ORM tags)
 type TokenDTO struct {
-	Address        string   `json:"address"`
-	Symbol         *string  `json:"symbol,omitempty"`
-	Name           *string  `json:"name,omitempty"`
-	Decimals       *int32   `json:"decimals,omitempty"`
-	PriceUSD       *string  `json:"price_usd,omitempty"`
-	MarketCapUSD   *string  `json:"market_cap_usd,omitempty"`
-	TotalVolumeUSD *string  `json:"total_volume_usd,omitempty"`
+	Address          string   `json:"address"`
+	Symbol           *string  `json:"symbol,omitempty"`
+	Name             *string  `json:"name,omitempty"`
+	Decimals         *int32   `json:"decimals,omitempty"`
+	PriceUSD         *string  `json:"price_usd,omitempty"`
+	MarketCapUSD     *string  `json:"market_cap_usd,omitempty"`
+	LiquidityUSD     *string  `json:"liquidity_usd,omitempty"`
+	Volume24hUSD     *string  `json:"volume_24h_usd,omitempty"`
+	PriceChange24h   *string  `json:"price_change_24h,omitempty"`
+	PriceChange7d    *string  `json:"price_change_7d,omitempty"`
 }
 
 type PairDTO struct {
@@ -102,7 +105,12 @@ type TransactionDTO struct {
 func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, search *string) ([]TokenDTO, error) {
 	q := `
 		SELECT address, symbol, name, decimals,
-		       CAST(price_usd AS TEXT), CAST(market_cap_usd AS TEXT), CAST(total_volume_usd AS TEXT)
+		       CAST(price_usd AS TEXT), 
+		       CAST(market_cap_usd AS TEXT), 
+		       CAST(total_liquidity_usd AS TEXT),
+		       CAST(volume_24h_usd AS TEXT),
+		       CAST(price_change_24h AS TEXT),
+		       CAST(price_change_7d AS TEXT)
 		FROM tokens
 		WHERE ($3::text IS NULL OR symbol ILIKE '%' || $3 || '%' OR name ILIKE '%' || $3 || '%')
 		ORDER BY market_cap_usd DESC NULLS LAST
@@ -117,7 +125,9 @@ func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sear
 	var out []TokenDTO
 	for rows.Next() {
 		var t TokenDTO
-		if err := rows.Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals, &t.PriceUSD, &t.MarketCapUSD, &t.TotalVolumeUSD); err != nil {
+		if err := rows.Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals, 
+			&t.PriceUSD, &t.MarketCapUSD, &t.LiquidityUSD, &t.Volume24hUSD,
+			&t.PriceChange24h, &t.PriceChange7d); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
