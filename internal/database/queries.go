@@ -102,6 +102,28 @@ type TransactionDTO struct {
 }
 
 // ListTokens queries tokens with optional fuzzy search (symbol/name) ordered by market_cap_usd desc
+func GetToken(ctx context.Context, pool *pgxpool.Pool, address string) (*TokenDTO, error) {
+	q := `
+		SELECT address, symbol, name, decimals,
+		       CAST(price_usd AS TEXT), 
+		       CAST(market_cap_usd AS TEXT), 
+		       CAST(total_liquidity_usd AS TEXT),
+		       CAST(volume_24h_usd AS TEXT),
+		       CAST(price_change_24h AS TEXT),
+		       CAST(price_change_7d AS TEXT)
+		FROM tokens
+		WHERE address = $1`
+
+	var t TokenDTO
+	err := pool.QueryRow(ctx, q, address).Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals, 
+		&t.PriceUSD, &t.MarketCapUSD, &t.LiquidityUSD, &t.Volume24hUSD,
+		&t.PriceChange24h, &t.PriceChange7d)
+	if err != nil {
+		return nil, fmt.Errorf("GetToken query failed: %w", err)
+	}
+	return &t, nil
+}
+
 func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, search *string) ([]TokenDTO, error) {
 	q := `
 		SELECT address, symbol, name, decimals,

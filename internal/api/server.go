@@ -153,7 +153,7 @@ func (s *APIServer) handleTokenPrefix(w http.ResponseWriter, r *http.Request) {
 	}
 	address := parts[0]
 	if len(parts) == 1 {
-		Error(w, http.StatusNotFound, "not found")
+		s.handleTokenDetail(w, r, address)
 		return
 	}
 	sub := parts[1]
@@ -163,6 +163,16 @@ func (s *APIServer) handleTokenPrefix(w http.ResponseWriter, r *http.Request) {
 	default:
 		Error(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (s *APIServer) handleTokenDetail(w http.ResponseWriter, r *http.Request, address string) {
+	ctx := r.Context()
+	token, err := database.GetToken(ctx, s.db, address)
+	if err != nil {
+		Error(w, http.StatusNotFound, "token not found")
+		return
+	}
+	JSON(w, http.StatusOK, token, nil)
 }
 
 func (s *APIServer) handleTokenPairs(w http.ResponseWriter, r *http.Request, tokenAddress string) {
