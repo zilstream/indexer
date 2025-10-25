@@ -135,6 +135,39 @@ func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sear
 	return out, nil
 }
 
+// ListPairsByToken returns all pairs containing a specific token address ordered by liquidity
+func ListPairsByToken(ctx context.Context, pool *pgxpool.Pool, tokenAddress string, limit, offset int) ([]PairDTO, error) {
+	q := `
+		SELECT protocol, address, token0, token1,
+		       token0_symbol, token0_name, token1_symbol, token1_name,
+		       CAST(fee AS TEXT), CAST(reserve0 AS TEXT), CAST(reserve1 AS TEXT), CAST(liquidity AS TEXT),
+		       CAST(liquidity_usd AS TEXT), CAST(volume_usd AS TEXT), CAST(volume_usd_24h AS TEXT), txn_count
+		FROM dex_pools
+		WHERE (token0 = $1 OR token1 = $1)
+		  AND liquidity_usd > 0
+		ORDER BY CAST(liquidity_usd AS NUMERIC) DESC NULLS LAST
+		LIMIT $2 OFFSET $3`
+
+	rows, err := pool.Query(ctx, q, tokenAddress, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("ListPairsByToken query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PairDTO
+	for rows.Next() {
+		var p PairDTO
+		if err := rows.Scan(&p.Protocol, &p.Address, &p.Token0, &p.Token1, 
+			&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name, 
+			&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity, 
+			&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.TxnCount); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
 // ListPairs reads from dex_pools view to be protocol-agnostic (V2+V3)
 func GetPair(ctx context.Context, pool *pgxpool.Pool, address string) (*PairDTO, error) {
 	q := `

@@ -78,6 +78,9 @@ func (s *APIServer) registerRoutes() {
 	s.mux.HandleFunc("/blocks", s.handleBlocks)
 	s.mux.HandleFunc("/transactions", s.handleTransactions)
 
+	// Token-scoped prefix
+	s.mux.HandleFunc("/tokens/", s.handleTokenPrefix)
+	
 	// Pair-scoped prefix for events
 	s.mux.HandleFunc("/pairs/", s.handlePairPrefix)
 	
@@ -137,6 +140,39 @@ func (s *APIServer) handlePairs(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := database.ListPairs(ctx, s.db, limit, offset, sortBy, sortOrder)
 	if err != nil { Error(w, http.StatusInternalServerError, err.Error()); return }
+	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
+	JSON(w, http.StatusOK, items, pg)
+}
+
+func (s *APIServer) handleTokenPrefix(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/tokens/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		Error(w, http.StatusNotFound, "not found")
+		return
+	}
+	address := parts[0]
+	if len(parts) == 1 {
+		Error(w, http.StatusNotFound, "not found")
+		return
+	}
+	sub := parts[1]
+	switch sub {
+	case "pairs":
+		s.handleTokenPairs(w, r, address)
+	default:
+		Error(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (s *APIServer) handleTokenPairs(w http.ResponseWriter, r *http.Request, tokenAddress string) {
+	ctx := r.Context()
+	limit, offset, page, perPage := parsePagination(r)
+	items, err := database.ListPairsByToken(ctx, s.db, tokenAddress, limit, offset)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
 	JSON(w, http.StatusOK, items, pg)
 }
