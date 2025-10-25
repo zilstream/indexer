@@ -14,6 +14,7 @@ import (
 	"github.com/zilstream/indexer/internal/config"
 	"github.com/zilstream/indexer/internal/database"
 	"github.com/zilstream/indexer/internal/processor"
+	"github.com/zilstream/indexer/internal/scheduler"
 )
 
 func main() {
@@ -48,6 +49,16 @@ func main() {
 		logger.Fatal().Err(err).Msg("Failed to connect database")
 	}
 	defer db.Close()
+
+	// Start token metrics scheduler
+	metricsScheduler, err := scheduler.NewTokenMetricsScheduler(db.Pool(), logger)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("Failed to create token metrics scheduler")
+	}
+	if err := metricsScheduler.Start(ctx); err != nil {
+		logger.Fatal().Err(err).Msg("Failed to start token metrics scheduler")
+	}
+	defer metricsScheduler.Stop()
 
 	// Build API server
 	apiServer := api.NewAPIServer(db.Pool(), logger)

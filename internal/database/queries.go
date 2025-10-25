@@ -16,10 +16,10 @@ type TokenDTO struct {
 	Decimals         *int32   `json:"decimals,omitempty"`
 	PriceUSD         *string  `json:"price_usd,omitempty"`
 	MarketCapUSD     *string  `json:"market_cap_usd,omitempty"`
-	LiquidityUSD     *string  `json:"liquidity_usd,omitempty"`
-	Volume24hUSD     *string  `json:"volume_24h_usd,omitempty"`
-	PriceChange24h   *string  `json:"price_change_24h,omitempty"`
-	PriceChange7d    *string  `json:"price_change_7d,omitempty"`
+	LiquidityUSD     *string  `json:"liquidity_usd"`
+	Volume24hUSD     *string  `json:"volume_24h_usd"`
+	PriceChange24h   *string  `json:"price_change_24h"`
+	PriceChange7d    *string  `json:"price_change_7d"`
 }
 
 type PairDTO struct {
