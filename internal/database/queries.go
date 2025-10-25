@@ -113,7 +113,7 @@ func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sear
 		       CAST(price_change_7d AS TEXT)
 		FROM tokens
 		WHERE ($3::text IS NULL OR symbol ILIKE '%' || $3 || '%' OR name ILIKE '%' || $3 || '%')
-		ORDER BY market_cap_usd DESC NULLS LAST
+		ORDER BY CAST(market_cap_usd AS NUMERIC) DESC NULLS LAST
 		LIMIT $1 OFFSET $2`
 
 	rows, err := pool.Query(ctx, q, limit, offset, search)

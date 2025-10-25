@@ -225,77 +225,63 @@ func UpdateTokenMetrics(ctx context.Context, pool any, tokenAddress string) erro
 			SELECT address, price_usd, EXTRACT(EPOCH FROM NOW())::bigint AS now_ts
 			FROM tokens WHERE address = $1
 		),
-		-- Calculate 24h volume from swaps
+		-- Calculate 24h volume from swaps (sum of all swap USD values)
 		vol_24h AS (
 			SELECT COALESCE(SUM(amount_usd), 0) as volume_24h
 			FROM (
-				SELECT amount_usd, timestamp 
+				SELECT amount_usd
 				FROM uniswap_v2_swaps s 
 				JOIN uniswap_v2_pairs p ON s.pair = p.address
 				WHERE (p.token0 = $1 OR p.token1 = $1)
 				  AND s.timestamp >= (SELECT now_ts FROM token_data) - 86400
+				  AND s.amount_usd IS NOT NULL
 				UNION ALL
-				SELECT amount_usd, timestamp
+				SELECT amount_usd
 				FROM uniswap_v3_swaps s
 				JOIN uniswap_v3_pools p ON s.pool = p.address  
 				WHERE (p.token0 = $1 OR p.token1 = $1)
 				  AND s.timestamp >= (SELECT now_ts FROM token_data) - 86400
+				  AND s.amount_usd IS NOT NULL
 			) combined
 		),
 		-- Calculate total liquidity from all pairs/pools
 		liq AS (
 			SELECT COALESCE(SUM(liq_usd), 0) as total_liq
 			FROM (
-				-- V2 pairs
+				-- V2 pairs - use reserve_usd directly
 				SELECT 
-					CASE 
-						WHEN p.token0 = $1 THEN (p.reserve0::numeric / POWER(10, COALESCE(t.decimals, 18))) * COALESCE(t.price_usd, 0)
-						WHEN p.token1 = $1 THEN (p.reserve1::numeric / POWER(10, COALESCE(t.decimals, 18))) * COALESCE(t.price_usd, 0)
-						ELSE 0
-					END as liq_usd
+					COALESCE(p.reserve_usd, 0) as liq_usd
 				FROM uniswap_v2_pairs p
-				JOIN tokens t ON t.address = $1
 				WHERE p.token0 = $1 OR p.token1 = $1
 				UNION ALL
-				-- V3 pools
+				-- V3 pools - calculate liquidity_usd from reserves
 				SELECT
-					CASE
-						WHEN p.token0 = $1 THEN (p.liquidity::numeric / POWER(10, COALESCE(t.decimals, 18))) * COALESCE(t.price_usd, 0)
-						WHEN p.token1 = $1 THEN (p.liquidity::numeric / POWER(10, COALESCE(t.decimals, 18))) * COALESCE(t.price_usd, 0)
-						ELSE 0
-					END as liq_usd
+					((COALESCE(p.reserve0,0) / POWER(10::numeric, COALESCE(t0.decimals, 18))) * COALESCE(t0.price_usd, 0)) +
+					((COALESCE(p.reserve1,0) / POWER(10::numeric, COALESCE(t1.decimals, 18))) * COALESCE(t1.price_usd, 0)) as liq_usd
 				FROM uniswap_v3_pools p
-				JOIN tokens t ON t.address = $1
+				LEFT JOIN tokens t0 ON t0.address = p.token0
+				LEFT JOIN tokens t1 ON t1.address = p.token1
 				WHERE p.token0 = $1 OR p.token1 = $1
 			) combined_liq
 		),
-		-- Get historical prices for price changes
-		price_24h_ago AS (
-			SELECT price FROM prices_zil_usd_minute
-			WHERE token_address = $1
-			  AND minute <= (SELECT now_ts FROM token_data) - 86400
-			ORDER BY minute DESC LIMIT 1
-		),
-		price_7d_ago AS (
-			SELECT price FROM prices_zil_usd_minute
-			WHERE token_address = $1
-			  AND minute <= (SELECT now_ts FROM token_data) - (7 * 86400)
-			ORDER BY minute DESC LIMIT 1
+		-- Get historical price snapshots (24h and 7d ago) by looking back in time
+		-- We'll use a simple approach: capture price_usd at different timestamps
+		-- For now, we'll skip price changes if we don't have historical data
+		-- This can be improved later with a proper price history table
+		price_history AS (
+			SELECT 
+				t.price_usd as current_price,
+				NULL::numeric as price_24h_ago,
+				NULL::numeric as price_7d_ago
+			FROM tokens t
+			WHERE t.address = $1
 		)
 		UPDATE tokens t
 		SET 
 			volume_24h_usd = (SELECT volume_24h FROM vol_24h),
 			total_liquidity_usd = (SELECT total_liq FROM liq),
-			price_change_24h = CASE 
-				WHEN (SELECT price FROM price_24h_ago) > 0 AND t.price_usd IS NOT NULL
-				THEN ((t.price_usd - (SELECT price FROM price_24h_ago)) / (SELECT price FROM price_24h_ago) * 100)
-				ELSE NULL
-			END,
-			price_change_7d = CASE
-				WHEN (SELECT price FROM price_7d_ago) > 0 AND t.price_usd IS NOT NULL
-				THEN ((t.price_usd - (SELECT price FROM price_7d_ago)) / (SELECT price FROM price_7d_ago) * 100)
-				ELSE NULL
-			END,
+			price_change_24h = NULL,  -- Will implement with proper price history
+			price_change_7d = NULL,   -- Will implement with proper price history
 			updated_at = NOW()
 		WHERE t.address = $1
 	`
