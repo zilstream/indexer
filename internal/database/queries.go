@@ -86,14 +86,15 @@ type StatsDTO struct {
 }
 
 type BlockDTO struct {
-	Number           int64   `json:"number"`
-	Hash             string  `json:"hash"`
-	ParentHash       string  `json:"parent_hash"`
-	Timestamp        int64   `json:"timestamp"`
-	GasLimit         *int64  `json:"gas_limit,omitempty"`
-	GasUsed          *int64  `json:"gas_used,omitempty"`
-	BaseFeePerGas    *string `json:"base_fee_per_gas,omitempty"`
-	TransactionCount int     `json:"transaction_count"`
+	Number           int64            `json:"number"`
+	Hash             string           `json:"hash"`
+	ParentHash       string           `json:"parent_hash"`
+	Timestamp        int64            `json:"timestamp"`
+	GasLimit         *int64           `json:"gas_limit,omitempty"`
+	GasUsed          *int64           `json:"gas_used,omitempty"`
+	BaseFeePerGas    *string          `json:"base_fee_per_gas,omitempty"`
+	TransactionCount int              `json:"transaction_count"`
+	Transactions     []TransactionDTO `json:"transactions,omitempty"`
 }
 
 type TransactionDTO struct {
@@ -473,6 +474,13 @@ func GetBlock(ctx context.Context, pool *pgxpool.Pool, number int64) (*BlockDTO,
 	if err != nil {
 		return nil, fmt.Errorf("GetBlock query failed: %w", err)
 	}
+	
+	transactions, err := ListTransactionsByBlock(ctx, pool, number)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch block transactions: %w", err)
+	}
+	b.Transactions = transactions
+	
 	return &b, nil
 }
 
@@ -529,6 +537,41 @@ func ListTransactionsByAddress(ctx context.Context, pool *pgxpool.Pool, address 
 	rows, err := pool.Query(ctx, q, address, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("ListTransactionsByAddress query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var out []TransactionDTO
+	for rows.Next() {
+		var tx TransactionDTO
+		if err := rows.Scan(&tx.Hash, &tx.BlockNumber, &tx.TransactionIndex, &tx.FromAddress, &tx.ToAddress,
+			&tx.Value, &tx.GasPrice, &tx.GasLimit, &tx.GasUsed, &tx.Nonce, &tx.Status,
+			&tx.TransactionType, &tx.OriginalTypeHex,
+			&tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.EffectiveGasPrice, &tx.ContractAddress, &tx.CumulativeGasUsed,
+			&tx.Timestamp); err != nil {
+			return nil, err
+		}
+		out = append(out, tx)
+	}
+	return out, nil
+}
+
+// ListTransactionsByBlock returns all transactions for a specific block number
+func ListTransactionsByBlock(ctx context.Context, pool *pgxpool.Pool, blockNumber int64) ([]TransactionDTO, error) {
+	q := `
+		SELECT t.hash, t.block_number, t.transaction_index, t.from_address, t.to_address,
+		       CAST(t.value AS TEXT), CAST(t.gas_price AS TEXT), t.gas_limit, t.gas_used, t.nonce, t.status,
+		       t.transaction_type, t.original_type_hex,
+		       CAST(t.max_fee_per_gas AS TEXT), CAST(t.max_priority_fee_per_gas AS TEXT),
+		       CAST(t.effective_gas_price AS TEXT), t.contract_address, t.cumulative_gas_used,
+		       b.timestamp
+		FROM transactions t
+		JOIN blocks b ON t.block_number = b.number
+		WHERE t.block_number = $1
+		ORDER BY t.transaction_index ASC`
+
+	rows, err := pool.Query(ctx, q, blockNumber)
+	if err != nil {
+		return nil, fmt.Errorf("ListTransactionsByBlock query failed: %w", err)
 	}
 	defer rows.Close()
 
