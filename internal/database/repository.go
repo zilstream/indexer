@@ -288,7 +288,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			JOIN tokens t0 ON lower(t0.address) = lower(dp.token0)
 			JOIN tokens t1 ON lower(t1.address) = lower(dp.token1)
 			WHERE lower(dp.token0) = lower($1) OR lower(dp.token1) = lower($1)
-			  AND (COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0)) > 0
+			  AND (COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0)) >= 100
 		),
 		zil_24h AS (
 			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_24h FROM times) ORDER BY ts DESC LIMIT 1) AS usd
@@ -334,7 +334,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				p.pool, p.w,
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 THEN NULL
 				  ELSE
 					CASE WHEN p.is_target0 THEN
 					  CASE p.anchor
@@ -412,7 +412,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				p.pool, p.w,
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 THEN NULL
 				  ELSE
 					CASE WHEN p.is_target0 THEN
 					  CASE p.anchor
