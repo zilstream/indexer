@@ -226,7 +226,7 @@ func (p *TransactionProcessor) GetTransactionCount(ctx context.Context, address 
 	query := `
 		SELECT COUNT(*) 
 		FROM transactions 
-		WHERE from_address = $1 OR to_address = $1`
+		WHERE lower(from_address) = lower($1) OR lower(to_address) = lower($1)`
 
 	err := p.db.Pool().QueryRow(ctx, query, address).Scan(&count)
 	if err != nil {

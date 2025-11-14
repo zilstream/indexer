@@ -319,7 +319,7 @@ func ListEventsByAddress(ctx context.Context, pool *pgxpool.Pool, address string
 		       CAST(amount0_in AS TEXT), CAST(amount1_in AS TEXT), CAST(amount0_out AS TEXT), CAST(amount1_out AS TEXT),
 		       CAST(liquidity AS TEXT), CAST(amount_usd AS TEXT)
 		FROM dex_pair_events
-		WHERE (sender = $1 OR recipient = $1 OR to_address = $1)
+		WHERE (lower(sender) = lower($1) OR lower(recipient) = lower($1) OR lower(to_address) = lower($1))
 		  AND ($2::text IS NULL OR event_type = $2)
 		  AND ($3::text IS NULL OR protocol = $3)
 		ORDER BY timestamp DESC, log_index DESC
@@ -491,7 +491,7 @@ func ListTransactionsByAddress(ctx context.Context, pool *pgxpool.Pool, address 
 		       b.timestamp
 		FROM transactions t
 		JOIN blocks b ON t.block_number = b.number
-		WHERE t.from_address = $1 OR t.to_address = $1
+		WHERE lower(t.from_address) = lower($1) OR lower(t.to_address) = lower($1)
 		ORDER BY t.block_number DESC, t.transaction_index DESC
 		LIMIT $2 OFFSET $3`
 
