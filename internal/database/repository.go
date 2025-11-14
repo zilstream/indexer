@@ -456,12 +456,12 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				CASE 
 					WHEN (SELECT total_w FROM agg_24h) > 0 AND (SELECT w_price_sum FROM agg_24h) IS NOT NULL 
-					THEN (SELECT w_price_sum FROM agg_24h) / (SELECT total_w FROM agg_24h) 
+					THEN NULLIF((SELECT w_price_sum FROM agg_24h) / (SELECT total_w FROM agg_24h), 0)
 					ELSE NULL 
 				END AS price_24h,
 				CASE 
 					WHEN (SELECT total_w FROM agg_7d) > 0 AND (SELECT w_price_sum FROM agg_7d) IS NOT NULL 
-					THEN (SELECT w_price_sum FROM agg_7d) / (SELECT total_w FROM agg_7d) 
+					THEN NULLIF((SELECT w_price_sum FROM agg_7d) / (SELECT total_w FROM agg_7d), 0)
 					ELSE NULL 
 				END AS price_7d
 		)
@@ -470,14 +470,14 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 		  volume_24h_usd = (SELECT volume_24h FROM vol_24h),
 		  total_liquidity_usd = (SELECT total_liq FROM liq),
 		  price_change_24h = CASE
-			WHEN (SELECT price_24h FROM hist_prices) IS NULL OR (SELECT price_24h FROM hist_prices) = 0 THEN NULL
-			WHEN (SELECT price_usd FROM token_data) IS NULL THEN NULL
+			WHEN (SELECT price_24h FROM hist_prices) IS NULL THEN NULL
+			WHEN (SELECT price_usd FROM token_data) IS NULL OR (SELECT price_usd FROM token_data) = 0 THEN NULL
 			ELSE (( (SELECT price_usd FROM token_data) - (SELECT price_24h FROM hist_prices) )
 				 / (SELECT price_24h FROM hist_prices)) * 100
 		  END,
 		  price_change_7d = CASE
-			WHEN (SELECT price_7d FROM hist_prices) IS NULL OR (SELECT price_7d FROM hist_prices) = 0 THEN NULL
-			WHEN (SELECT price_usd FROM token_data) IS NULL THEN NULL
+			WHEN (SELECT price_7d FROM hist_prices) IS NULL THEN NULL
+			WHEN (SELECT price_usd FROM token_data) IS NULL OR (SELECT price_usd FROM token_data) = 0 THEN NULL
 			ELSE (( (SELECT price_usd FROM token_data) - (SELECT price_7d FROM hist_prices) )
 				 / (SELECT price_7d FROM hist_prices)) * 100
 		  END,
