@@ -6,6 +6,7 @@ import (
 	"math/big"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // BlockRepository handles block-related database operations
@@ -209,35 +210,13 @@ func (r *TransactionRepository) GetByHash(ctx context.Context, hash string) (*Tr
 }
 
 // UpdateTokenMetrics updates aggregated metrics for a specific token
-func UpdateTokenMetrics(ctx context.Context, pool any, tokenAddress string) error {
-	type Pooler interface {
-		Exec(ctx context.Context, sql string, arguments ...any) (any, error)
-		QueryRow(ctx context.Context, sql string, arguments ...any) any
-	}
-	
-	pooler, ok := pool.(Pooler)
-	if !ok {
-		return fmt.Errorf("invalid pool type")
-	}
-
-	// Get WZIL and stablecoin addresses for price calculation
-	type RowScanner interface {
-		Scan(dest ...any) error
-	}
-	
+func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress string) error {
+	// Get WZIL address for price calculation
 	var wzilAddr string
-	row := pooler.QueryRow(ctx, "SELECT address FROM tokens WHERE symbol ILIKE 'WZIL' LIMIT 1")
-	if rowScanner, ok := row.(RowScanner); ok {
-		if err := rowScanner.Scan(&wzilAddr); err != nil {
-			return fmt.Errorf("failed to get WZIL address: %w", err)
-		}
-	} else {
-		return fmt.Errorf("failed to get WZIL address: row scanner not available")
+	err := pool.QueryRow(ctx, "SELECT address FROM tokens WHERE symbol ILIKE 'WZIL' LIMIT 1").Scan(&wzilAddr)
+	if err != nil {
+		return fmt.Errorf("failed to get WZIL address: %w", err)
 	}
-
-	// Get stablecoin addresses - need to query them properly
-	// For simplicity, we'll pass them as part of the query since we can't easily use QueryRow for arrays
-	stableAddrs := []string{} // Will be populated by a subquery in SQL
 
 	query := `
 		WITH token_data AS (
@@ -281,7 +260,7 @@ func UpdateTokenMetrics(ctx context.Context, pool any, tokenAddress string) erro
 		),
 		anchors AS (
 			SELECT
-				ARRAY(SELECT lower(address) FROM tokens WHERE price_usd = 1.0 AND symbol IN ('USDT', 'USDC', 'DAI', 'BUSD')) AS stables,
+				ARRAY(SELECT lower(address) FROM tokens WHERE symbol ILIKE ANY(ARRAY['USDT', 'USDC', 'DAI', 'BUSD', 'ZUSDT', 'ZUSD', 'XSGD'])) AS stables,
 				lower($2) AS wzil
 		),
 		times AS (
@@ -295,19 +274,19 @@ func UpdateTokenMetrics(ctx context.Context, pool any, tokenAddress string) erro
 				dp.protocol,
 				dp.address AS pool,
 				dp.token0, dp.token1,
-				t0.decimals AS dec0, t1.decimals AS dec1,
+				COALESCE(t0.decimals, 18) AS dec0, COALESCE(t1.decimals, 18) AS dec1,
 				(COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0))::numeric AS w,
 				(lower(dp.token0) = lower($1)) AS is_target0,
 				CASE
 				  WHEN lower(dp.token0) = (SELECT wzil FROM anchors) THEN 'wzil0'
 				  WHEN lower(dp.token1) = (SELECT wzil FROM anchors) THEN 'wzil1'
-				  WHEN lower(dp.token0) = ANY((SELECT stables FROM anchors)) THEN 'stable0'
-				  WHEN lower(dp.token1) = ANY((SELECT stables FROM anchors)) THEN 'stable1'
+				  WHEN lower(dp.token0) = ANY(SELECT unnest(stables) FROM anchors) THEN 'stable0'
+				  WHEN lower(dp.token1) = ANY(SELECT unnest(stables) FROM anchors) THEN 'stable1'
 				  ELSE 'none'
 				END AS anchor
 			FROM dex_pools dp
-			JOIN tokens t0 ON t0.address = dp.token0
-			JOIN tokens t1 ON t1.address = dp.token1
+			JOIN tokens t0 ON lower(t0.address) = lower(dp.token0)
+			JOIN tokens t1 ON lower(t1.address) = lower(dp.token1)
 			WHERE lower(dp.token0) = lower($1) OR lower(dp.token1) = lower($1)
 			  AND (COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0)) > 0
 		),
@@ -498,7 +477,7 @@ func UpdateTokenMetrics(ctx context.Context, pool any, tokenAddress string) erro
 		WHERE lower(t.address) = lower($1)
 	`
 	
-	_, err := pooler.Exec(ctx, query, tokenAddress, wzilAddr, stableAddrs)
+	_, err = pool.Exec(ctx, query, tokenAddress, wzilAddr)
 	if err != nil {
 		return fmt.Errorf("failed to update token metrics for %s: %w", tokenAddress, err)
 	}
