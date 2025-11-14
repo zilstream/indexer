@@ -173,6 +173,7 @@ func (s *APIServer) handleTokenPrefix(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handleTokenDetail(w http.ResponseWriter, r *http.Request, address string) {
 	ctx := r.Context()
+	address = strings.ToLower(address)
 	token, err := database.GetToken(ctx, s.db, address)
 	if err != nil {
 		Error(w, http.StatusNotFound, "token not found")
@@ -183,6 +184,7 @@ func (s *APIServer) handleTokenDetail(w http.ResponseWriter, r *http.Request, ad
 
 func (s *APIServer) handleTokenPairs(w http.ResponseWriter, r *http.Request, tokenAddress string) {
 	ctx := r.Context()
+	tokenAddress = strings.ToLower(tokenAddress)
 	limit, offset, page, perPage := parsePagination(r)
 	items, err := database.ListPairsByToken(ctx, s.db, tokenAddress, limit, offset)
 	if err != nil {
@@ -195,6 +197,7 @@ func (s *APIServer) handleTokenPairs(w http.ResponseWriter, r *http.Request, tok
 
 func (s *APIServer) handleTokenPriceChart(w http.ResponseWriter, r *http.Request, address string) {
 	ctx := r.Context()
+	address = strings.ToLower(address)
 	chart, err := database.GetTokenPriceChart(ctx, s.db, address)
 	if err != nil {
 		Error(w, http.StatusNotFound, err.Error())
@@ -232,6 +235,7 @@ func (s *APIServer) handlePairPrefix(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handlePairDetail(w http.ResponseWriter, r *http.Request, address string) {
 	ctx := r.Context()
+	address = strings.ToLower(address)
 	pair, err := database.GetPair(ctx, s.db, address)
 	if err != nil {
 		Error(w, http.StatusNotFound, "pair not found")
@@ -242,6 +246,7 @@ func (s *APIServer) handlePairDetail(w http.ResponseWriter, r *http.Request, add
 
 func (s *APIServer) handlePairEvents(w http.ResponseWriter, r *http.Request, address string) {
 	ctx := r.Context()
+	address = strings.ToLower(address)
 	limit, offset, page, perPage := parsePagination(r)
 	var eventType *string
 	if v := r.URL.Query().Get("type"); v != "" { eventType = &v }
@@ -255,6 +260,7 @@ func (s *APIServer) handlePairEvents(w http.ResponseWriter, r *http.Request, add
 
 func (s *APIServer) handlePairPriceChart(w http.ResponseWriter, r *http.Request, address string) {
 	ctx := r.Context()
+	address = strings.ToLower(address)
 	chart, err := database.GetPairPriceChart(ctx, s.db, address)
 	if err != nil {
 		Error(w, http.StatusNotFound, err.Error())
@@ -344,6 +350,7 @@ func (s *APIServer) handleAddressPrefix(w http.ResponseWriter, r *http.Request) 
 
 func (s *APIServer) handleAddressTransactions(w http.ResponseWriter, r *http.Request, address string) {
 	ctx := r.Context()
+	address = strings.ToLower(address)
 	limit, offset, page, perPage := parsePagination(r)
 	items, err := database.ListTransactionsByAddress(ctx, s.db, address, limit, offset)
 	if err != nil {
@@ -356,6 +363,7 @@ func (s *APIServer) handleAddressTransactions(w http.ResponseWriter, r *http.Req
 
 func (s *APIServer) handleAddressEvents(w http.ResponseWriter, r *http.Request, address string) {
 	ctx := r.Context()
+	address = strings.ToLower(address)
 	limit, offset, page, perPage := parsePagination(r)
 	var eventType *string
 	if v := r.URL.Query().Get("type"); v != "" { eventType = &v }
