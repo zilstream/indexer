@@ -101,6 +101,28 @@ type TransactionDTO struct {
 	CumulativeGasUsed     *int64  `json:"cumulative_gas_used,omitempty"`
 }
 
+type PricePoint struct {
+	Timestamp string  `json:"timestamp"`
+	Price     *string `json:"price"`
+	Source    *string `json:"source,omitempty"`
+}
+
+type PriceChartDTO struct {
+	Address    string       `json:"address"`
+	Protocol   string       `json:"protocol"`
+	BaseToken  TokenBaseDTO `json:"base_token"`
+	Quote      string       `json:"quote"`
+	Timeframe  string       `json:"timeframe"`
+	Interval   string       `json:"interval"`
+	Points     []PricePoint `json:"points"`
+}
+
+type TokenBaseDTO struct {
+	Address  string `json:"address"`
+	Symbol   string `json:"symbol"`
+	Decimals int32  `json:"decimals"`
+}
+
 // ListTokens queries tokens with optional fuzzy search (symbol/name) ordered by market_cap_usd desc
 func GetToken(ctx context.Context, pool *pgxpool.Pool, address string) (*TokenDTO, error) {
 	q := `
@@ -445,4 +467,257 @@ func GetTransaction(ctx context.Context, pool *pgxpool.Pool, hash string) (*Tran
 		return nil, fmt.Errorf("GetTransaction query failed: %w", err)
 	}
 	return &tx, nil
+}
+
+// GetPairPriceChart returns 42 price points (every 4h) over 7 days for a pair/pool
+func GetPairPriceChart(ctx context.Context, pool *pgxpool.Pool, address string) (*PriceChartDTO, error) {
+	// First, get pair info to determine protocol
+	pair, err := GetPair(ctx, pool, address)
+	if err != nil {
+		return nil, fmt.Errorf("pair not found: %w", err)
+	}
+
+	// Get WZIL address
+	wzilAddr, err := getWZILAddress(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get WZIL address: %w", err)
+	}
+
+	// Get stablecoin addresses
+	stableAddrs, err := getStablecoinAddresses(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stablecoin addresses: %w", err)
+	}
+
+	var points []PricePoint
+	var token0Symbol string
+	var token0Decimals int32
+
+	if pair.Protocol == "uniswap_v2" {
+		points, token0Symbol, token0Decimals, err = getPriceChartV2(ctx, pool, address, pair.Token0, pair.Token1, wzilAddr, stableAddrs)
+	} else {
+		points, token0Symbol, token0Decimals, err = getPriceChartV3(ctx, pool, address, pair.Token0, pair.Token1, wzilAddr, stableAddrs)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &PriceChartDTO{
+		Address:   address,
+		Protocol:  pair.Protocol,
+		BaseToken: TokenBaseDTO{
+			Address:  pair.Token0,
+			Symbol:   token0Symbol,
+			Decimals: token0Decimals,
+		},
+		Quote:     "USD",
+		Timeframe: "7d",
+		Interval:  "4h",
+		Points:    points,
+	}, nil
+}
+
+func getWZILAddress(ctx context.Context, pool *pgxpool.Pool) (string, error) {
+	var addr string
+	err := pool.QueryRow(ctx, "SELECT address FROM tokens WHERE symbol ILIKE 'WZIL' LIMIT 1").Scan(&addr)
+	if err != nil {
+		return "", err
+	}
+	return addr, nil
+}
+
+func getStablecoinAddresses(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {
+	rows, err := pool.Query(ctx, "SELECT address FROM tokens WHERE price_usd = 1.0 AND symbol IN ('USDT', 'USDC', 'DAI', 'BUSD')")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var addrs []string
+	for rows.Next() {
+		var addr string
+		if err := rows.Scan(&addr); err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
+}
+
+func getPriceChartV2(ctx context.Context, pool *pgxpool.Pool, pairAddr, token0, token1, wzil string, stables []string) ([]PricePoint, string, int32, error) {
+	q := `
+	WITH meta AS (
+		SELECT 
+			t0.address AS token0, t1.address AS token1,
+			t0.symbol AS symbol0, t0.decimals AS dec0,
+			t1.decimals AS dec1
+		FROM tokens t0, tokens t1
+		WHERE t0.address = $1 AND t1.address = $2
+	),
+	aligned AS (
+		SELECT date_trunc('hour', now() AT TIME ZONE 'UTC') 
+		     - make_interval(hours := (EXTRACT(hour FROM now() AT TIME ZONE 'UTC')::int % 4)) AS end_ts
+	),
+	buckets AS (
+		SELECT generate_series(
+			(SELECT end_ts FROM aligned) - interval '7 days' + interval '4 hours',
+			(SELECT end_ts FROM aligned),
+			interval '4 hours'
+		) AS ts
+	),
+	snaps AS (
+		SELECT 
+			b.ts,
+			s.reserve0, 
+			s.reserve1
+		FROM buckets b
+		LEFT JOIN LATERAL (
+			SELECT reserve0, reserve1
+			FROM uniswap_v2_syncs
+			WHERE pair = $3
+			  AND timestamp <= EXTRACT(EPOCH FROM b.ts)
+			ORDER BY timestamp DESC
+			LIMIT 1
+		) s ON TRUE
+	),
+	zil_prices AS (
+		SELECT 
+			b.ts,
+			(SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= b.ts ORDER BY ts DESC LIMIT 1) AS zil_usd
+		FROM buckets b
+	)
+	SELECT 
+		to_char(b.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+		CASE
+			WHEN LOWER($5) = LOWER(m.token1) THEN
+				((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
+			WHEN LOWER($5) = LOWER(m.token0) THEN
+				z.zil_usd
+			WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+				((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0))
+			WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+				1
+			ELSE NULL
+		END::text AS price,
+		CASE
+			WHEN LOWER($5) = LOWER(m.token1) OR LOWER($5) = LOWER(m.token0) THEN 'wzil'
+			WHEN LOWER(m.token1) = ANY($4::text[]) OR LOWER(m.token0) = ANY($4::text[]) THEN 'stable'
+			ELSE 'none'
+		END AS source,
+		m.symbol0,
+		m.dec0
+	FROM buckets b
+	CROSS JOIN meta m
+	LEFT JOIN snaps s ON s.ts = b.ts
+	LEFT JOIN zil_prices z ON z.ts = b.ts
+	ORDER BY b.ts ASC`
+
+	rows, err := pool.Query(ctx, q, token0, token1, pairAddr, stables, wzil)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("V2 price chart query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var points []PricePoint
+	var symbol string
+	var decimals int32
+	for rows.Next() {
+		var p PricePoint
+		if err := rows.Scan(&p.Timestamp, &p.Price, &p.Source, &symbol, &decimals); err != nil {
+			return nil, "", 0, err
+		}
+		points = append(points, p)
+	}
+
+	return points, symbol, decimals, nil
+}
+
+func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, token1, wzil string, stables []string) ([]PricePoint, string, int32, error) {
+	q := `
+	WITH meta AS (
+		SELECT 
+			t0.address AS token0, t1.address AS token1,
+			t0.symbol AS symbol0, t0.decimals AS dec0,
+			t1.decimals AS dec1
+		FROM tokens t0, tokens t1
+		WHERE t0.address = $1 AND t1.address = $2
+	),
+	aligned AS (
+		SELECT date_trunc('hour', now() AT TIME ZONE 'UTC') 
+		     - make_interval(hours := (EXTRACT(hour FROM now() AT TIME ZONE 'UTC')::int % 4)) AS end_ts
+	),
+	buckets AS (
+		SELECT generate_series(
+			(SELECT end_ts FROM aligned) - interval '7 days' + interval '4 hours',
+			(SELECT end_ts FROM aligned),
+			interval '4 hours'
+		) AS ts
+	),
+	snaps AS (
+		SELECT 
+			b.ts,
+			s.sqrt_price_x96
+		FROM buckets b
+		LEFT JOIN LATERAL (
+			SELECT sqrt_price_x96
+			FROM uniswap_v3_swaps
+			WHERE pool = $3
+			  AND timestamp <= EXTRACT(EPOCH FROM b.ts)
+			ORDER BY timestamp DESC
+			LIMIT 1
+		) s ON TRUE
+	),
+	zil_prices AS (
+		SELECT 
+			b.ts,
+			(SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= b.ts ORDER BY ts DESC LIMIT 1) AS zil_usd
+		FROM buckets b
+	)
+	SELECT 
+		to_char(b.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+		CASE
+			WHEN s.sqrt_price_x96 IS NULL THEN NULL
+			WHEN LOWER($5) = LOWER(m.token1) THEN
+				(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
+				* POWER(10::numeric, m.dec0 - m.dec1) * z.zil_usd
+			WHEN LOWER($5) = LOWER(m.token0) THEN
+				z.zil_usd
+			WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+				(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
+				* POWER(10::numeric, m.dec0 - m.dec1)
+			WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+				1
+			ELSE NULL
+		END::text AS price,
+		CASE
+			WHEN LOWER($5) = LOWER(m.token1) OR LOWER($5) = LOWER(m.token0) THEN 'wzil'
+			WHEN LOWER(m.token1) = ANY($4::text[]) OR LOWER(m.token0) = ANY($4::text[]) THEN 'stable'
+			ELSE 'none'
+		END AS source,
+		m.symbol0,
+		m.dec0
+	FROM buckets b
+	CROSS JOIN meta m
+	LEFT JOIN snaps s ON s.ts = b.ts
+	LEFT JOIN zil_prices z ON z.ts = b.ts
+	ORDER BY b.ts ASC`
+
+	rows, err := pool.Query(ctx, q, token0, token1, poolAddr, stables, wzil)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("V3 price chart query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var points []PricePoint
+	var symbol string
+	var decimals int32
+	for rows.Next() {
+		var p PricePoint
+		if err := rows.Scan(&p.Timestamp, &p.Price, &p.Source, &symbol, &decimals); err != nil {
+			return nil, "", 0, err
+		}
+		points = append(points, p)
+	}
+
+	return points, symbol, decimals, nil
 }
