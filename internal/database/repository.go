@@ -212,6 +212,7 @@ func (r *TransactionRepository) GetByHash(ctx context.Context, hash string) (*Tr
 func UpdateTokenMetrics(ctx context.Context, pool any, tokenAddress string) error {
 	type Pooler interface {
 		Exec(ctx context.Context, sql string, arguments ...any) (any, error)
+		QueryRow(ctx context.Context, sql string, arguments ...any) any
 	}
 	
 	pooler, ok := pool.(Pooler)
@@ -219,74 +220,285 @@ func UpdateTokenMetrics(ctx context.Context, pool any, tokenAddress string) erro
 		return fmt.Errorf("invalid pool type")
 	}
 
+	// Get WZIL and stablecoin addresses for price calculation
+	type RowScanner interface {
+		Scan(dest ...any) error
+	}
+	
+	var wzilAddr string
+	row := pooler.QueryRow(ctx, "SELECT address FROM tokens WHERE symbol ILIKE 'WZIL' LIMIT 1")
+	if rowScanner, ok := row.(RowScanner); ok {
+		if err := rowScanner.Scan(&wzilAddr); err != nil {
+			return fmt.Errorf("failed to get WZIL address: %w", err)
+		}
+	} else {
+		return fmt.Errorf("failed to get WZIL address: row scanner not available")
+	}
+
+	// Get stablecoin addresses - need to query them properly
+	// For simplicity, we'll pass them as part of the query since we can't easily use QueryRow for arrays
+	stableAddrs := []string{} // Will be populated by a subquery in SQL
+
 	query := `
 		WITH token_data AS (
-			-- Get current price from tokens table
-			SELECT address, price_usd, EXTRACT(EPOCH FROM NOW())::bigint AS now_ts
-			FROM tokens WHERE address = $1
+			SELECT address, price_usd, now() AT TIME ZONE 'UTC' AS now_ts
+			FROM tokens
+			WHERE lower(address) = lower($1)
 		),
-		-- Calculate 24h volume from swaps (sum of all swap USD values)
 		vol_24h AS (
-			SELECT COALESCE(SUM(amount_usd), 0) as volume_24h
+			SELECT COALESCE(SUM(amount_usd), 0)::numeric AS volume_24h
 			FROM (
-				SELECT amount_usd
-				FROM uniswap_v2_swaps s 
+				SELECT s.amount_usd
+				FROM uniswap_v2_swaps s
 				JOIN uniswap_v2_pairs p ON s.pair = p.address
-				WHERE (p.token0 = $1 OR p.token1 = $1)
-				  AND s.timestamp >= (SELECT now_ts FROM token_data) - 86400
+				WHERE (lower(p.token0) = lower($1) OR lower(p.token1) = lower($1))
+				  AND s.timestamp >= EXTRACT(EPOCH FROM (SELECT now_ts FROM token_data)) - 86400
 				  AND s.amount_usd IS NOT NULL
 				UNION ALL
-				SELECT amount_usd
+				SELECT s.amount_usd
 				FROM uniswap_v3_swaps s
-				JOIN uniswap_v3_pools p ON s.pool = p.address  
-				WHERE (p.token0 = $1 OR p.token1 = $1)
-				  AND s.timestamp >= (SELECT now_ts FROM token_data) - 86400
+				JOIN uniswap_v3_pools p ON s.pool = p.address
+				WHERE (lower(p.token0) = lower($1) OR lower(p.token1) = lower($1))
+				  AND s.timestamp >= EXTRACT(EPOCH FROM (SELECT now_ts FROM token_data)) - 86400
 				  AND s.amount_usd IS NOT NULL
 			) combined
 		),
-		-- Calculate total liquidity from all pairs/pools
 		liq AS (
-			SELECT COALESCE(SUM(liq_usd), 0) as total_liq
+			SELECT COALESCE(SUM(liq_usd), 0)::numeric AS total_liq
 			FROM (
-				-- V2 pairs - use reserve_usd directly
-				SELECT 
-					COALESCE(p.reserve_usd, 0) as liq_usd
+				SELECT COALESCE(p.reserve_usd, 0)::numeric AS liq_usd
 				FROM uniswap_v2_pairs p
-				WHERE p.token0 = $1 OR p.token1 = $1
+				WHERE lower(p.token0) = lower($1) OR lower(p.token1) = lower($1)
 				UNION ALL
-				-- V3 pools - calculate liquidity_usd from reserves
 				SELECT
-					((COALESCE(p.reserve0,0) / POWER(10::numeric, COALESCE(t0.decimals, 18))) * COALESCE(t0.price_usd, 0)) +
-					((COALESCE(p.reserve1,0) / POWER(10::numeric, COALESCE(t1.decimals, 18))) * COALESCE(t1.price_usd, 0)) as liq_usd
+				  ((COALESCE(p.reserve0,0)::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18))) * COALESCE(t0.price_usd, 0)::numeric) +
+				  ((COALESCE(p.reserve1,0)::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18))) * COALESCE(t1.price_usd, 0)::numeric) AS liq_usd
 				FROM uniswap_v3_pools p
 				LEFT JOIN tokens t0 ON t0.address = p.token0
 				LEFT JOIN tokens t1 ON t1.address = p.token1
-				WHERE p.token0 = $1 OR p.token1 = $1
+				WHERE lower(p.token0) = lower($1) OR lower(p.token1) = lower($1)
 			) combined_liq
 		),
-		-- Get historical price snapshots (24h and 7d ago) by looking back in time
-		-- We'll use a simple approach: capture price_usd at different timestamps
-		-- For now, we'll skip price changes if we don't have historical data
-		-- This can be improved later with a proper price history table
-		price_history AS (
-			SELECT 
-				t.price_usd as current_price,
-				NULL::numeric as price_24h_ago,
-				NULL::numeric as price_7d_ago
-			FROM tokens t
-			WHERE t.address = $1
+		anchors AS (
+			SELECT
+				ARRAY(SELECT lower(address) FROM tokens WHERE price_usd = 1.0 AND symbol IN ('USDT', 'USDC', 'DAI', 'BUSD')) AS stables,
+				lower($2) AS wzil
+		),
+		times AS (
+			SELECT
+				(SELECT now_ts FROM token_data) AS now_ts,
+				(SELECT now_ts FROM token_data) - interval '24 hours' AS ts_24h,
+				(SELECT now_ts FROM token_data) - interval '7 days' AS ts_7d
+		),
+		pools AS (
+			SELECT
+				dp.protocol,
+				dp.address AS pool,
+				dp.token0, dp.token1,
+				t0.decimals AS dec0, t1.decimals AS dec1,
+				(COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0))::numeric AS w,
+				(lower(dp.token0) = lower($1)) AS is_target0,
+				CASE
+				  WHEN lower(dp.token0) = (SELECT wzil FROM anchors) THEN 'wzil0'
+				  WHEN lower(dp.token1) = (SELECT wzil FROM anchors) THEN 'wzil1'
+				  WHEN lower(dp.token0) = ANY((SELECT stables FROM anchors)) THEN 'stable0'
+				  WHEN lower(dp.token1) = ANY((SELECT stables FROM anchors)) THEN 'stable1'
+				  ELSE 'none'
+				END AS anchor
+			FROM dex_pools dp
+			JOIN tokens t0 ON t0.address = dp.token0
+			JOIN tokens t1 ON t1.address = dp.token1
+			WHERE lower(dp.token0) = lower($1) OR lower(dp.token1) = lower($1)
+			  AND (COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0)) > 0
+		),
+		zil_24h AS (
+			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_24h FROM times) ORDER BY ts DESC LIMIT 1) AS usd
+		),
+		zil_7d AS (
+			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_7d FROM times) ORDER BY ts DESC LIMIT 1) AS usd
+		),
+		v2_24h AS (
+			SELECT
+				p.pool, p.w,
+				CASE
+				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL THEN NULL
+				  ELSE
+					CASE WHEN p.is_target0 THEN
+					  CASE p.anchor
+						WHEN 'wzil1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * (SELECT usd FROM zil_24h)
+						WHEN 'wzil0' THEN (SELECT usd FROM zil_24h)
+						WHEN 'stable1' THEN (s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
+						WHEN 'stable0' THEN 1::numeric
+						ELSE NULL
+					  END
+					ELSE
+					  CASE p.anchor
+						WHEN 'wzil0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * (SELECT usd FROM zil_24h)
+						WHEN 'wzil1' THEN (SELECT usd FROM zil_24h)
+						WHEN 'stable0' THEN NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)
+						WHEN 'stable1' THEN 1::numeric
+						ELSE NULL
+					  END
+					END
+				END AS price_usd
+			FROM pools p
+			LEFT JOIN LATERAL (
+				SELECT reserve0, reserve1
+				FROM uniswap_v2_syncs s
+				WHERE s.pair = p.pool
+				  AND s.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_24h FROM times))
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		),
+		v3_24h AS (
+			SELECT
+				p.pool, p.w,
+				CASE
+				  WHEN s.sqrt_price_x96 IS NULL THEN NULL
+				  ELSE
+					CASE WHEN p.is_target0 THEN
+					  CASE p.anchor
+						WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)) * (SELECT usd FROM zil_24h)
+						WHEN 'wzil0' THEN (SELECT usd FROM zil_24h)
+						WHEN 'stable1' THEN (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+						WHEN 'stable0' THEN 1::numeric
+						ELSE NULL
+					  END
+					ELSE
+					  CASE p.anchor
+						WHEN 'wzil0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)) * (SELECT usd FROM zil_24h)
+						WHEN 'wzil1' THEN (SELECT usd FROM zil_24h)
+						WHEN 'stable0' THEN 1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)
+						WHEN 'stable1' THEN 1::numeric
+						ELSE NULL
+					  END
+					END
+				END AS price_usd
+			FROM pools p
+			LEFT JOIN LATERAL (
+				SELECT sqrt_price_x96
+				FROM uniswap_v3_swaps s
+				WHERE s.pool = p.pool
+				  AND s.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_24h FROM times))
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		),
+		agg_24h AS (
+			SELECT
+				NULLIF(SUM(CASE WHEN price_usd IS NOT NULL THEN w ELSE 0 END), 0) AS total_w,
+				SUM(price_usd * w) AS w_price_sum
+			FROM (
+				SELECT pool, w, price_usd FROM v2_24h
+				UNION ALL
+				SELECT pool, w, price_usd FROM v3_24h
+			) x
+		),
+		v2_7d AS (
+			SELECT
+				p.pool, p.w,
+				CASE
+				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL THEN NULL
+				  ELSE
+					CASE WHEN p.is_target0 THEN
+					  CASE p.anchor
+						WHEN 'wzil1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * (SELECT usd FROM zil_7d)
+						WHEN 'wzil0' THEN (SELECT usd FROM zil_7d)
+						WHEN 'stable1' THEN (s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
+						WHEN 'stable0' THEN 1::numeric
+						ELSE NULL
+					  END
+					ELSE
+					  CASE p.anchor
+						WHEN 'wzil0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * (SELECT usd FROM zil_7d)
+						WHEN 'wzil1' THEN (SELECT usd FROM zil_7d)
+						WHEN 'stable0' THEN NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)
+						WHEN 'stable1' THEN 1::numeric
+						ELSE NULL
+					  END
+					END
+				END AS price_usd
+			FROM pools p
+			LEFT JOIN LATERAL (
+				SELECT reserve0, reserve1
+				FROM uniswap_v2_syncs s
+				WHERE s.pair = p.pool
+				  AND s.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_7d FROM times))
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		),
+		v3_7d AS (
+			SELECT
+				p.pool, p.w,
+				CASE
+				  WHEN s.sqrt_price_x96 IS NULL THEN NULL
+				  ELSE
+					CASE WHEN p.is_target0 THEN
+					  CASE p.anchor
+						WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)) * (SELECT usd FROM zil_7d)
+						WHEN 'wzil0' THEN (SELECT usd FROM zil_7d)
+						WHEN 'stable1' THEN (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+						WHEN 'stable0' THEN 1::numeric
+						ELSE NULL
+					  END
+					ELSE
+					  CASE p.anchor
+						WHEN 'wzil0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)) * (SELECT usd FROM zil_7d)
+						WHEN 'wzil1' THEN (SELECT usd FROM zil_7d)
+						WHEN 'stable0' THEN 1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)
+						WHEN 'stable1' THEN 1::numeric
+						ELSE NULL
+					  END
+					END
+				END AS price_usd
+			FROM pools p
+			LEFT JOIN LATERAL (
+				SELECT sqrt_price_x96
+				FROM uniswap_v3_swaps s
+				WHERE s.pool = p.pool
+				  AND s.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_7d FROM times))
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		),
+		agg_7d AS (
+			SELECT
+				NULLIF(SUM(CASE WHEN price_usd IS NOT NULL THEN w ELSE 0 END), 0) AS total_w,
+				SUM(price_usd * w) AS w_price_sum
+			FROM (
+				SELECT pool, w, price_usd FROM v2_7d
+				UNION ALL
+				SELECT pool, w, price_usd FROM v3_7d
+			) x
+		),
+		hist_prices AS (
+			SELECT
+				CASE WHEN (SELECT total_w FROM agg_24h) > 0 THEN (SELECT w_price_sum FROM agg_24h) / (SELECT total_w FROM agg_24h) ELSE NULL END AS price_24h,
+				CASE WHEN (SELECT total_w FROM agg_7d) > 0 THEN (SELECT w_price_sum FROM agg_7d) / (SELECT total_w FROM agg_7d) ELSE NULL END AS price_7d
 		)
 		UPDATE tokens t
-		SET 
-			volume_24h_usd = (SELECT volume_24h FROM vol_24h),
-			total_liquidity_usd = (SELECT total_liq FROM liq),
-			price_change_24h = NULL,  -- Will implement with proper price history
-			price_change_7d = NULL,   -- Will implement with proper price history
-			updated_at = NOW()
-		WHERE t.address = $1
+		SET
+		  volume_24h_usd = (SELECT volume_24h FROM vol_24h),
+		  total_liquidity_usd = (SELECT total_liq FROM liq),
+		  price_change_24h = CASE
+			WHEN (SELECT price_24h FROM hist_prices) IS NULL OR (SELECT price_24h FROM hist_prices) = 0 THEN NULL
+			WHEN (SELECT price_usd FROM token_data) IS NULL THEN NULL
+			ELSE (( (SELECT price_usd FROM token_data) - (SELECT price_24h FROM hist_prices) )
+				 / (SELECT price_24h FROM hist_prices)) * 100
+		  END,
+		  price_change_7d = CASE
+			WHEN (SELECT price_7d FROM hist_prices) IS NULL OR (SELECT price_7d FROM hist_prices) = 0 THEN NULL
+			WHEN (SELECT price_usd FROM token_data) IS NULL THEN NULL
+			ELSE (( (SELECT price_usd FROM token_data) - (SELECT price_7d FROM hist_prices) )
+				 / (SELECT price_7d FROM hist_prices)) * 100
+		  END,
+		  updated_at = NOW()
+		WHERE lower(t.address) = lower($1)
 	`
 	
-	_, err := pooler.Exec(ctx, query, tokenAddress)
+	_, err := pooler.Exec(ctx, query, tokenAddress, wzilAddr, stableAddrs)
 	if err != nil {
 		return fmt.Errorf("failed to update token metrics for %s: %w", tokenAddress, err)
 	}
