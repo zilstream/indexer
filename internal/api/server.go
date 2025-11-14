@@ -312,6 +312,15 @@ func (s *APIServer) handleTransactionDetail(w http.ResponseWriter, r *http.Reque
 		Error(w, http.StatusNotFound, "transaction not found")
 		return
 	}
+	
+	// Fetch events for this transaction
+	events, err := database.GetEventLogsByTransaction(ctx, s.db, hash)
+	if err == nil {
+		tx.Events = events
+	} else {
+		tx.Events = []database.EventLogDTO{}
+	}
+	
 	JSON(w, http.StatusOK, tx, nil)
 }
 
