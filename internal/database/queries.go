@@ -689,17 +689,19 @@ func getPriceChartV2(ctx context.Context, pool *pgxpool.Pool, pairAddr, token0, 
 	)
 	SELECT 
 		to_char(b.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
-		CASE
-			WHEN LOWER($5) = LOWER(m.token1) THEN
-				((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
-			WHEN LOWER($5) = LOWER(m.token0) THEN
-				z.zil_usd
-			WHEN LOWER(m.token1) = ANY($4::text[]) THEN
-				((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0))
-			WHEN LOWER(m.token0) = ANY($4::text[]) THEN
-				1
-			ELSE NULL
-		END::text AS price,
+		ROUND(
+			CASE
+				WHEN LOWER($5) = LOWER(m.token1) THEN
+					((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
+				WHEN LOWER($5) = LOWER(m.token0) THEN
+					z.zil_usd
+				WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+					((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0))
+				WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+					1
+				ELSE NULL
+			END, 8
+		)::text AS price,
 		CASE
 			WHEN LOWER($5) = LOWER(m.token1) OR LOWER($5) = LOWER(m.token0) THEN 'wzil'
 			WHEN LOWER(m.token1) = ANY($4::text[]) OR LOWER(m.token0) = ANY($4::text[]) THEN 'stable'
@@ -776,20 +778,22 @@ func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, 
 	)
 	SELECT 
 		to_char(b.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
-		CASE
-			WHEN s.sqrt_price_x96 IS NULL THEN NULL
-			WHEN LOWER($5) = LOWER(m.token1) THEN
-				(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
-				* POWER(10::numeric, m.dec0 - m.dec1) * z.zil_usd
-			WHEN LOWER($5) = LOWER(m.token0) THEN
-				z.zil_usd
-			WHEN LOWER(m.token1) = ANY($4::text[]) THEN
-				(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
-				* POWER(10::numeric, m.dec0 - m.dec1)
-			WHEN LOWER(m.token0) = ANY($4::text[]) THEN
-				1
-			ELSE NULL
-		END::text AS price,
+		ROUND(
+			CASE
+				WHEN s.sqrt_price_x96 IS NULL THEN NULL
+				WHEN LOWER($5) = LOWER(m.token1) THEN
+					(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
+					/ POWER(10::numeric, m.dec0 - m.dec1) * z.zil_usd
+				WHEN LOWER($5) = LOWER(m.token0) THEN
+					z.zil_usd
+				WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+					(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
+					/ POWER(10::numeric, m.dec0 - m.dec1)
+				WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+					1
+				ELSE NULL
+			END, 8
+		)::text AS price,
 		CASE
 			WHEN LOWER($5) = LOWER(m.token1) OR LOWER($5) = LOWER(m.token0) THEN 'wzil'
 			WHEN LOWER(m.token1) = ANY($4::text[]) OR LOWER(m.token0) = ANY($4::text[]) THEN 'stable'
@@ -875,7 +879,7 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 			lower(dp.token0) = lower($3) OR lower(dp.token1) = lower($3)
 			OR lower(dp.token0) = ANY($2::text[]) OR lower(dp.token1) = ANY($2::text[])
 		  )
-		  AND (COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0)) > 0
+		  AND (COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0)) >= 1.0
 	),
 	zil_prices AS (
 		SELECT
@@ -937,17 +941,17 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 					CASE
 						WHEN p.is_target0 THEN
 							CASE p.anchor
-								WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)) * z.zil_usd
+								WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec0 - p.dec1)) * z.zil_usd
 								WHEN 'wzil0' THEN z.zil_usd
-								WHEN 'stable1' THEN (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+								WHEN 'stable1' THEN (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec0 - p.dec1)
 								WHEN 'stable0' THEN 1::numeric
 								ELSE NULL
 							END
 						ELSE
 							CASE p.anchor
-								WHEN 'wzil0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)) * z.zil_usd
+								WHEN 'wzil0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec0 - p.dec1)),0)) * z.zil_usd
 								WHEN 'wzil1' THEN z.zil_usd
-								WHEN 'stable0' THEN 1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)
+								WHEN 'stable0' THEN 1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec0 - p.dec1)),0)
 								WHEN 'stable1' THEN 1::numeric
 								ELSE NULL
 							END
@@ -981,7 +985,7 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 	)
 	SELECT
 		to_char(a.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
-		CASE WHEN a.total_w > 0 THEN (a.w_price_sum / a.total_w)::text ELSE NULL END AS price,
+		CASE WHEN a.total_w > 0 THEN ROUND((a.w_price_sum / a.total_w), 8)::text ELSE NULL END AS price,
 		'weighted' AS source,
 		m.symbol,
 		m.dec AS decimals
