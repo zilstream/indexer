@@ -31,22 +31,24 @@ type TokenDTO struct {
 }
 
 type PairDTO struct {
-	Protocol      string  `json:"protocol"`
-	Address       string  `json:"address"`
-	Token0        string  `json:"token0"`
-	Token1        string  `json:"token1"`
-	Token0Symbol  *string `json:"token0_symbol,omitempty"`
-	Token0Name    *string `json:"token0_name,omitempty"`
-	Token1Symbol  *string `json:"token1_symbol,omitempty"`
-	Token1Name    *string `json:"token1_name,omitempty"`
-	Fee           *string `json:"fee,omitempty"`
-	Reserve0      *string `json:"reserve0,omitempty"`
-	Reserve1      *string `json:"reserve1,omitempty"`
-	Liquidity     *string `json:"liquidity,omitempty"`
-	LiquidityUSD  *string `json:"liquidity_usd,omitempty"`
-	VolumeUSD     *string `json:"volume_usd,omitempty"`
-	VolumeUSD24h  *string `json:"volume_usd_24h,omitempty"`
-	TxnCount      *int64  `json:"txn_count,omitempty"`
+	Protocol       string  `json:"protocol"`
+	Address        string  `json:"address"`
+	Token0         string  `json:"token0"`
+	Token1         string  `json:"token1"`
+	Token0Symbol   *string `json:"token0_symbol,omitempty"`
+	Token0Name     *string `json:"token0_name,omitempty"`
+	Token1Symbol   *string `json:"token1_symbol,omitempty"`
+	Token1Name     *string `json:"token1_name,omitempty"`
+	Fee            *string `json:"fee,omitempty"`
+	Reserve0       *string `json:"reserve0,omitempty"`
+	Reserve1       *string `json:"reserve1,omitempty"`
+	Liquidity      *string `json:"liquidity,omitempty"`
+	LiquidityUSD   *string `json:"liquidity_usd,omitempty"`
+	VolumeUSD      *string `json:"volume_usd,omitempty"`
+	VolumeUSD24h   *string `json:"volume_usd_24h,omitempty"`
+	PriceChange24h *string `json:"price_change_24h"`
+	PriceChange7d  *string `json:"price_change_7d"`
+	TxnCount       *int64  `json:"txn_count,omitempty"`
 }
 
 type PairEventDTO struct {
@@ -252,19 +254,24 @@ func ListPairsByToken(ctx context.Context, pool *pgxpool.Pool, tokenAddress stri
 // ListPairs reads from dex_pools view to be protocol-agnostic (V2+V3)
 func GetPair(ctx context.Context, pool *pgxpool.Pool, address string) (*PairDTO, error) {
 	q := `
-		SELECT protocol, address, token0, token1,
-		       token0_symbol, token0_name, token1_symbol, token1_name,
-		       CAST(fee AS TEXT), CAST(reserve0 AS TEXT), CAST(reserve1 AS TEXT), CAST(liquidity AS TEXT),
-		       CAST(liquidity_usd AS TEXT), CAST(volume_usd AS TEXT), CAST(volume_usd_24h AS TEXT), txn_count
-		FROM dex_pools
-		WHERE address = $1`
+		SELECT dp.protocol, dp.address, dp.token0, dp.token1,
+		       dp.token0_symbol, dp.token0_name, dp.token1_symbol, dp.token1_name,
+		       CAST(dp.fee AS TEXT), CAST(dp.reserve0 AS TEXT), CAST(dp.reserve1 AS TEXT), CAST(dp.liquidity AS TEXT),
+		       CAST(dp.liquidity_usd AS TEXT), CAST(dp.volume_usd AS TEXT), CAST(dp.volume_usd_24h AS TEXT),
+		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_24h AS TEXT) ELSE CAST(v3.price_change_24h AS TEXT) END,
+		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_7d AS TEXT) ELSE CAST(v3.price_change_7d AS TEXT) END,
+		       dp.txn_count
+		FROM dex_pools dp
+		LEFT JOIN uniswap_v2_pairs v2 ON dp.protocol = 'uniswap_v2' AND v2.address = dp.address
+		LEFT JOIN uniswap_v3_pools v3 ON dp.protocol = 'uniswap_v3' AND v3.address = dp.address
+		WHERE dp.address = $1`
 
 	var p PairDTO
 	err := pool.QueryRow(ctx, q, address).Scan(
 		&p.Protocol, &p.Address, &p.Token0, &p.Token1,
 		&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name,
 		&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity,
-		&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.TxnCount)
+		&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount)
 	if err != nil {
 		return nil, fmt.Errorf("GetPair query failed: %w", err)
 	}
@@ -291,13 +298,18 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 	}
 
 	q := fmt.Sprintf(`
-		SELECT protocol, address, token0, token1,
-		       token0_symbol, token0_name, token1_symbol, token1_name,
-		       CAST(fee AS TEXT), CAST(reserve0 AS TEXT), CAST(reserve1 AS TEXT), CAST(liquidity AS TEXT),
-		       CAST(liquidity_usd AS TEXT), CAST(volume_usd AS TEXT), CAST(volume_usd_24h AS TEXT), txn_count
-		FROM dex_pools
-		WHERE liquidity_usd > 0
-		ORDER BY CAST(%s AS NUMERIC) %s NULLS LAST, CAST(liquidity_usd AS NUMERIC) DESC NULLS LAST
+		SELECT dp.protocol, dp.address, dp.token0, dp.token1,
+		       dp.token0_symbol, dp.token0_name, dp.token1_symbol, dp.token1_name,
+		       CAST(dp.fee AS TEXT), CAST(dp.reserve0 AS TEXT), CAST(dp.reserve1 AS TEXT), CAST(dp.liquidity AS TEXT),
+		       CAST(dp.liquidity_usd AS TEXT), CAST(dp.volume_usd AS TEXT), CAST(dp.volume_usd_24h AS TEXT),
+		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_24h AS TEXT) ELSE CAST(v3.price_change_24h AS TEXT) END,
+		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_7d AS TEXT) ELSE CAST(v3.price_change_7d AS TEXT) END,
+		       dp.txn_count
+		FROM dex_pools dp
+		LEFT JOIN uniswap_v2_pairs v2 ON dp.protocol = 'uniswap_v2' AND v2.address = dp.address
+		LEFT JOIN uniswap_v3_pools v3 ON dp.protocol = 'uniswap_v3' AND v3.address = dp.address
+		WHERE dp.liquidity_usd > 0
+		ORDER BY CAST(%s AS NUMERIC) %s NULLS LAST, CAST(dp.liquidity_usd AS NUMERIC) DESC NULLS LAST
 		LIMIT $1 OFFSET $2`, sortColumn, strings.ToUpper(sortOrder))
 
 	rows, err := pool.Query(ctx, q, limit, offset)
@@ -309,7 +321,7 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 	var out []PairDTO
 	for rows.Next() {
 		var p PairDTO
-		if err := rows.Scan(&p.Protocol, &p.Address, &p.Token0, &p.Token1, &p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name, &p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity, &p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.TxnCount); err != nil {
+		if err := rows.Scan(&p.Protocol, &p.Address, &p.Token0, &p.Token1, &p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name, &p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity, &p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

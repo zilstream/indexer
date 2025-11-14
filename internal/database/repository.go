@@ -300,7 +300,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				p.pool, p.w,
 				CASE
-				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL THEN NULL
+				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL OR s.reserve0 = 0 OR s.reserve1 = 0 THEN NULL
 				  ELSE
 					CASE WHEN p.is_target0 THEN
 					  CASE p.anchor
@@ -334,7 +334,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				p.pool, p.w,
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
 				  ELSE
 					CASE WHEN p.is_target0 THEN
 					  CASE p.anchor
@@ -378,7 +378,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				p.pool, p.w,
 				CASE
-				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL THEN NULL
+				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL OR s.reserve0 = 0 OR s.reserve1 = 0 THEN NULL
 				  ELSE
 					CASE WHEN p.is_target0 THEN
 					  CASE p.anchor
@@ -412,7 +412,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				p.pool, p.w,
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
 				  ELSE
 					CASE WHEN p.is_target0 THEN
 					  CASE p.anchor
@@ -482,5 +482,258 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 		return fmt.Errorf("failed to update token metrics for %s: %w", tokenAddress, err)
 	}
 	
+	return nil
+}
+
+// UpdatePairMetrics calculates and updates price change percentages for a pair/pool
+func UpdatePairMetrics(ctx context.Context, pool *pgxpool.Pool, pairAddress, protocol string) error {
+	// Get WZIL address for price calculation
+	var wzilAddr string
+	err := pool.QueryRow(ctx, "SELECT address FROM tokens WHERE symbol ILIKE 'WZIL' LIMIT 1").Scan(&wzilAddr)
+	if err != nil {
+		return fmt.Errorf("failed to get WZIL address: %w", err)
+	}
+
+	if protocol == "uniswap_v2" {
+		return updateV2PairMetrics(ctx, pool, pairAddress, wzilAddr)
+	}
+	return updateV3PoolMetrics(ctx, pool, pairAddress, wzilAddr)
+}
+
+func updateV2PairMetrics(ctx context.Context, pool *pgxpool.Pool, pairAddr, wzilAddr string) error {
+	query := `
+		WITH pair_info AS (
+			SELECT p.address, p.token0, p.token1,
+				COALESCE(t0.decimals, 18) AS dec0,
+				COALESCE(t1.decimals, 18) AS dec1,
+				lower($2) AS wzil,
+				ARRAY(SELECT lower(address) FROM tokens WHERE symbol ILIKE ANY(ARRAY['USDT', 'USDC', 'DAI', 'BUSD', 'ZUSDT', 'ZUSD', 'XSGD'])) AS stables
+			FROM uniswap_v2_pairs p
+			LEFT JOIN tokens t0 ON t0.address = p.token0
+			LEFT JOIN tokens t1 ON t1.address = p.token1
+			WHERE lower(p.address) = lower($1)
+		),
+		times AS (
+			SELECT
+				now() AT TIME ZONE 'UTC' AS now_ts,
+				now() AT TIME ZONE 'UTC' - interval '24 hours' AS ts_24h,
+				now() AT TIME ZONE 'UTC' - interval '7 days' AS ts_7d
+		),
+		zil_24h AS (
+			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_24h FROM times) ORDER BY ts DESC LIMIT 1) AS usd
+		),
+		zil_7d AS (
+			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_7d FROM times) ORDER BY ts DESC LIMIT 1) AS usd
+		),
+		current_price AS (
+			SELECT
+				CASE
+				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL OR s.reserve0 = 0 OR s.reserve1 = 0 THEN NULL
+				  WHEN lower(p.token1) = p.wzil THEN
+					((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0))
+				  WHEN lower(p.token0) = p.wzil THEN
+					1::numeric
+				  WHEN lower(p.token1) = ANY(p.stables) THEN
+					(s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
+				  WHEN lower(p.token0) = ANY(p.stables) THEN
+					1::numeric
+				  ELSE NULL
+				END AS price
+			FROM pair_info p
+			LEFT JOIN LATERAL (
+				SELECT reserve0, reserve1
+				FROM uniswap_v2_syncs s
+				WHERE s.pair = p.address
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		),
+		price_24h AS (
+			SELECT
+				CASE
+				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL OR s.reserve0 = 0 OR s.reserve1 = 0 THEN NULL
+				  WHEN lower(p.token1) = p.wzil THEN
+					((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0))
+				  WHEN lower(p.token0) = p.wzil THEN
+					1::numeric
+				  WHEN lower(p.token1) = ANY(p.stables) THEN
+					(s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
+				  WHEN lower(p.token0) = ANY(p.stables) THEN
+					1::numeric
+				  ELSE NULL
+				END AS price
+			FROM pair_info p
+			LEFT JOIN LATERAL (
+				SELECT reserve0, reserve1
+				FROM uniswap_v2_syncs s
+				WHERE s.pair = p.address
+				  AND s.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_24h FROM times))
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		),
+		price_7d AS (
+			SELECT
+				CASE
+				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL OR s.reserve0 = 0 OR s.reserve1 = 0 THEN NULL
+				  WHEN lower(p.token1) = p.wzil THEN
+					((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0))
+				  WHEN lower(p.token0) = p.wzil THEN
+					1::numeric
+				  WHEN lower(p.token1) = ANY(p.stables) THEN
+					(s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
+				  WHEN lower(p.token0) = ANY(p.stables) THEN
+					1::numeric
+				  ELSE NULL
+				END AS price
+			FROM pair_info p
+			LEFT JOIN LATERAL (
+				SELECT reserve0, reserve1
+				FROM uniswap_v2_syncs s
+				WHERE s.pair = p.address
+				  AND s.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_7d FROM times))
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		)
+		UPDATE uniswap_v2_pairs
+		SET
+		  price_change_24h = CASE
+			WHEN (SELECT price FROM price_24h) IS NULL OR (SELECT price FROM price_24h) = 0 THEN NULL
+			WHEN (SELECT price FROM current_price) IS NULL THEN NULL
+			ELSE (((SELECT price FROM current_price) - (SELECT price FROM price_24h)) / (SELECT price FROM price_24h)) * 100
+		  END,
+		  price_change_7d = CASE
+			WHEN (SELECT price FROM price_7d) IS NULL OR (SELECT price FROM price_7d) = 0 THEN NULL
+			WHEN (SELECT price FROM current_price) IS NULL THEN NULL
+			ELSE (((SELECT price FROM current_price) - (SELECT price FROM price_7d)) / (SELECT price FROM price_7d)) * 100
+		  END,
+		  updated_at = NOW()
+		WHERE lower(address) = lower($1)
+	`
+
+	_, err := pool.Exec(ctx, query, pairAddr, wzilAddr)
+	if err != nil {
+		return fmt.Errorf("failed to update V2 pair metrics for %s: %w", pairAddr, err)
+	}
+	return nil
+}
+
+func updateV3PoolMetrics(ctx context.Context, pool *pgxpool.Pool, poolAddr, wzilAddr string) error {
+	query := `
+		WITH pool_info AS (
+			SELECT p.address, p.token0, p.token1,
+				COALESCE(t0.decimals, 18) AS dec0,
+				COALESCE(t1.decimals, 18) AS dec1,
+				lower($2) AS wzil,
+				ARRAY(SELECT lower(address) FROM tokens WHERE symbol ILIKE ANY(ARRAY['USDT', 'USDC', 'DAI', 'BUSD', 'ZUSDT', 'ZUSD', 'XSGD'])) AS stables
+			FROM uniswap_v3_pools p
+			LEFT JOIN tokens t0 ON t0.address = p.token0
+			LEFT JOIN tokens t1 ON t1.address = p.token1
+			WHERE lower(p.address) = lower($1)
+		),
+		times AS (
+			SELECT
+				now() AT TIME ZONE 'UTC' AS now_ts,
+				now() AT TIME ZONE 'UTC' - interval '24 hours' AS ts_24h,
+				now() AT TIME ZONE 'UTC' - interval '7 days' AS ts_7d
+		),
+		zil_24h AS (
+			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_24h FROM times) ORDER BY ts DESC LIMIT 1) AS usd
+		),
+		zil_7d AS (
+			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_7d FROM times) ORDER BY ts DESC LIMIT 1) AS usd
+		),
+		current_price AS (
+			SELECT
+				CASE
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+				  WHEN lower(p.token1) = p.wzil THEN
+					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+				  WHEN lower(p.token0) = p.wzil THEN
+					1::numeric
+				  WHEN lower(p.token1) = ANY(p.stables) THEN
+					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+				  WHEN lower(p.token0) = ANY(p.stables) THEN
+					1::numeric
+				  ELSE NULL
+				END AS price
+			FROM pool_info p
+			LEFT JOIN LATERAL (
+				SELECT sqrt_price_x96
+				FROM uniswap_v3_swaps s
+				WHERE s.pool = p.address
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		),
+		price_24h AS (
+			SELECT
+				CASE
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+				  WHEN lower(p.token1) = p.wzil THEN
+					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+				  WHEN lower(p.token0) = p.wzil THEN
+					1::numeric
+				  WHEN lower(p.token1) = ANY(p.stables) THEN
+					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+				  WHEN lower(p.token0) = ANY(p.stables) THEN
+					1::numeric
+				  ELSE NULL
+				END AS price
+			FROM pool_info p
+			LEFT JOIN LATERAL (
+				SELECT sqrt_price_x96
+				FROM uniswap_v3_swaps s
+				WHERE s.pool = p.address
+				  AND s.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_24h FROM times))
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		),
+		price_7d AS (
+			SELECT
+				CASE
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+				  WHEN lower(p.token1) = p.wzil THEN
+					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+				  WHEN lower(p.token0) = p.wzil THEN
+					1::numeric
+				  WHEN lower(p.token1) = ANY(p.stables) THEN
+					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+				  WHEN lower(p.token0) = ANY(p.stables) THEN
+					1::numeric
+				  ELSE NULL
+				END AS price
+			FROM pool_info p
+			LEFT JOIN LATERAL (
+				SELECT sqrt_price_x96
+				FROM uniswap_v3_swaps s
+				WHERE s.pool = p.address
+				  AND s.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_7d FROM times))
+				ORDER BY s.timestamp DESC
+				LIMIT 1
+			) s ON TRUE
+		)
+		UPDATE uniswap_v3_pools
+		SET
+		  price_change_24h = CASE
+			WHEN (SELECT price FROM price_24h) IS NULL OR (SELECT price FROM price_24h) = 0 THEN NULL
+			WHEN (SELECT price FROM current_price) IS NULL THEN NULL
+			ELSE (((SELECT price FROM current_price) - (SELECT price FROM price_24h)) / (SELECT price FROM price_24h)) * 100
+		  END,
+		  price_change_7d = CASE
+			WHEN (SELECT price FROM price_7d) IS NULL OR (SELECT price FROM price_7d) = 0 THEN NULL
+			WHEN (SELECT price FROM current_price) IS NULL THEN NULL
+			ELSE (((SELECT price FROM current_price) - (SELECT price FROM price_7d)) / (SELECT price FROM price_7d)) * 100
+		  END,
+		  updated_at = NOW()
+		WHERE lower(address) = lower($1)
+	`
+
+	_, err := pool.Exec(ctx, query, poolAddr, wzilAddr)
+	if err != nil {
+		return fmt.Errorf("failed to update V3 pool metrics for %s: %w", poolAddr, err)
+	}
 	return nil
 }
