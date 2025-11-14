@@ -811,7 +811,7 @@ func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, 
 		to_char(b.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
 		ROUND(
 			(CASE
-				WHEN s.sqrt_price_x96 IS NULL THEN NULL
+				WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
 				WHEN LOWER($5) = LOWER(m.token1) THEN
 					(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
 					/ POWER(10::numeric, m.dec0 - m.dec1) * z.zil_usd

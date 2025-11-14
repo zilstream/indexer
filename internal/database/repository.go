@@ -334,7 +334,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				p.pool, p.w,
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
 				  ELSE
 					CASE WHEN p.is_target0 THEN
 					  CASE p.anchor
@@ -412,7 +412,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 			SELECT
 				p.pool, p.w,
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
 				  ELSE
 					CASE WHEN p.is_target0 THEN
 					  CASE p.anchor
@@ -655,7 +655,7 @@ func updateV3PoolMetrics(ctx context.Context, pool *pgxpool.Pool, poolAddr, wzil
 		current_price AS (
 			SELECT
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
 				  WHEN lower(p.token1) = p.wzil THEN
 					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
 				  WHEN lower(p.token0) = p.wzil THEN
@@ -678,7 +678,7 @@ func updateV3PoolMetrics(ctx context.Context, pool *pgxpool.Pool, poolAddr, wzil
 		price_24h AS (
 			SELECT
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
 				  WHEN lower(p.token1) = p.wzil THEN
 					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
 				  WHEN lower(p.token0) = p.wzil THEN
@@ -702,7 +702,7 @@ func updateV3PoolMetrics(ctx context.Context, pool *pgxpool.Pool, poolAddr, wzil
 		price_7d AS (
 			SELECT
 				CASE
-				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
 				  WHEN lower(p.token1) = p.wzil THEN
 					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
 				  WHEN lower(p.token0) = p.wzil THEN
