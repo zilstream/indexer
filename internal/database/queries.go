@@ -10,16 +10,24 @@ import (
 
 // DTOs for API responses (lightweight, no ORM tags)
 type TokenDTO struct {
-	Address          string   `json:"address"`
-	Symbol           *string  `json:"symbol,omitempty"`
-	Name             *string  `json:"name,omitempty"`
-	Decimals         *int32   `json:"decimals,omitempty"`
-	PriceUSD         *string  `json:"price_usd,omitempty"`
-	MarketCapUSD     *string  `json:"market_cap_usd,omitempty"`
-	LiquidityUSD     *string  `json:"liquidity_usd"`
-	Volume24hUSD     *string  `json:"volume_24h_usd"`
-	PriceChange24h   *string  `json:"price_change_24h"`
-	PriceChange7d    *string  `json:"price_change_7d"`
+	Address            string   `json:"address"`
+	Symbol             *string  `json:"symbol,omitempty"`
+	Name               *string  `json:"name,omitempty"`
+	Decimals           *int32   `json:"decimals,omitempty"`
+	TotalSupply        *string  `json:"total_supply,omitempty"`
+	PriceUSD           *string  `json:"price_usd,omitempty"`
+	PriceETH           *string  `json:"price_eth,omitempty"`
+	MarketCapUSD       *string  `json:"market_cap_usd,omitempty"`
+	LiquidityUSD       *string  `json:"liquidity_usd"`
+	Volume24hUSD       *string  `json:"volume_24h_usd"`
+	TotalVolumeUSD     *string  `json:"total_volume_usd,omitempty"`
+	PriceChange24h     *string  `json:"price_change_24h"`
+	PriceChange7d      *string  `json:"price_change_7d"`
+	LogoURI            *string  `json:"logo_uri,omitempty"`
+	Website            *string  `json:"website,omitempty"`
+	Description        *string  `json:"description,omitempty"`
+	FirstSeenBlock     *int64   `json:"first_seen_block,omitempty"`
+	FirstSeenTimestamp *int64   `json:"first_seen_timestamp,omitempty"`
 }
 
 type PairDTO struct {
@@ -128,19 +136,25 @@ type TokenBaseDTO struct {
 func GetToken(ctx context.Context, pool *pgxpool.Pool, address string) (*TokenDTO, error) {
 	q := `
 		SELECT address, symbol, name, decimals,
-		       CAST(price_usd AS TEXT), 
+		       CAST(total_supply AS TEXT),
+		       CAST(price_usd AS TEXT),
+		       CAST(price_eth AS TEXT),
 		       CAST(market_cap_usd AS TEXT), 
 		       CAST(total_liquidity_usd AS TEXT),
 		       CAST(volume_24h_usd AS TEXT),
+		       CAST(total_volume_usd AS TEXT),
 		       CAST(price_change_24h AS TEXT),
-		       CAST(price_change_7d AS TEXT)
+		       CAST(price_change_7d AS TEXT),
+		       logo_uri, website, description,
+		       first_seen_block, first_seen_timestamp
 		FROM tokens
 		WHERE address = $1`
 
 	var t TokenDTO
 	err := pool.QueryRow(ctx, q, address).Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals, 
-		&t.PriceUSD, &t.MarketCapUSD, &t.LiquidityUSD, &t.Volume24hUSD,
-		&t.PriceChange24h, &t.PriceChange7d)
+		&t.TotalSupply, &t.PriceUSD, &t.PriceETH, &t.MarketCapUSD, &t.LiquidityUSD, 
+		&t.Volume24hUSD, &t.TotalVolumeUSD, &t.PriceChange24h, &t.PriceChange7d,
+		&t.LogoURI, &t.Website, &t.Description, &t.FirstSeenBlock, &t.FirstSeenTimestamp)
 	if err != nil {
 		return nil, fmt.Errorf("GetToken query failed: %w", err)
 	}
@@ -150,12 +164,17 @@ func GetToken(ctx context.Context, pool *pgxpool.Pool, address string) (*TokenDT
 func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, search *string) ([]TokenDTO, error) {
 	q := `
 		SELECT address, symbol, name, decimals,
-		       CAST(price_usd AS TEXT), 
+		       CAST(total_supply AS TEXT),
+		       CAST(price_usd AS TEXT),
+		       CAST(price_eth AS TEXT),
 		       CAST(market_cap_usd AS TEXT), 
 		       CAST(total_liquidity_usd AS TEXT),
 		       CAST(volume_24h_usd AS TEXT),
+		       CAST(total_volume_usd AS TEXT),
 		       CAST(price_change_24h AS TEXT),
-		       CAST(price_change_7d AS TEXT)
+		       CAST(price_change_7d AS TEXT),
+		       logo_uri, website, description,
+		       first_seen_block, first_seen_timestamp
 		FROM tokens
 		WHERE ($3::text IS NULL OR symbol ILIKE '%' || $3 || '%' OR name ILIKE '%' || $3 || '%')
 		ORDER BY CAST(market_cap_usd AS NUMERIC) DESC NULLS LAST
@@ -171,8 +190,9 @@ func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sear
 	for rows.Next() {
 		var t TokenDTO
 		if err := rows.Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals, 
-			&t.PriceUSD, &t.MarketCapUSD, &t.LiquidityUSD, &t.Volume24hUSD,
-			&t.PriceChange24h, &t.PriceChange7d); err != nil {
+			&t.TotalSupply, &t.PriceUSD, &t.PriceETH, &t.MarketCapUSD, &t.LiquidityUSD, 
+			&t.Volume24hUSD, &t.TotalVolumeUSD, &t.PriceChange24h, &t.PriceChange7d,
+			&t.LogoURI, &t.Website, &t.Description, &t.FirstSeenBlock, &t.FirstSeenTimestamp); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
