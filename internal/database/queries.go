@@ -99,6 +99,7 @@ type TransactionDTO struct {
 	EffectiveGasPrice     *string `json:"effective_gas_price,omitempty"`
 	ContractAddress       *string `json:"contract_address,omitempty"`
 	CumulativeGasUsed     *int64  `json:"cumulative_gas_used,omitempty"`
+	Timestamp             int64   `json:"timestamp"`
 }
 
 type PricePoint struct {
@@ -385,13 +386,15 @@ func GetBlock(ctx context.Context, pool *pgxpool.Pool, number int64) (*BlockDTO,
 // ListTransactions returns a paginated list of transactions ordered by block number and index descending
 func ListTransactions(ctx context.Context, pool *pgxpool.Pool, limit, offset int) ([]TransactionDTO, error) {
 	q := `
-		SELECT hash, block_number, transaction_index, from_address, to_address,
-		       CAST(value AS TEXT), CAST(gas_price AS TEXT), gas_limit, gas_used, nonce, status,
-		       transaction_type, original_type_hex,
-		       CAST(max_fee_per_gas AS TEXT), CAST(max_priority_fee_per_gas AS TEXT),
-		       CAST(effective_gas_price AS TEXT), contract_address, cumulative_gas_used
-		FROM transactions
-		ORDER BY block_number DESC, transaction_index DESC
+		SELECT t.hash, t.block_number, t.transaction_index, t.from_address, t.to_address,
+		       CAST(t.value AS TEXT), CAST(t.gas_price AS TEXT), t.gas_limit, t.gas_used, t.nonce, t.status,
+		       t.transaction_type, t.original_type_hex,
+		       CAST(t.max_fee_per_gas AS TEXT), CAST(t.max_priority_fee_per_gas AS TEXT),
+		       CAST(t.effective_gas_price AS TEXT), t.contract_address, t.cumulative_gas_used,
+		       b.timestamp
+		FROM transactions t
+		JOIN blocks b ON t.block_number = b.number
+		ORDER BY t.block_number DESC, t.transaction_index DESC
 		LIMIT $1 OFFSET $2`
 
 	rows, err := pool.Query(ctx, q, limit, offset)
@@ -406,7 +409,8 @@ func ListTransactions(ctx context.Context, pool *pgxpool.Pool, limit, offset int
 		if err := rows.Scan(&tx.Hash, &tx.BlockNumber, &tx.TransactionIndex, &tx.FromAddress, &tx.ToAddress,
 			&tx.Value, &tx.GasPrice, &tx.GasLimit, &tx.GasUsed, &tx.Nonce, &tx.Status,
 			&tx.TransactionType, &tx.OriginalTypeHex,
-			&tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.EffectiveGasPrice, &tx.ContractAddress, &tx.CumulativeGasUsed); err != nil {
+			&tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.EffectiveGasPrice, &tx.ContractAddress, &tx.CumulativeGasUsed,
+			&tx.Timestamp); err != nil {
 			return nil, err
 		}
 		out = append(out, tx)
@@ -417,14 +421,16 @@ func ListTransactions(ctx context.Context, pool *pgxpool.Pool, limit, offset int
 // ListTransactionsByAddress returns a paginated list of transactions for a specific address
 func ListTransactionsByAddress(ctx context.Context, pool *pgxpool.Pool, address string, limit, offset int) ([]TransactionDTO, error) {
 	q := `
-		SELECT hash, block_number, transaction_index, from_address, to_address,
-		       CAST(value AS TEXT), CAST(gas_price AS TEXT), gas_limit, gas_used, nonce, status,
-		       transaction_type, original_type_hex,
-		       CAST(max_fee_per_gas AS TEXT), CAST(max_priority_fee_per_gas AS TEXT),
-		       CAST(effective_gas_price AS TEXT), contract_address, cumulative_gas_used
-		FROM transactions
-		WHERE from_address = $1 OR to_address = $1
-		ORDER BY block_number DESC, transaction_index DESC
+		SELECT t.hash, t.block_number, t.transaction_index, t.from_address, t.to_address,
+		       CAST(t.value AS TEXT), CAST(t.gas_price AS TEXT), t.gas_limit, t.gas_used, t.nonce, t.status,
+		       t.transaction_type, t.original_type_hex,
+		       CAST(t.max_fee_per_gas AS TEXT), CAST(t.max_priority_fee_per_gas AS TEXT),
+		       CAST(t.effective_gas_price AS TEXT), t.contract_address, t.cumulative_gas_used,
+		       b.timestamp
+		FROM transactions t
+		JOIN blocks b ON t.block_number = b.number
+		WHERE t.from_address = $1 OR t.to_address = $1
+		ORDER BY t.block_number DESC, t.transaction_index DESC
 		LIMIT $2 OFFSET $3`
 
 	rows, err := pool.Query(ctx, q, address, limit, offset)
@@ -439,7 +445,8 @@ func ListTransactionsByAddress(ctx context.Context, pool *pgxpool.Pool, address 
 		if err := rows.Scan(&tx.Hash, &tx.BlockNumber, &tx.TransactionIndex, &tx.FromAddress, &tx.ToAddress,
 			&tx.Value, &tx.GasPrice, &tx.GasLimit, &tx.GasUsed, &tx.Nonce, &tx.Status,
 			&tx.TransactionType, &tx.OriginalTypeHex,
-			&tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.EffectiveGasPrice, &tx.ContractAddress, &tx.CumulativeGasUsed); err != nil {
+			&tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.EffectiveGasPrice, &tx.ContractAddress, &tx.CumulativeGasUsed,
+			&tx.Timestamp); err != nil {
 			return nil, err
 		}
 		out = append(out, tx)
@@ -450,19 +457,22 @@ func ListTransactionsByAddress(ctx context.Context, pool *pgxpool.Pool, address 
 // GetTransaction returns a single transaction by hash
 func GetTransaction(ctx context.Context, pool *pgxpool.Pool, hash string) (*TransactionDTO, error) {
 	q := `
-		SELECT hash, block_number, transaction_index, from_address, to_address,
-		       CAST(value AS TEXT), CAST(gas_price AS TEXT), gas_limit, gas_used, nonce, status,
-		       transaction_type, original_type_hex,
-		       CAST(max_fee_per_gas AS TEXT), CAST(max_priority_fee_per_gas AS TEXT),
-		       CAST(effective_gas_price AS TEXT), contract_address, cumulative_gas_used
-		FROM transactions
-		WHERE hash = $1`
+		SELECT t.hash, t.block_number, t.transaction_index, t.from_address, t.to_address,
+		       CAST(t.value AS TEXT), CAST(t.gas_price AS TEXT), t.gas_limit, t.gas_used, t.nonce, t.status,
+		       t.transaction_type, t.original_type_hex,
+		       CAST(t.max_fee_per_gas AS TEXT), CAST(t.max_priority_fee_per_gas AS TEXT),
+		       CAST(t.effective_gas_price AS TEXT), t.contract_address, t.cumulative_gas_used,
+		       b.timestamp
+		FROM transactions t
+		JOIN blocks b ON t.block_number = b.number
+		WHERE t.hash = $1`
 
 	var tx TransactionDTO
 	err := pool.QueryRow(ctx, q, hash).Scan(&tx.Hash, &tx.BlockNumber, &tx.TransactionIndex, &tx.FromAddress, &tx.ToAddress,
 		&tx.Value, &tx.GasPrice, &tx.GasLimit, &tx.GasUsed, &tx.Nonce, &tx.Status,
 		&tx.TransactionType, &tx.OriginalTypeHex,
-		&tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.EffectiveGasPrice, &tx.ContractAddress, &tx.CumulativeGasUsed)
+		&tx.MaxFeePerGas, &tx.MaxPriorityFeePerGas, &tx.EffectiveGasPrice, &tx.ContractAddress, &tx.CumulativeGasUsed,
+		&tx.Timestamp)
 	if err != nil {
 		return nil, fmt.Errorf("GetTransaction query failed: %w", err)
 	}
