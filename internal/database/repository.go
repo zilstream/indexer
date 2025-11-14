@@ -537,15 +537,8 @@ func updateV2PairMetrics(ctx context.Context, pool *pgxpool.Pool, pairAddr, wzil
 			SELECT
 				CASE
 				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL OR s.reserve0 = 0 OR s.reserve1 = 0 THEN NULL
-				  WHEN lower(p.token1) = p.wzil THEN
-					((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0))
-				  WHEN lower(p.token0) = p.wzil THEN
-					1::numeric
-				  WHEN lower(p.token1) = ANY(p.stables) THEN
-					(s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
-				  WHEN lower(p.token0) = ANY(p.stables) THEN
-					1::numeric
-				  ELSE NULL
+				  -- Use reserve ratio directly for all pairs (token0 in terms of token1)
+				  ELSE (s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
 				END AS price
 			FROM pair_info p
 			LEFT JOIN LATERAL (
@@ -560,15 +553,8 @@ func updateV2PairMetrics(ctx context.Context, pool *pgxpool.Pool, pairAddr, wzil
 			SELECT
 				CASE
 				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL OR s.reserve0 = 0 OR s.reserve1 = 0 THEN NULL
-				  WHEN lower(p.token1) = p.wzil THEN
-					((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0))
-				  WHEN lower(p.token0) = p.wzil THEN
-					1::numeric
-				  WHEN lower(p.token1) = ANY(p.stables) THEN
-					(s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
-				  WHEN lower(p.token0) = ANY(p.stables) THEN
-					1::numeric
-				  ELSE NULL
+				  -- Use reserve ratio directly for all pairs (token0 in terms of token1)
+				  ELSE (s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
 				END AS price
 			FROM pair_info p
 			LEFT JOIN LATERAL (
@@ -584,15 +570,8 @@ func updateV2PairMetrics(ctx context.Context, pool *pgxpool.Pool, pairAddr, wzil
 			SELECT
 				CASE
 				  WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL OR s.reserve0 = 0 OR s.reserve1 = 0 THEN NULL
-				  WHEN lower(p.token1) = p.wzil THEN
-					((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0))
-				  WHEN lower(p.token0) = p.wzil THEN
-					1::numeric
-				  WHEN lower(p.token1) = ANY(p.stables) THEN
-					(s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
-				  WHEN lower(p.token0) = ANY(p.stables) THEN
-					1::numeric
-				  ELSE NULL
+				  -- Use reserve ratio directly for all pairs (token0 in terms of token1)
+				  ELSE (s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
 				END AS price
 			FROM pair_info p
 			LEFT JOIN LATERAL (
@@ -656,15 +635,8 @@ func updateV3PoolMetrics(ctx context.Context, pool *pgxpool.Pool, poolAddr, wzil
 			SELECT
 				CASE
 				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
-				  WHEN lower(p.token1) = p.wzil THEN
-					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
-				  WHEN lower(p.token0) = p.wzil THEN
-					1::numeric
-				  WHEN lower(p.token1) = ANY(p.stables) THEN
-					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
-				  WHEN lower(p.token0) = ANY(p.stables) THEN
-					1::numeric
-				  ELSE NULL
+				  -- Use sqrt_price_x96 directly for all pools (token0 in terms of token1)
+				  ELSE (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
 				END AS price
 			FROM pool_info p
 			LEFT JOIN LATERAL (
@@ -679,15 +651,8 @@ func updateV3PoolMetrics(ctx context.Context, pool *pgxpool.Pool, poolAddr, wzil
 			SELECT
 				CASE
 				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
-				  WHEN lower(p.token1) = p.wzil THEN
-					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
-				  WHEN lower(p.token0) = p.wzil THEN
-					1::numeric
-				  WHEN lower(p.token1) = ANY(p.stables) THEN
-					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
-				  WHEN lower(p.token0) = ANY(p.stables) THEN
-					1::numeric
-				  ELSE NULL
+				  -- Use sqrt_price_x96 directly for all pools (token0 in terms of token1)
+				  ELSE (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
 				END AS price
 			FROM pool_info p
 			LEFT JOIN LATERAL (
@@ -703,15 +668,8 @@ func updateV3PoolMetrics(ctx context.Context, pool *pgxpool.Pool, poolAddr, wzil
 			SELECT
 				CASE
 				  WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
-				  WHEN lower(p.token1) = p.wzil THEN
-					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
-				  WHEN lower(p.token0) = p.wzil THEN
-					1::numeric
-				  WHEN lower(p.token1) = ANY(p.stables) THEN
-					(POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
-				  WHEN lower(p.token0) = ANY(p.stables) THEN
-					1::numeric
-				  ELSE NULL
+				  -- Use sqrt_price_x96 directly for all pools (token0 in terms of token1)
+				  ELSE (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
 				END AS price
 			FROM pool_info p
 			LEFT JOIN LATERAL (
