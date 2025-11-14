@@ -721,3 +721,205 @@ func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, 
 
 	return points, symbol, decimals, nil
 }
+
+// GetTokenPriceChart returns a weighted price chart for a token aggregated from all pairs
+func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string) (*PriceChartDTO, error) {
+	wzilAddr, err := getWZILAddress(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get WZIL address: %w", err)
+	}
+
+	stableAddrs, err := getStablecoinAddresses(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stablecoin addresses: %w", err)
+	}
+
+	q := `
+	WITH meta AS (
+		SELECT t.address AS token, t.symbol AS symbol, t.decimals AS dec
+		FROM tokens t
+		WHERE lower(t.address) = lower($1)
+	),
+	aligned AS (
+		SELECT date_trunc('hour', now() AT TIME ZONE 'UTC')
+		     - make_interval(hours := (EXTRACT(hour FROM now() AT TIME ZONE 'UTC')::int % 4)) AS end_ts
+	),
+	buckets AS (
+		SELECT generate_series(
+			(SELECT end_ts FROM aligned) - interval '7 days' + interval '4 hours',
+			(SELECT end_ts FROM aligned),
+			interval '4 hours'
+		) AS ts
+	),
+	pools AS (
+		SELECT
+			dp.protocol,
+			dp.address AS pool,
+			dp.token0, dp.token1,
+			t0.decimals AS dec0, t1.decimals AS dec1,
+			(COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0))::numeric AS w,
+			(lower(dp.token0) = lower($1)) AS is_target0,
+			CASE
+				WHEN lower(dp.token0) = lower($3) THEN 'wzil0'
+				WHEN lower(dp.token1) = lower($3) THEN 'wzil1'
+				WHEN lower(dp.token0) = ANY($2::text[]) THEN 'stable0'
+				WHEN lower(dp.token1) = ANY($2::text[]) THEN 'stable1'
+				ELSE 'none'
+			END AS anchor
+		FROM dex_pools dp
+		JOIN tokens t0 ON t0.address = dp.token0
+		JOIN tokens t1 ON t1.address = dp.token1
+		WHERE (lower(dp.token0) = lower($1) OR lower(dp.token1) = lower($1))
+		  AND (
+			lower(dp.token0) = lower($3) OR lower(dp.token1) = lower($3)
+			OR lower(dp.token0) = ANY($2::text[]) OR lower(dp.token1) = ANY($2::text[])
+		  )
+		  AND (COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0)) > 0
+	),
+	zil_prices AS (
+		SELECT
+			b.ts,
+			(SELECT price::numeric
+			 FROM prices_zil_usd_minute p
+			 WHERE p.ts <= b.ts
+			 ORDER BY p.ts DESC
+			 LIMIT 1) AS zil_usd
+		FROM buckets b
+	),
+	v2_prices AS (
+		SELECT
+			b.ts,
+			p.pool,
+			p.w,
+			CASE
+				WHEN s.reserve0 IS NULL OR s.reserve1 IS NULL THEN NULL
+				ELSE
+					CASE
+						WHEN p.is_target0 THEN
+							CASE p.anchor
+								WHEN 'wzil1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * z.zil_usd
+								WHEN 'wzil0' THEN z.zil_usd
+								WHEN 'stable1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0))
+								WHEN 'stable0' THEN 1::numeric
+								ELSE NULL
+							END
+						ELSE
+							CASE p.anchor
+								WHEN 'wzil0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * z.zil_usd
+								WHEN 'wzil1' THEN z.zil_usd
+								WHEN 'stable0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0))
+								WHEN 'stable1' THEN 1::numeric
+								ELSE NULL
+							END
+					END
+			END AS price_usd
+		FROM buckets b
+		JOIN pools p ON p.protocol = 'uniswap_v2'
+		LEFT JOIN LATERAL (
+			SELECT reserve0, reserve1
+			FROM uniswap_v2_syncs s
+			WHERE s.pair = p.pool
+			  AND s.timestamp <= EXTRACT(EPOCH FROM b.ts)
+			ORDER BY s.timestamp DESC
+			LIMIT 1
+		) s ON TRUE
+		LEFT JOIN zil_prices z ON z.ts = b.ts
+	),
+	v3_prices AS (
+		SELECT
+			b.ts,
+			p.pool,
+			p.w,
+			CASE
+				WHEN s.sqrt_price_x96 IS NULL THEN NULL
+				ELSE
+					CASE
+						WHEN p.is_target0 THEN
+							CASE p.anchor
+								WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)) * z.zil_usd
+								WHEN 'wzil0' THEN z.zil_usd
+								WHEN 'stable1' THEN (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
+								WHEN 'stable0' THEN 1::numeric
+								ELSE NULL
+							END
+						ELSE
+							CASE p.anchor
+								WHEN 'wzil0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)) * z.zil_usd
+								WHEN 'wzil1' THEN z.zil_usd
+								WHEN 'stable0' THEN 1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)
+								WHEN 'stable1' THEN 1::numeric
+								ELSE NULL
+							END
+					END
+			END AS price_usd
+		FROM buckets b
+		JOIN pools p ON p.protocol = 'uniswap_v3'
+		LEFT JOIN LATERAL (
+			SELECT sqrt_price_x96
+			FROM uniswap_v3_swaps s
+			WHERE s.pool = p.pool
+			  AND s.timestamp <= EXTRACT(EPOCH FROM b.ts)
+			ORDER BY s.timestamp DESC
+			LIMIT 1
+		) s ON TRUE
+		LEFT JOIN zil_prices z ON z.ts = b.ts
+	),
+	all_prices AS (
+		SELECT ts, pool, w, price_usd FROM v2_prices
+		UNION ALL
+		SELECT ts, pool, w, price_usd FROM v3_prices
+	),
+	aggregated AS (
+		SELECT
+			b.ts,
+			NULLIF(SUM(CASE WHEN ap.price_usd IS NOT NULL THEN ap.w ELSE 0 END), 0) AS total_w,
+			SUM(ap.price_usd * ap.w) AS w_price_sum
+		FROM buckets b
+		LEFT JOIN all_prices ap ON ap.ts = b.ts
+		GROUP BY b.ts
+	)
+	SELECT
+		to_char(a.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
+		CASE WHEN a.total_w > 0 THEN (a.w_price_sum / a.total_w)::text ELSE NULL END AS price,
+		'weighted' AS source,
+		m.symbol,
+		m.dec AS decimals
+	FROM aggregated a
+	CROSS JOIN meta m
+	ORDER BY a.ts ASC`
+
+	rows, err := pool.Query(ctx, q, address, stableAddrs, wzilAddr)
+	if err != nil {
+		return nil, fmt.Errorf("token price chart query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var points []PricePoint
+	var symbol string
+	var decimals int32
+	for rows.Next() {
+		var p PricePoint
+		if err := rows.Scan(&p.Timestamp, &p.Price, &p.Source, &symbol, &decimals); err != nil {
+			return nil, err
+		}
+		points = append(points, p)
+	}
+
+	if symbol == "" {
+		return nil, fmt.Errorf("token not found")
+	}
+
+	return &PriceChartDTO{
+		Address: address,
+		Protocol: "aggregated",
+		BaseToken: TokenBaseDTO{
+			Address:  address,
+			Symbol:   symbol,
+			Decimals: decimals,
+		},
+		Quote:     "USD",
+		Timeframe: "7d",
+		Interval:  "4h",
+		Points:    points,
+	}, nil
+}

@@ -160,6 +160,12 @@ func (s *APIServer) handleTokenPrefix(w http.ResponseWriter, r *http.Request) {
 	switch sub {
 	case "pairs":
 		s.handleTokenPairs(w, r, address)
+	case "chart":
+		if len(parts) >= 3 && parts[2] == "price" {
+			s.handleTokenPriceChart(w, r, address)
+		} else {
+			Error(w, http.StatusNotFound, "not found")
+		}
 	default:
 		Error(w, http.StatusNotFound, "not found")
 	}
@@ -185,6 +191,16 @@ func (s *APIServer) handleTokenPairs(w http.ResponseWriter, r *http.Request, tok
 	}
 	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
 	JSON(w, http.StatusOK, items, pg)
+}
+
+func (s *APIServer) handleTokenPriceChart(w http.ResponseWriter, r *http.Request, address string) {
+	ctx := r.Context()
+	chart, err := database.GetTokenPriceChart(ctx, s.db, address)
+	if err != nil {
+		Error(w, http.StatusNotFound, err.Error())
+		return
+	}
+	JSON(w, http.StatusOK, chart, nil)
 }
 
 func (s *APIServer) handlePairPrefix(w http.ResponseWriter, r *http.Request) {
