@@ -89,25 +89,35 @@ type BlockDTO struct {
 }
 
 type TransactionDTO struct {
-	Hash                  string  `json:"hash"`
-	BlockNumber           int64   `json:"block_number"`
-	TransactionIndex      int     `json:"transaction_index"`
-	FromAddress           string  `json:"from_address"`
-	ToAddress             *string `json:"to_address,omitempty"`
-	Value                 string  `json:"value"`
-	GasPrice              *string `json:"gas_price,omitempty"`
-	GasLimit              *int64  `json:"gas_limit,omitempty"`
-	GasUsed               *int64  `json:"gas_used,omitempty"`
-	Nonce                 *int64  `json:"nonce,omitempty"`
-	Status                *int    `json:"status,omitempty"`
-	TransactionType       int     `json:"transaction_type"`
-	OriginalTypeHex       *string `json:"original_type_hex,omitempty"`
-	MaxFeePerGas          *string `json:"max_fee_per_gas,omitempty"`
-	MaxPriorityFeePerGas  *string `json:"max_priority_fee_per_gas,omitempty"`
-	EffectiveGasPrice     *string `json:"effective_gas_price,omitempty"`
-	ContractAddress       *string `json:"contract_address,omitempty"`
-	CumulativeGasUsed     *int64  `json:"cumulative_gas_used,omitempty"`
-	Timestamp             int64   `json:"timestamp"`
+	Hash                  string        `json:"hash"`
+	BlockNumber           int64         `json:"block_number"`
+	TransactionIndex      int           `json:"transaction_index"`
+	FromAddress           string        `json:"from_address"`
+	ToAddress             *string       `json:"to_address,omitempty"`
+	Value                 string        `json:"value"`
+	GasPrice              *string       `json:"gas_price,omitempty"`
+	GasLimit              *int64        `json:"gas_limit,omitempty"`
+	GasUsed               *int64        `json:"gas_used,omitempty"`
+	Nonce                 *int64        `json:"nonce,omitempty"`
+	Status                *int          `json:"status,omitempty"`
+	TransactionType       int           `json:"transaction_type"`
+	OriginalTypeHex       *string       `json:"original_type_hex,omitempty"`
+	MaxFeePerGas          *string       `json:"max_fee_per_gas,omitempty"`
+	MaxPriorityFeePerGas  *string       `json:"max_priority_fee_per_gas,omitempty"`
+	EffectiveGasPrice     *string       `json:"effective_gas_price,omitempty"`
+	ContractAddress       *string       `json:"contract_address,omitempty"`
+	CumulativeGasUsed     *int64        `json:"cumulative_gas_used,omitempty"`
+	Timestamp             int64         `json:"timestamp"`
+	Events                []EventLogDTO `json:"events,omitempty"`
+}
+
+type EventLogDTO struct {
+	LogIndex         int      `json:"log_index"`
+	Address          string   `json:"address"`
+	Topics           []string `json:"topics"`
+	Data             string   `json:"data"`
+	TransactionIndex int      `json:"transaction_index"`
+	BlockNumber      int64    `json:"block_number"`
 }
 
 type PricePoint struct {
@@ -297,6 +307,38 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 			return nil, err
 		}
 		out = append(out, p)
+	}
+	return out, nil
+}
+
+// ListEventsByAddress returns all DEX events where address is sender, recipient, or to_address
+func ListEventsByAddress(ctx context.Context, pool *pgxpool.Pool, address string, eventType *string, protocol *string, limit, offset int) ([]PairEventDTO, error) {
+	q := `
+		SELECT protocol, event_type, id, transaction_hash, log_index, block_number, timestamp,
+		       address, sender, recipient, to_address,
+		       CAST(amount0_in AS TEXT), CAST(amount1_in AS TEXT), CAST(amount0_out AS TEXT), CAST(amount1_out AS TEXT),
+		       CAST(liquidity AS TEXT), CAST(amount_usd AS TEXT)
+		FROM dex_pair_events
+		WHERE (sender = $1 OR recipient = $1 OR to_address = $1)
+		  AND ($2::text IS NULL OR event_type = $2)
+		  AND ($3::text IS NULL OR protocol = $3)
+		ORDER BY timestamp DESC, log_index DESC
+		LIMIT $4 OFFSET $5`
+
+	rows, err := pool.Query(ctx, q, address, eventType, protocol, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("ListEventsByAddress query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PairEventDTO
+	for rows.Next() {
+		var e PairEventDTO
+		if err := rows.Scan(&e.Protocol, &e.EventType, &e.ID, &e.TransactionHash, &e.LogIndex, &e.BlockNumber, &e.Timestamp,
+			&e.Address, &e.Sender, &e.Recipient, &e.ToAddress, &e.Amount0In, &e.Amount1In, &e.Amount0Out, &e.Amount1Out, &e.Liquidity, &e.AmountUSD); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
 	}
 	return out, nil
 }
@@ -497,6 +539,35 @@ func GetTransaction(ctx context.Context, pool *pgxpool.Pool, hash string) (*Tran
 		return nil, fmt.Errorf("GetTransaction query failed: %w", err)
 	}
 	return &tx, nil
+}
+
+// GetEventLogsByTransaction returns all event logs for a transaction
+func GetEventLogsByTransaction(ctx context.Context, pool *pgxpool.Pool, hash string) ([]EventLogDTO, error) {
+	q := `
+		SELECT log_index, address, topics, data, transaction_index, block_number
+		FROM event_logs
+		WHERE transaction_hash = $1
+		ORDER BY log_index ASC`
+
+	rows, err := pool.Query(ctx, q, hash)
+	if err != nil {
+		return nil, fmt.Errorf("GetEventLogsByTransaction query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var events []EventLogDTO
+	for rows.Next() {
+		var event EventLogDTO
+		err := rows.Scan(&event.LogIndex, &event.Address, &event.Topics, &event.Data, &event.TransactionIndex, &event.BlockNumber)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan event log: %w", err)
+		}
+		events = append(events, event)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating event logs: %w", err)
+	}
+	return events, nil
 }
 
 // GetPairPriceChart returns 42 price points (every 4h) over 7 days for a pair/pool

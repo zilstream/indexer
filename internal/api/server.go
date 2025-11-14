@@ -326,6 +326,8 @@ func (s *APIServer) handleAddressPrefix(w http.ResponseWriter, r *http.Request) 
 	switch sub {
 	case "transactions":
 		s.handleAddressTransactions(w, r, address)
+	case "events":
+		s.handleAddressEvents(w, r, address)
 	default:
 		Error(w, http.StatusNotFound, "not found")
 	}
@@ -335,6 +337,22 @@ func (s *APIServer) handleAddressTransactions(w http.ResponseWriter, r *http.Req
 	ctx := r.Context()
 	limit, offset, page, perPage := parsePagination(r)
 	items, err := database.ListTransactionsByAddress(ctx, s.db, address, limit, offset)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
+	JSON(w, http.StatusOK, items, pg)
+}
+
+func (s *APIServer) handleAddressEvents(w http.ResponseWriter, r *http.Request, address string) {
+	ctx := r.Context()
+	limit, offset, page, perPage := parsePagination(r)
+	var eventType *string
+	if v := r.URL.Query().Get("type"); v != "" { eventType = &v }
+	var protocol *string
+	if v := r.URL.Query().Get("protocol"); v != "" { protocol = &v }
+	items, err := database.ListEventsByAddress(ctx, s.db, address, eventType, protocol, limit, offset)
 	if err != nil {
 		Error(w, http.StatusInternalServerError, err.Error())
 		return
