@@ -659,7 +659,7 @@ func getWZILAddress(ctx context.Context, pool *pgxpool.Pool) (string, error) {
 }
 
 func getStablecoinAddresses(ctx context.Context, pool *pgxpool.Pool) ([]string, error) {
-	rows, err := pool.Query(ctx, "SELECT address FROM tokens WHERE price_usd = 1.0 AND symbol IN ('USDT', 'USDC', 'DAI', 'BUSD')")
+	rows, err := pool.Query(ctx, "SELECT address FROM tokens WHERE symbol ILIKE ANY(ARRAY['USDT', 'USDC', 'DAI', 'BUSD', 'ZUSDT', 'zUSDT', 'ZUSD', 'XSGD', 'kUSD'])")
 	if err != nil {
 		return nil, err
 	}

@@ -260,7 +260,7 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 		),
 		anchors AS (
 			SELECT
-				ARRAY(SELECT lower(address) FROM tokens WHERE symbol ILIKE ANY(ARRAY['USDT', 'USDC', 'DAI', 'BUSD', 'ZUSDT', 'ZUSD', 'XSGD'])) AS stables,
+				ARRAY(SELECT lower(address) FROM tokens WHERE symbol ILIKE ANY(ARRAY['USDT', 'USDC', 'DAI', 'BUSD', 'ZUSDT', 'zUSDT', 'ZUSD', 'XSGD', 'kUSD'])) AS stables,
 				lower($2) AS wzil
 		),
 		times AS (
@@ -454,8 +454,16 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 		),
 		hist_prices AS (
 			SELECT
-				CASE WHEN (SELECT total_w FROM agg_24h) > 0 THEN (SELECT w_price_sum FROM agg_24h) / (SELECT total_w FROM agg_24h) ELSE NULL END AS price_24h,
-				CASE WHEN (SELECT total_w FROM agg_7d) > 0 THEN (SELECT w_price_sum FROM agg_7d) / (SELECT total_w FROM agg_7d) ELSE NULL END AS price_7d
+				CASE 
+					WHEN (SELECT total_w FROM agg_24h) > 0 AND (SELECT w_price_sum FROM agg_24h) IS NOT NULL 
+					THEN (SELECT w_price_sum FROM agg_24h) / (SELECT total_w FROM agg_24h) 
+					ELSE NULL 
+				END AS price_24h,
+				CASE 
+					WHEN (SELECT total_w FROM agg_7d) > 0 AND (SELECT w_price_sum FROM agg_7d) IS NOT NULL 
+					THEN (SELECT w_price_sum FROM agg_7d) / (SELECT total_w FROM agg_7d) 
+					ELSE NULL 
+				END AS price_7d
 		)
 		UPDATE tokens t
 		SET
@@ -600,12 +608,12 @@ func updateV2PairMetrics(ctx context.Context, pool *pgxpool.Pool, pairAddr, wzil
 		SET
 		  price_change_24h = CASE
 			WHEN (SELECT price FROM price_24h) IS NULL OR (SELECT price FROM price_24h) = 0 THEN NULL
-			WHEN (SELECT price FROM current_price) IS NULL THEN NULL
+			WHEN (SELECT price FROM current_price) IS NULL OR (SELECT price FROM current_price) = 0 THEN NULL
 			ELSE (((SELECT price FROM current_price) - (SELECT price FROM price_24h)) / (SELECT price FROM price_24h)) * 100
 		  END,
 		  price_change_7d = CASE
 			WHEN (SELECT price FROM price_7d) IS NULL OR (SELECT price FROM price_7d) = 0 THEN NULL
-			WHEN (SELECT price FROM current_price) IS NULL THEN NULL
+			WHEN (SELECT price FROM current_price) IS NULL OR (SELECT price FROM current_price) = 0 THEN NULL
 			ELSE (((SELECT price FROM current_price) - (SELECT price FROM price_7d)) / (SELECT price FROM price_7d)) * 100
 		  END,
 		  updated_at = NOW()
@@ -719,12 +727,12 @@ func updateV3PoolMetrics(ctx context.Context, pool *pgxpool.Pool, poolAddr, wzil
 		SET
 		  price_change_24h = CASE
 			WHEN (SELECT price FROM price_24h) IS NULL OR (SELECT price FROM price_24h) = 0 THEN NULL
-			WHEN (SELECT price FROM current_price) IS NULL THEN NULL
+			WHEN (SELECT price FROM current_price) IS NULL OR (SELECT price FROM current_price) = 0 THEN NULL
 			ELSE (((SELECT price FROM current_price) - (SELECT price FROM price_24h)) / (SELECT price FROM price_24h)) * 100
 		  END,
 		  price_change_7d = CASE
 			WHEN (SELECT price FROM price_7d) IS NULL OR (SELECT price FROM price_7d) = 0 THEN NULL
-			WHEN (SELECT price FROM current_price) IS NULL THEN NULL
+			WHEN (SELECT price FROM current_price) IS NULL OR (SELECT price FROM current_price) = 0 THEN NULL
 			ELSE (((SELECT price FROM current_price) - (SELECT price FROM price_7d)) / (SELECT price FROM price_7d)) * 100
 		  END,
 		  updated_at = NOW()
