@@ -1,0 +1,33 @@
+{
+  "token_hmac_secret_key": "",
+  "api_key": "",
+  "admin": false,
+  "health": true,
+  "allowed_origins": [
+    "http://localhost:3000",
+    "https://v2.zilstream.com",
+    "https://beta.zilstream.com",
+    "https://dev.zilstream.com",
+    "https://zilstream.com"
+  ],
+  "port": 8001,
+  "namespaces": [
+    {
+      "name": "dex",
+      "presence": false,
+      "join_leave": false,
+      "force_positioning": false,
+      "force_recovery": true,
+      "history_size": 100,
+      "history_ttl": "15s",
+      "allow_publish_for_client": false,
+      "allow_subscribe_for_client": true,
+      "allow_subscribe_for_anonymous": true
+    }
+  ],
+  "history_size": 100,
+  "history_ttl": "15s",
+  "allow_publish_for_client": false,
+  "allow_subscribe_for_client": true,
+  "allow_subscribe_for_anonymous": true
+}

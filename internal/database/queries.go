@@ -279,6 +279,51 @@ func GetPair(ctx context.Context, pool *pgxpool.Pool, address string) (*PairDTO,
 	return &p, nil
 }
 
+func GetPairsByAddresses(ctx context.Context, pool *pgxpool.Pool, addresses []string) ([]PairDTO, error) {
+	if len(addresses) == 0 {
+		return []PairDTO{}, nil
+	}
+
+	q := `
+		SELECT dp.protocol, dp.address, dp.token0, dp.token1,
+		       dp.token0_symbol, dp.token0_name, dp.token1_symbol, dp.token1_name,
+		       CAST(dp.fee AS TEXT), CAST(dp.reserve0 AS TEXT), CAST(dp.reserve1 AS TEXT), CAST(dp.liquidity AS TEXT),
+		       CAST(dp.liquidity_usd AS TEXT), CAST(dp.volume_usd AS TEXT), CAST(dp.volume_usd_24h AS TEXT),
+		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_24h AS TEXT) ELSE CAST(v3.price_change_24h AS TEXT) END,
+		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_7d AS TEXT) ELSE CAST(v3.price_change_7d AS TEXT) END,
+		       dp.txn_count
+		FROM dex_pools dp
+		LEFT JOIN uniswap_v2_pairs v2 ON dp.protocol = 'uniswap_v2' AND v2.address = dp.address
+		LEFT JOIN uniswap_v3_pools v3 ON dp.protocol = 'uniswap_v3' AND v3.address = dp.address
+		WHERE dp.address = ANY($1)`
+
+	rows, err := pool.Query(ctx, q, addresses)
+	if err != nil {
+		return nil, fmt.Errorf("GetPairsByAddresses query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var pairs []PairDTO
+	for rows.Next() {
+		var p PairDTO
+		err := rows.Scan(
+			&p.Protocol, &p.Address, &p.Token0, &p.Token1,
+			&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name,
+			&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity,
+			&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount)
+		if err != nil {
+			return nil, fmt.Errorf("GetPairsByAddresses scan failed: %w", err)
+		}
+		pairs = append(pairs, p)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("GetPairsByAddresses rows error: %w", err)
+	}
+
+	return pairs, nil
+}
+
 func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortBy, sortOrder string) ([]PairDTO, error) {
 	// Map user-friendly sort options to column names
 	sortColumn := "volume_usd_24h"

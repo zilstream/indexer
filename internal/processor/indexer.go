@@ -18,6 +18,7 @@ import (
 	"github.com/zilstream/indexer/internal/modules/uniswapv2"
 	"github.com/zilstream/indexer/internal/modules/uniswapv3"
 	"github.com/zilstream/indexer/internal/prices"
+	"github.com/zilstream/indexer/internal/realtime"
 	"github.com/zilstream/indexer/internal/rpc"
 	"github.com/zilstream/indexer/internal/sync"
 )
@@ -29,6 +30,7 @@ type Indexer struct {
 	db             *database.Database
 	moduleRegistry *core.ModuleRegistry
 	pricePoller    *prices.Poller
+	publisher      *realtime.Publisher
 	logger         zerolog.Logger
 	shutdown       chan struct{}
 }
@@ -74,12 +76,26 @@ func NewIndexer(cfg *config.Config, logger zerolog.Logger) (*Indexer, error) {
 		Interval: cfg.Processor.PricePollInterval,
 	}, logger)
 
+	// Create realtime publisher if enabled
+	var publisher *realtime.Publisher
+	if cfg.Centrifugo.Enabled {
+		publisherConfig := realtime.PublishConfig{
+			APIURL: cfg.Centrifugo.APIURL,
+			APIKey: cfg.Centrifugo.APIKey,
+		}
+		publisher = realtime.NewPublisher(publisherConfig, db.Pool(), logger)
+		logger.Info().Msg("Realtime publisher enabled")
+	} else {
+		logger.Info().Msg("Realtime publisher disabled")
+	}
+
 	return &Indexer{
 		config:         cfg,
 		rpcClient:      rpcClient,
 		db:             db,
 		moduleRegistry: moduleRegistry,
 		pricePoller:    pricePoller,
+		publisher:      publisher,
 		logger:         logger.With().Str("component", "indexer").Logger(),
 		shutdown:       make(chan struct{}),
 	}, nil
@@ -209,6 +225,9 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 			syncConfig,
 			i.logger,
 		)
+		if i.publisher != nil {
+			unifiedSync.SetPublisher(i.publisher)
+		}
 		defer unifiedSync.Close()
 
 		// Determine end block (don't go all the way to latest for safety)
@@ -288,6 +307,9 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 				continue
 			}
 			m.SetPriceProvider(priceProvider)
+			if i.publisher != nil {
+				m.SetPublisher(i.publisher)
+			}
 			module = m
 		case "uniswap-v3":
 			m, err := uniswapv3.NewUniswapV3Module(i.logger)

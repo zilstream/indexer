@@ -3,10 +3,13 @@ package api
 import (
 	"context"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/zilstream/indexer/internal/database"
@@ -70,6 +73,10 @@ func (s *APIServer) registerRoutes() {
 			"time": time.Now().UTC(),
 		}, nil)
 	})
+
+	// WebSocket endpoints
+	s.mux.HandleFunc("/ws/info", s.handleWsInfo)
+	s.mux.HandleFunc("/ws/token", s.handleWsToken)
 
 	// Collections
 	s.mux.HandleFunc("/tokens", s.handleTokens)
@@ -376,4 +383,47 @@ func (s *APIServer) handleAddressEvents(w http.ResponseWriter, r *http.Request, 
 	}
 	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
 	JSON(w, http.StatusOK, items, pg)
+}
+
+func (s *APIServer) handleWsInfo(w http.ResponseWriter, r *http.Request) {
+	wsURL := os.Getenv("CENTRIFUGO_WS_URL")
+	if wsURL == "" {
+		wsURL = "ws://localhost:8001/connection/websocket"
+	}
+	
+	JSON(w, http.StatusOK, map[string]any{
+		"url":       wsURL,
+		"ping_ms":   25000,
+		"recover":   true,
+	}, nil)
+}
+
+func (s *APIServer) handleWsToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		Error(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	
+	jwtSecret := os.Getenv("CENTRIFUGO_JWT_SECRET")
+	if jwtSecret == "" {
+		Error(w, http.StatusInternalServerError, "JWT secret not configured")
+		return
+	}
+	
+	anonID := uuid.NewString()
+	claims := jwt.MapClaims{
+		"sub": anonID,
+		"exp": time.Now().Add(12 * time.Hour).Unix(),
+	}
+	
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte(jwtSecret))
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+	
+	JSON(w, http.StatusOK, map[string]any{
+		"token": tokenString,
+	}, nil)
 }

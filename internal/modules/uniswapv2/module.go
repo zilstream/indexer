@@ -44,6 +44,14 @@ config *Config
 	// Pricing
 	priceProvider prices.Provider
 	priceRouter   prices.TokenRouter
+
+	// Realtime publisher (optional)
+	publisher PairPublisher
+}
+
+// PairPublisher interface for realtime updates
+type PairPublisher interface {
+	EnqueuePairChanged(address string)
 }
 
 // Config represents the module configuration
@@ -160,6 +168,10 @@ m.rpcClient = client
 // SetPriceProvider injects the price provider
 func (m *UniswapV2Module) SetPriceProvider(p prices.Provider) {
 m.priceProvider = p
+}
+
+func (m *UniswapV2Module) SetPublisher(publisher PairPublisher) {
+	m.publisher = publisher
 }
 
 // Initialize sets up the module with database connection
@@ -433,7 +445,7 @@ func (m *UniswapV2Module) Backfill(ctx context.Context, fromBlock, toBlock uint6
 }
 
 // updatePairStatistics updates pair reserves, volumes, and transaction counts from processed events
-func (m *UniswapV2Module) updatePairStatistics(ctx context.Context, tx pgx.Tx, swapEvents, syncEvents []*types.Log) error {
+func (m *UniswapV2Module) updatePairStatistics(ctx context.Context, tx pgx.Tx, swapEvents, syncEvents, mintEvents, burnEvents []*types.Log) error {
 	// Update reserves from the latest sync events per pair
 	if len(syncEvents) > 0 {
 		// Group syncs by pair and find the latest one for each
@@ -569,6 +581,40 @@ func (m *UniswapV2Module) updatePairStatistics(ctx context.Context, tx pgx.Tx, s
 
 		if err != nil {
 			m.logger.Error().Err(err).Msg("Failed to update reserve_usd")
+		}
+	}
+
+	// Notify publisher about changed pairs
+	if m.publisher != nil {
+		changedPairs := make(map[string]struct{})
+		
+		// Collect all affected pairs from swaps
+		for _, event := range swapEvents {
+			changedPairs[strings.ToLower(event.Address.Hex())] = struct{}{}
+		}
+		
+		// Collect all affected pairs from syncs
+		for _, event := range syncEvents {
+			changedPairs[strings.ToLower(event.Address.Hex())] = struct{}{}
+		}
+		
+		// Collect all affected pairs from mints
+		for _, event := range mintEvents {
+			changedPairs[strings.ToLower(event.Address.Hex())] = struct{}{}
+		}
+		
+		// Collect all affected pairs from burns
+		for _, event := range burnEvents {
+			changedPairs[strings.ToLower(event.Address.Hex())] = struct{}{}
+		}
+		
+		// Enqueue all changed pairs for realtime updates
+		for pairAddr := range changedPairs {
+			m.publisher.EnqueuePairChanged(pairAddr)
+		}
+		
+		if len(changedPairs) > 0 {
+			m.logger.Debug().Int("pairs", len(changedPairs)).Msg("Enqueued pairs for realtime updates")
 		}
 	}
 
@@ -771,7 +817,7 @@ func (m *UniswapV2Module) HandleEventBatch(ctx context.Context, events []*types.
 	// Update pair aggregate statistics based on the events we just processed
 	// This updates reserves from syncs, volumes from swaps, and transaction counts
 	if len(swapEvents) > 0 || len(syncEvents) > 0 {
-		if err := m.updatePairStatistics(ctx, tx, swapEvents, syncEvents); err != nil {
+		if err := m.updatePairStatistics(ctx, tx, swapEvents, syncEvents, mintEvents, burnEvents); err != nil {
 			m.logger.Error().Err(err).Msg("Failed to update pair statistics")
 			// Don't fail the whole batch for statistics updates
 		}

@@ -39,3 +39,10 @@ bootstrap:
     csv_path: "data/zilliqa_historical_prices.csv"
     source: "bootstrap_csv"
     batch_size: 50000
+
+centrifugo:
+  api_url: "http://localhost:8001/api"
+  api_key: "your-api-key-here"
+  ws_url: "ws://localhost:8001/connection/websocket"
+  jwt_secret: "your-jwt-secret-here"
+  enabled: true

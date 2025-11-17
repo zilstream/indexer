@@ -9,12 +9,13 @@ import (
 )
 
 type Config struct {
-	Server    ServerConfig    `mapstructure:"server"`
-	Chain     ChainConfig     `mapstructure:"chain"`
-	Database  DatabaseConfig  `mapstructure:"database"`
-	Processor ProcessorConfig `mapstructure:"processor"`
-	Logging   LoggingConfig   `mapstructure:"logging"`
-	Bootstrap BootstrapConfig `mapstructure:"bootstrap"`
+	Server      ServerConfig      `mapstructure:"server"`
+	Chain       ChainConfig       `mapstructure:"chain"`
+	Database    DatabaseConfig    `mapstructure:"database"`
+	Processor   ProcessorConfig   `mapstructure:"processor"`
+	Logging     LoggingConfig     `mapstructure:"logging"`
+	Bootstrap   BootstrapConfig   `mapstructure:"bootstrap"`
+	Centrifugo  CentrifugoConfig  `mapstructure:"centrifugo"`
 }
 
 type ServerConfig struct {
@@ -67,6 +68,14 @@ type ZILPricesBootstrap struct {
 	BatchSize int    `mapstructure:"batch_size"`
 }
 
+type CentrifugoConfig struct {
+	APIURL    string `mapstructure:"api_url"`
+	APIKey    string `mapstructure:"api_key"`
+	WsURL     string `mapstructure:"ws_url"`
+	JWTSecret string `mapstructure:"jwt_secret"`
+	Enabled   bool   `mapstructure:"enabled"`
+}
+
 func Load(configPath string) (*Config, error) {
 	viper.SetConfigFile(configPath)
 	viper.SetEnvPrefix("INDEXER")
@@ -94,6 +103,9 @@ func Load(configPath string) (*Config, error) {
 	viper.SetDefault("bootstrap.zil_prices.csv_path", "data/zilliqa_historical_prices.csv")
 	viper.SetDefault("bootstrap.zil_prices.source", "bootstrap_csv")
 	viper.SetDefault("bootstrap.zil_prices.batch_size", 50_000)
+	viper.SetDefault("centrifugo.enabled", false)
+	viper.SetDefault("centrifugo.api_url", "http://localhost:8001/api")
+	viper.SetDefault("centrifugo.ws_url", "ws://localhost:8001/connection/websocket")
 
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("failed to read config: %w", err)

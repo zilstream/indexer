@@ -23,6 +23,7 @@ type UnifiedSync struct {
 	writer     *database.AtomicBlockWriter
 	bulkWriter *database.BulkWriter
 	modules    *core.ModuleRegistry
+	publisher  BlockPublisher
 	logger     zerolog.Logger
 
 	// Configuration
@@ -30,6 +31,12 @@ type UnifiedSync struct {
 	maxRetries        int
 	retryDelay        time.Duration
 	requestsPerSecond int
+}
+
+// BlockPublisher interface for realtime block updates
+type BlockPublisher interface {
+	SetCurrentBlock(blockNumber uint64)
+	Flush()
 }
 
 // UnifiedSyncConfig holds configuration for unified sync
@@ -63,12 +70,17 @@ func NewUnifiedSync(
 		writer:            writer,
 		bulkWriter:        bulkWriter,
 		modules:           modules,
+		publisher:         nil,
 		logger:            logger.With().Str("component", "unified_sync").Logger(),
 		maxBatchSize:      config.MaxBatchSize,
 		maxRetries:        config.MaxRetries,
 		retryDelay:        config.RetryDelay,
 		requestsPerSecond: config.RequestsPerSecond,
 	}
+}
+
+func (s *UnifiedSync) SetPublisher(publisher BlockPublisher) {
+	s.publisher = publisher
 }
 
 // SyncRange syncs a range of blocks
@@ -162,6 +174,12 @@ func (s *UnifiedSync) SyncRange(ctx context.Context, startBlock, endBlock uint64
 		// Update progress
 		totalProcessed += uint64(batchSize)
 		current = batchEnd + 1
+		
+		// Flush realtime updates after each batch
+		if s.publisher != nil {
+			s.publisher.SetCurrentBlock(batchEnd)
+			s.publisher.Flush()
+		}
 		
 		// Log progress periodically
 		if totalProcessed%1000 == 0 || current > endBlock {

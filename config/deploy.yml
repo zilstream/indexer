@@ -22,6 +22,11 @@ proxy:
     interval: 15
     path: /health
     timeout: 15
+  # WebSocket support for Centrifugo
+  response_timeout: 3600
+  buffering:
+    requests: false
+    responses: false
 
 # Credentials for your image host.
 registry:
@@ -50,6 +55,13 @@ env:
     INDEXER_DATABASE_PORT: 5432
     INDEXER_DATABASE_USER: postgres
     INDEXER_DATABASE_PASSWORD: zilstream
+    # Centrifugo configuration
+    INDEXER_CENTRIFUGO_ENABLED: true
+    INDEXER_CENTRIFUGO_API_URL: http://zilstream-indexer-centrifugo:8001/api
+    CENTRIFUGO_WS_URL: wss://ws.zilstream.com/connection/websocket
+  secret:
+    - INDEXER_CENTRIFUGO_API_KEY
+    - CENTRIFUGO_JWT_SECRET
 # Aliases are triggered with "bin/kamal <alias>". You can overwrite arguments on invocation:
 # "bin/kamal app logs -r job" will tail logs from the first server in the job section.
 #
@@ -77,22 +89,24 @@ env:
 #   limit: 10 # Can also specify as a percentage of total hosts, such as "25%"
 #   wait: 2
 
-# Accessories example (uncomment/configure if you want Kamal to manage DB/Redis)
-# accessories:
-#   db:
-#     image: postgres:15
-#     host: 192.168.0.2
-#     port: 5432
-#     env:
-#       clear:
-#         POSTGRES_DB: stream
-#       secret:
-#         - POSTGRES_PASSWORD
-#     directories:
-#       - data:/var/lib/postgresql/data
-#   redis:
-#     image: valkey/valkey:8
-#     host: 192.168.0.2
-#     port: 6379
-#     directories:
-#       - data:/data
+# Accessories - Centrifugo for real-time WebSocket updates
+accessories:
+  centrifugo:
+    image: centrifugo/centrifugo:v5
+    host: indexer
+    proxy:
+      host: "ws.zilstream.com"
+      app_port: 8001
+      ssl: true
+      healthcheck:
+        path: /health
+    cmd: centrifugo --config=/centrifugo/config.json
+    env:
+      secret:
+        - CENTRIFUGO_API_KEY
+        - CENTRIFUGO_TOKEN_HMAC_SECRET_KEY
+    files:
+      - config/centrifugo.json:/centrifugo/config.json
+    # Optional: Add a directory for logs/state if needed
+    # directories:
+    #   - centrifugo-data:/centrifugo/data
