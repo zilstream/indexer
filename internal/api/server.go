@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -262,6 +263,8 @@ func (s *APIServer) handlePairPrefix(w http.ResponseWriter, r *http.Request) {
 		} else {
 			Error(w, http.StatusNotFound, "not found")
 		}
+	case "ohlcv":
+		s.handlePairOHLCV(w, r, address)
 	default:
 		Error(w, http.StatusNotFound, "not found")
 	}
@@ -301,6 +304,106 @@ func (s *APIServer) handlePairPriceChart(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	JSON(w, http.StatusOK, chart, nil)
+}
+
+// TradingView-compatible /history response
+type TVHistoryResponse struct {
+	S        string   `json:"s"`                  // "ok" | "no_data" | "error"
+	T        []int64  `json:"t,omitempty"`        // timestamps
+	O        []string `json:"o,omitempty"`
+	H        []string `json:"h,omitempty"`
+	L        []string `json:"l,omitempty"`
+	C        []string `json:"c,omitempty"`
+	V        []string `json:"v,omitempty"`
+	NextTime *int64   `json:"nextTime,omitempty"` // optional
+}
+
+func (s *APIServer) handlePairOHLCV(w http.ResponseWriter, r *http.Request, address string) {
+	ctx := r.Context()
+	address = strings.ToLower(address)
+
+	// TradingView UDF: from, to = unix seconds; resolution = "1", "5", "60", "D", "W", etc.
+	q := r.URL.Query()
+
+	fromStr := q.Get("from")
+	toStr := q.Get("to")
+	resolution := q.Get("resolution")
+
+	if fromStr == "" || toStr == "" || resolution == "" {
+		Error(w, http.StatusBadRequest, "from, to and resolution are required")
+		return
+	}
+
+	from, err := strconv.ParseInt(fromStr, 10, 64)
+	if err != nil {
+		Error(w, http.StatusBadRequest, "invalid from")
+		return
+	}
+	to, err := strconv.ParseInt(toStr, 10, 64)
+	if err != nil {
+		Error(w, http.StatusBadRequest, "invalid to")
+		return
+	}
+	if to <= from {
+		Error(w, http.StatusBadRequest, "to must be greater than from")
+		return
+	}
+
+	interval, err := mapResolutionToInterval(resolution)
+	if err != nil {
+		Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	candles, err := database.GetPairOHLCV(ctx, s.db, address, from, to, interval)
+	if err != nil {
+		Error(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if len(candles) == 0 {
+		JSON(w, http.StatusOK, TVHistoryResponse{S: "no_data"}, nil)
+		return
+	}
+
+	resp := TVHistoryResponse{
+		S: "ok",
+	}
+	for _, c := range candles {
+		resp.T = append(resp.T, c.Timestamp)
+		resp.O = append(resp.O, derefOrZeroStr(c.Open))
+		resp.H = append(resp.H, derefOrZeroStr(c.High))
+		resp.L = append(resp.L, derefOrZeroStr(c.Low))
+		resp.C = append(resp.C, derefOrZeroStr(c.Close))
+		resp.V = append(resp.V, derefOrZeroStr(c.Volume))
+	}
+
+	JSON(w, http.StatusOK, resp, nil)
+}
+
+func derefOrZeroStr(v *string) string {
+	if v == nil {
+		return "0"
+	}
+	return *v
+}
+
+func mapResolutionToInterval(res string) (string, error) {
+	res = strings.TrimSpace(strings.ToUpper(res))
+
+	switch res {
+	case "D", "1D":
+		return "1 day", nil
+	case "W", "1W":
+		return "7 days", nil
+	}
+
+	// Numeric: minutes
+	n, err := strconv.Atoi(res)
+	if err != nil || n <= 0 {
+		return "", fmt.Errorf("invalid resolution: %s", res)
+	}
+	return fmt.Sprintf("%d minutes", n), nil
 }
 
 func (s *APIServer) handleStats(w http.ResponseWriter, r *http.Request) {

@@ -145,6 +145,15 @@ type PriceChartDTO struct {
 	Points     []PricePoint `json:"points"`
 }
 
+type CandleDTO struct {
+	Timestamp int64   `json:"t"` // unix seconds
+	Open      *string `json:"o"`
+	High      *string `json:"h"`
+	Low       *string `json:"l"`
+	Close     *string `json:"c"`
+	Volume    *string `json:"v"`
+}
+
 type TokenBaseDTO struct {
 	Address  string `json:"address"`
 	Symbol   string `json:"symbol"`
@@ -1146,4 +1155,398 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 		Interval:  "4h",
 		Points:    points,
 	}, nil
+}
+
+func GetPairOHLCV(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	address string,
+	from, to int64,
+	interval string, // e.g. "1 minute", "5 minutes", "1 day"
+) ([]CandleDTO, error) {
+	// Lookup pair to get protocol, token0, token1
+	pair, err := GetPair(ctx, pool, address)
+	if err != nil {
+		return nil, fmt.Errorf("pair not found: %w", err)
+	}
+	if pair.Protocol == "uniswap_v2" {
+		return getPairOHLCVV2(ctx, pool, pair, address, from, to, interval)
+	}
+	return getPairOHLCVV3(ctx, pool, pair, address, from, to, interval)
+}
+
+func getPairOHLCVV2(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	pair *PairDTO,
+	address string,
+	from, to int64,
+	interval string,
+) ([]CandleDTO, error) {
+	// Reuse helpers already defined in queries.go
+	wzilAddr, err := getWZILAddress(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get WZIL address: %w", err)
+	}
+	stableAddrs, err := getStablecoinAddresses(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stablecoin addresses: %w", err)
+	}
+
+	q := `
+		WITH meta AS (
+			SELECT 
+				t0.address  AS token0, 
+				t1.address  AS token1,
+				t0.decimals AS dec0,
+				t1.decimals AS dec1
+			FROM tokens t0, tokens t1
+			WHERE t0.address = $1 AND t1.address = $2
+		),
+		params AS (
+			SELECT
+				to_timestamp($6) AT TIME ZONE 'UTC' AS from_ts,
+				to_timestamp($7) AT TIME ZONE 'UTC' AS to_ts
+		),
+		buckets AS (
+			SELECT
+				gs AS bucket_start,
+				gs + $8::interval AS bucket_end
+			FROM params p,
+				 generate_series(
+					 p.from_ts,
+					 p.to_ts,
+					 $8::interval
+				 ) AS gs
+		),
+		price_points AS (
+			SELECT
+				to_timestamp(s.timestamp) AT TIME ZONE 'UTC' AS ts,
+				CASE
+					WHEN LOWER($5) = LOWER(m.token1) THEN
+						((s.reserve1::numeric / POWER(10, m.dec1))
+						 / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
+					WHEN LOWER($5) = LOWER(m.token0) THEN
+						z.zil_usd
+					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+						(s.reserve1::numeric / POWER(10, m.dec1))
+						/ NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)
+					WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+						1
+					ELSE NULL
+				END AS price_usd
+			FROM uniswap_v2_syncs s
+			CROSS JOIN meta m
+			LEFT JOIN LATERAL (
+				SELECT price::numeric AS zil_usd
+				FROM prices_zil_usd_minute p
+				WHERE p.ts <= to_timestamp(s.timestamp) AT TIME ZONE 'UTC'
+				ORDER BY p.ts DESC
+				LIMIT 1
+			) z ON TRUE
+			WHERE s.pair = $3
+			  AND s.timestamp <= $7
+		),
+		swap_points AS (
+			SELECT
+				to_timestamp(sw.timestamp) AT TIME ZONE 'UTC' AS ts,
+				(
+					(COALESCE(sw.amount0_in, 0)::numeric +
+					 COALESCE(sw.amount0_out, 0)::numeric)
+					/ POWER(10, m.dec0)
+				) *
+				CASE
+					WHEN LOWER($5) = LOWER(m.token1) THEN
+						((sy.reserve1::numeric / POWER(10, m.dec1))
+						 / NULLIF(sy.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
+					WHEN LOWER($5) = LOWER(m.token0) THEN
+						z.zil_usd
+					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+						(sy.reserve1::numeric / POWER(10, m.dec1))
+						/ NULLIF(sy.reserve0::numeric / POWER(10, m.dec0), 0)
+					WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+						1
+					ELSE NULL
+				END AS volume_usd
+			FROM uniswap_v2_swaps sw
+			CROSS JOIN meta m
+			LEFT JOIN LATERAL (
+				SELECT reserve0, reserve1
+				FROM uniswap_v2_syncs s2
+				WHERE s2.pair = $3
+				  AND s2.timestamp <= sw.timestamp
+				ORDER BY s2.timestamp DESC
+				LIMIT 1
+			) sy ON TRUE
+			LEFT JOIN LATERAL (
+				SELECT price::numeric AS zil_usd
+				FROM prices_zil_usd_minute p
+				WHERE p.ts <= to_timestamp(sw.timestamp) AT TIME ZONE 'UTC'
+				ORDER BY p.ts DESC
+				LIMIT 1
+			) z ON TRUE
+			WHERE sw.pair = $3
+			  AND sw.timestamp >= $6
+			  AND sw.timestamp <= $7
+		),
+		agg AS (
+			SELECT
+				b.bucket_start,
+				(
+					SELECT price_usd
+					FROM price_points pp
+					WHERE pp.ts <= b.bucket_end
+					ORDER BY pp.ts DESC
+					LIMIT 1
+				) AS close_price,
+				(
+					SELECT price_usd
+					FROM price_points pp
+					WHERE pp.ts <= b.bucket_start
+					ORDER BY pp.ts DESC
+					LIMIT 1
+				) AS open_price,
+				(
+					SELECT MAX(price_usd)
+					FROM price_points pp
+					WHERE pp.ts > b.bucket_start
+					  AND pp.ts <= b.bucket_end
+				) AS high_price,
+				(
+					SELECT MIN(price_usd)
+					FROM price_points pp
+					WHERE pp.ts > b.bucket_start
+					  AND pp.ts <= b.bucket_end
+				) AS low_price,
+				(
+					SELECT COALESCE(SUM(volume_usd), 0)
+					FROM swap_points sp
+					WHERE sp.ts > b.bucket_start
+					  AND sp.ts <= b.bucket_end
+				) AS volume_usd
+			FROM buckets b
+		)
+		SELECT
+			EXTRACT(EPOCH FROM bucket_start)::bigint AS ts,
+			CAST(open_price  AS TEXT) AS o,
+			CAST(high_price  AS TEXT) AS h,
+			CAST(low_price   AS TEXT) AS l,
+			CAST(close_price AS TEXT) AS c,
+			CAST(volume_usd  AS TEXT) AS v
+		FROM agg
+		WHERE close_price IS NOT NULL
+		ORDER BY bucket_start ASC
+	`
+
+	rows, err := pool.Query(
+		ctx,
+		q,
+		pair.Token0,
+		pair.Token1,
+		address,
+		stableAddrs,
+		wzilAddr,
+		from,
+		to,
+		interval,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("getPairOHLCVV2 query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CandleDTO
+	for rows.Next() {
+		var c CandleDTO
+		if err := rows.Scan(
+			&c.Timestamp,
+			&c.Open,
+			&c.High,
+			&c.Low,
+			&c.Close,
+			&c.Volume,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func getPairOHLCVV3(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	pair *PairDTO,
+	address string,
+	from, to int64,
+	interval string,
+) ([]CandleDTO, error) {
+	wzilAddr, err := getWZILAddress(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get WZIL address: %w", err)
+	}
+	stableAddrs, err := getStablecoinAddresses(ctx, pool)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stablecoin addresses: %w", err)
+	}
+
+	q := `
+		WITH meta AS (
+			SELECT 
+				t0.address  AS token0, 
+				t1.address  AS token1,
+				t0.decimals AS dec0,
+				t1.decimals AS dec1
+			FROM tokens t0, tokens t1
+			WHERE t0.address = $1 AND t1.address = $2
+		),
+		params AS (
+			SELECT
+				to_timestamp($6) AT TIME ZONE 'UTC' AS from_ts,
+				to_timestamp($7) AT TIME ZONE 'UTC' AS to_ts
+		),
+		buckets AS (
+			SELECT
+				gs AS bucket_start,
+				gs + $8::interval AS bucket_end
+			FROM params p,
+				 generate_series(
+					 p.from_ts,
+					 p.to_ts,
+					 $8::interval
+				 ) AS gs
+		),
+		swaps AS (
+			SELECT
+				to_timestamp(s.timestamp) AT TIME ZONE 'UTC' AS ts,
+				CASE
+					WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+					WHEN LOWER($5) = LOWER(m.token1) THEN
+						((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
+						/ POWER(10::numeric, m.dec0 - m.dec1)) * z.zil_usd
+					WHEN LOWER($5) = LOWER(m.token0) THEN
+						z.zil_usd
+					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+						(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
+						/ POWER(10::numeric, m.dec0 - m.dec1)
+					WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+						1
+					ELSE NULL
+				END AS price_usd,
+				CASE
+					WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
+					WHEN LOWER($5) = LOWER(m.token1) THEN
+						(ABS(s.amount0::numeric) / POWER(10::numeric, m.dec0)) * 
+						(((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
+						/ POWER(10::numeric, m.dec0 - m.dec1)) * z.zil_usd)
+					WHEN LOWER($5) = LOWER(m.token0) THEN
+						(ABS(s.amount0::numeric) / POWER(10::numeric, m.dec0)) * z.zil_usd
+					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+						(ABS(s.amount0::numeric) / POWER(10::numeric, m.dec0)) * 
+						((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
+						/ POWER(10::numeric, m.dec0 - m.dec1))
+					WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+						(ABS(s.amount0::numeric) / POWER(10::numeric, m.dec0)) * 1
+					ELSE NULL
+				END AS volume_usd
+			FROM uniswap_v3_swaps s
+			CROSS JOIN meta m
+			LEFT JOIN LATERAL (
+				SELECT price::numeric AS zil_usd
+				FROM prices_zil_usd_minute p
+				WHERE p.ts <= to_timestamp(s.timestamp) AT TIME ZONE 'UTC'
+				ORDER BY p.ts DESC
+				LIMIT 1
+			) z ON TRUE
+			WHERE s.pool = $3
+			  AND s.timestamp <= $7 AND s.timestamp >= $6 - 86400 -- Look back a bit for open price if needed
+		),
+		agg AS (
+			SELECT
+				b.bucket_start,
+				(
+					SELECT price_usd
+					FROM swaps s
+					WHERE s.ts <= b.bucket_end AND s.price_usd IS NOT NULL
+					ORDER BY s.ts DESC
+					LIMIT 1
+				) AS close_price,
+				(
+					SELECT price_usd
+					FROM swaps s
+					WHERE s.ts <= b.bucket_start AND s.price_usd IS NOT NULL
+					ORDER BY s.ts DESC
+					LIMIT 1
+				) AS open_price,
+				(
+					SELECT MAX(price_usd)
+					FROM swaps s
+					WHERE s.ts > b.bucket_start
+					  AND s.ts <= b.bucket_end
+				) AS high_price,
+				(
+					SELECT MIN(price_usd)
+					FROM swaps s
+					WHERE s.ts > b.bucket_start
+					  AND s.ts <= b.bucket_end
+				) AS low_price,
+				(
+					SELECT COALESCE(SUM(volume_usd), 0)
+					FROM swaps s
+					WHERE s.ts > b.bucket_start
+					  AND s.ts <= b.bucket_end
+				) AS volume_usd
+			FROM buckets b
+		)
+		SELECT
+			EXTRACT(EPOCH FROM bucket_start)::bigint AS ts,
+			CAST(open_price  AS TEXT) AS o,
+			CAST(high_price  AS TEXT) AS h,
+			CAST(low_price   AS TEXT) AS l,
+			CAST(close_price AS TEXT) AS c,
+			CAST(volume_usd  AS TEXT) AS v
+		FROM agg
+		WHERE close_price IS NOT NULL
+		ORDER BY bucket_start ASC
+	`
+
+	rows, err := pool.Query(
+		ctx,
+		q,
+		pair.Token0,
+		pair.Token1,
+		address,
+		stableAddrs,
+		wzilAddr,
+		from,
+		to,
+		interval,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("getPairOHLCVV3 query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CandleDTO
+	for rows.Next() {
+		var c CandleDTO
+		if err := rows.Scan(
+			&c.Timestamp,
+			&c.Open,
+			&c.High,
+			&c.Low,
+			&c.Close,
+			&c.Volume,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
