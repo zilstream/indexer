@@ -61,6 +61,7 @@ type PairEventDTO struct {
 	Timestamp    int64   `json:"timestamp"`
 	Address      string  `json:"address"`
 	Sender       *string `json:"sender,omitempty"`
+	Maker        *string `json:"maker,omitempty"`
 	Recipient    *string `json:"recipient,omitempty"`
 	ToAddress    *string `json:"to_address,omitempty"`
 	Amount0In    *string `json:"amount0_in,omitempty"`
@@ -398,7 +399,8 @@ func ListEventsByAddress(ctx context.Context, pool *pgxpool.Pool, address string
 			t0.decimals AS token0_decimals,
 			COALESCE(pair.token1, pool.token1) AS token1_address,
 			t1.symbol AS token1_symbol,
-			t1.decimals AS token1_decimals
+			t1.decimals AS token1_decimals,
+			e.maker
 		FROM dex_pair_events e
 		LEFT JOIN uniswap_v2_pairs pair ON e.protocol = 'uniswap_v2' AND e.address = pair.address
 		LEFT JOIN uniswap_v3_pools pool ON e.protocol = 'uniswap_v3' AND e.address = pool.address
@@ -421,7 +423,7 @@ func ListEventsByAddress(ctx context.Context, pool *pgxpool.Pool, address string
 		var e PairEventDTO
 		if err := rows.Scan(&e.Protocol, &e.EventType, &e.ID, &e.TransactionHash, &e.LogIndex, &e.BlockNumber, &e.Timestamp,
 			&e.Address, &e.Sender, &e.Recipient, &e.ToAddress, &e.Amount0In, &e.Amount1In, &e.Amount0Out, &e.Amount1Out, &e.Liquidity, &e.AmountUSD,
-			&e.Token0Address, &e.Token0Symbol, &e.Token0Decimals, &e.Token1Address, &e.Token1Symbol, &e.Token1Decimals); err != nil {
+			&e.Token0Address, &e.Token0Symbol, &e.Token0Decimals, &e.Token1Address, &e.Token1Symbol, &e.Token1Decimals, &e.Maker); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -435,7 +437,7 @@ func ListPairEvents(ctx context.Context, pool *pgxpool.Pool, address string, eve
 		SELECT protocol, event_type, id, transaction_hash, log_index, block_number, timestamp,
 		       address, sender, recipient, to_address,
 		       CAST(amount0_in AS TEXT), CAST(amount1_in AS TEXT), CAST(amount0_out AS TEXT), CAST(amount1_out AS TEXT),
-		       CAST(liquidity AS TEXT), CAST(amount_usd AS TEXT)
+		       CAST(liquidity AS TEXT), CAST(amount_usd AS TEXT), maker
 		FROM dex_pair_events
 		WHERE address = $1
 		  AND ($2::text IS NULL OR event_type = $2)
@@ -453,7 +455,7 @@ func ListPairEvents(ctx context.Context, pool *pgxpool.Pool, address string, eve
 	for rows.Next() {
 		var e PairEventDTO
 		if err := rows.Scan(&e.Protocol, &e.EventType, &e.ID, &e.TransactionHash, &e.LogIndex, &e.BlockNumber, &e.Timestamp,
-			&e.Address, &e.Sender, &e.Recipient, &e.ToAddress, &e.Amount0In, &e.Amount1In, &e.Amount0Out, &e.Amount1Out, &e.Liquidity, &e.AmountUSD); err != nil {
+			&e.Address, &e.Sender, &e.Recipient, &e.ToAddress, &e.Amount0In, &e.Amount1In, &e.Amount0Out, &e.Amount1Out, &e.Liquidity, &e.AmountUSD, &e.Maker); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
