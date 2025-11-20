@@ -1295,14 +1295,14 @@ func getPairOHLCVV2(
 				(
 					SELECT price_usd
 					FROM price_points pp
-					WHERE pp.ts <= b.bucket_end
+					WHERE pp.ts <= b.bucket_end AND pp.price_usd IS NOT NULL
 					ORDER BY pp.ts DESC
 					LIMIT 1
 				) AS close_price,
 				(
 					SELECT price_usd
 					FROM price_points pp
-					WHERE pp.ts <= b.bucket_start
+					WHERE pp.ts <= b.bucket_start AND pp.price_usd IS NOT NULL
 					ORDER BY pp.ts DESC
 					LIMIT 1
 				) AS open_price,
@@ -1328,9 +1328,9 @@ func getPairOHLCVV2(
 		)
 		SELECT
 			EXTRACT(EPOCH FROM bucket_start)::bigint AS ts,
-			CAST(open_price  AS TEXT) AS o,
-			CAST(high_price  AS TEXT) AS h,
-			CAST(low_price   AS TEXT) AS l,
+			CAST(COALESCE(open_price, close_price) AS TEXT) AS o,
+			CAST(COALESCE(high_price, open_price, close_price) AS TEXT) AS h,
+			CAST(COALESCE(low_price, open_price, close_price)  AS TEXT) AS l,
 			CAST(close_price AS TEXT) AS c,
 			CAST(volume_usd  AS TEXT) AS v
 		FROM agg
@@ -1462,7 +1462,7 @@ func getPairOHLCVV3(
 				LIMIT 1
 			) z ON TRUE
 			WHERE s.pool = $3
-			  AND s.timestamp <= $7 AND s.timestamp >= $6 - 86400 -- Look back a bit for open price if needed
+			  AND s.timestamp <= $7 -- AND s.timestamp >= $6 - 86400 -- Look back a bit for open price if needed
 		),
 		agg AS (
 			SELECT
@@ -1503,9 +1503,9 @@ func getPairOHLCVV3(
 		)
 		SELECT
 			EXTRACT(EPOCH FROM bucket_start)::bigint AS ts,
-			CAST(open_price  AS TEXT) AS o,
-			CAST(high_price  AS TEXT) AS h,
-			CAST(low_price   AS TEXT) AS l,
+			CAST(COALESCE(open_price, close_price) AS TEXT) AS o,
+			CAST(COALESCE(high_price, open_price, close_price) AS TEXT) AS h,
+			CAST(COALESCE(low_price, open_price, close_price)  AS TEXT) AS l,
 			CAST(close_price AS TEXT) AS c,
 			CAST(volume_usd  AS TEXT) AS v
 		FROM agg
