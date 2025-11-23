@@ -318,6 +318,9 @@ func (i *Indexer) initializeModules(ctx context.Context) error {
 				continue
 			}
 			m.SetPriceProvider(priceProvider)
+			if i.publisher != nil {
+				m.SetPublisher(i.publisher)
+			}
 			module = m
 		default:
 			// Fallback: try v2

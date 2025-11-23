@@ -377,6 +377,29 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 			}
 		}
 	}
+
+	// Publish event
+	if module.publisher != nil {
+		payload := map[string]interface{}{
+			"id":               id,
+			"transaction_hash": event.TransactionHash.Hex(),
+			"log_index":        event.LogIndex,
+			"block_number":     event.BlockNumber,
+			"timestamp":        event.Timestamp.Int64(),
+			"address":          strings.ToLower(event.Address.Hex()),
+			"sender":           strings.ToLower(sender.Hex()),
+			"recipient":        strings.ToLower(recipient.Hex()),
+			"amount0":          func() string { if amount0 != nil { return amount0.String() }; return "0" }(),
+			"amount1":          func() string { if amount1 != nil { return amount1.String() }; return "0" }(),
+			"sqrt_price_x96":   func() string { if sqrtPriceX96 != nil { return sqrtPriceX96.String() }; return "0" }(),
+			"liquidity":        func() string { if liquidity != nil { return liquidity.String() }; return "0" }(),
+			"tick":             func() string { if tick != nil { return tick.String() }; return "0" }(),
+			"amount_usd":       usd,
+			"protocol":         "uniswap_v3",
+		}
+		module.publisher.PublishEvent(strings.ToLower(event.Address.Hex()), "swap", payload)
+	}
+
 	return nil
 }
 

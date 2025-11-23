@@ -85,6 +85,38 @@ func (p *Publisher) EnqueuePairChanged(address string) {
 	}
 }
 
+func (p *Publisher) PublishEvent(address string, eventType string, data interface{}) {
+	payload := map[string]any{
+		"type":       "pair.event",
+		"event_type": eventType,
+		"data":       data,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		p.logger.Warn().Err(err).Msg("Failed to marshal event payload")
+		return
+	}
+
+	channel := fmt.Sprintf("dex.pair.%s", strings.ToLower(address))
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		if _, err := p.gc.Publish(p.ctx, channel, payloadBytes); err != nil {
+			// Ignore errors if context is cancelled (shutting down)
+			if p.ctx.Err() != nil {
+				return
+			}
+			p.logger.Warn().
+				Err(err).
+				Str("pair", address).
+				Str("channel", channel).
+				Msg("Failed to publish pair event")
+		}
+	}()
+}
+
 func (p *Publisher) SetCurrentBlock(blockNumber uint64) {
 	p.mu.Lock()
 	p.currentBlock = blockNumber

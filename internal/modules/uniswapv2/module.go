@@ -52,6 +52,7 @@ config *Config
 // PairPublisher interface for realtime updates
 type PairPublisher interface {
 	EnqueuePairChanged(address string)
+	PublishEvent(address string, eventType string, data interface{})
 }
 
 // Config represents the module configuration

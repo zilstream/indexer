@@ -426,6 +426,27 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 		Str("sender", sender.Hex()).
 		Str("swap_id", swapID).
 		Msg("Swap processed")
+
+	// Publish event if publisher is available
+	if module.publisher != nil {
+		payload := map[string]interface{}{
+			"id":               swapID,
+			"transaction_hash": event.TransactionHash.Hex(),
+			"log_index":        event.LogIndex,
+			"block_number":     event.BlockNumber,
+			"timestamp":        event.Timestamp.Int64(),
+			"address":          pairAddr,
+			"sender":           strings.ToLower(sender.Hex()),
+			"recipient":        strings.ToLower(to.Hex()),
+			"amount0_in":       amount0In.String(),
+			"amount1_in":       amount1In.String(),
+			"amount0_out":      amount0Out.String(),
+			"amount1_out":      amount1Out.String(),
+			"amount_usd":       swapUSD,
+			"protocol":         "uniswap_v2",
+		}
+		module.publisher.PublishEvent(pairAddr, "swap", payload)
+	}
 	
 	return nil
 }

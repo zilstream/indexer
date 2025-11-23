@@ -46,8 +46,17 @@ type UniswapV3Module struct {
 	priceProvider prices.Provider
 	priceRouter   prices.TokenRouter
 
+	// Realtime publisher (optional)
+	publisher PairPublisher
+
 	// Cached config sets
 	stablecoinSet map[string]struct{}
+}
+
+// PairPublisher interface for realtime updates
+type PairPublisher interface {
+	EnqueuePairChanged(address string)
+	PublishEvent(address string, eventType string, data interface{})
 }
 
 // Config represents the module configuration
@@ -158,6 +167,10 @@ func (m *UniswapV3Module) SetRPCClient(client *ethclient.Client) { m.rpcClient =
 
 // SetPriceProvider injects the price provider
 func (m *UniswapV3Module) SetPriceProvider(p prices.Provider) { m.priceProvider = p }
+
+func (m *UniswapV3Module) SetPublisher(publisher PairPublisher) {
+	m.publisher = publisher
+}
 
 // internal: build stablecoin set from config
 func (m *UniswapV3Module) buildStablecoinSet() {
