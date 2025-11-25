@@ -1,6 +1,8 @@
 -- Migration 019: Add price_usd and price_eth to dex_pools view
 -- Price represents token0 priced in USD/ETH terms, derived from token prices
 
+DROP VIEW IF EXISTS dex_pools CASCADE;
+
 CREATE OR REPLACE VIEW dex_pools AS
 SELECT
     'uniswap_v2'::text               AS protocol,
