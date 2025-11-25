@@ -46,6 +46,8 @@ type PairDTO struct {
 	LiquidityUSD   *string `json:"liquidity_usd,omitempty"`
 	VolumeUSD      *string `json:"volume_usd,omitempty"`
 	VolumeUSD24h   *string `json:"volume_usd_24h,omitempty"`
+	PriceUSD       *string `json:"price_usd,omitempty"`
+	PriceETH       *string `json:"price_eth,omitempty"`
 	PriceChange24h *string `json:"price_change_24h"`
 	PriceChange7d  *string `json:"price_change_7d"`
 	TxnCount       *int64  `json:"txn_count,omitempty"`
@@ -235,7 +237,8 @@ func ListPairsByToken(ctx context.Context, pool *pgxpool.Pool, tokenAddress stri
 		SELECT protocol, address, token0, token1,
 		       token0_symbol, token0_name, token1_symbol, token1_name,
 		       CAST(fee AS TEXT), CAST(reserve0 AS TEXT), CAST(reserve1 AS TEXT), CAST(liquidity AS TEXT),
-		       CAST(liquidity_usd AS TEXT), CAST(volume_usd AS TEXT), CAST(volume_usd_24h AS TEXT), txn_count
+		       CAST(liquidity_usd AS TEXT), CAST(volume_usd AS TEXT), CAST(volume_usd_24h AS TEXT),
+		       CAST(price_usd AS TEXT), CAST(price_eth AS TEXT), txn_count
 		FROM dex_pools
 		WHERE (token0 = $1 OR token1 = $1)
 		  AND liquidity_usd > 0
@@ -251,10 +254,11 @@ func ListPairsByToken(ctx context.Context, pool *pgxpool.Pool, tokenAddress stri
 	var out []PairDTO
 	for rows.Next() {
 		var p PairDTO
-		if err := rows.Scan(&p.Protocol, &p.Address, &p.Token0, &p.Token1, 
-			&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name, 
-			&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity, 
-			&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.TxnCount); err != nil {
+		if err := rows.Scan(&p.Protocol, &p.Address, &p.Token0, &p.Token1,
+			&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name,
+			&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity,
+			&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h,
+			&p.PriceUSD, &p.PriceETH, &p.TxnCount); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -269,6 +273,7 @@ func GetPair(ctx context.Context, pool *pgxpool.Pool, address string) (*PairDTO,
 		       dp.token0_symbol, dp.token0_name, dp.token1_symbol, dp.token1_name,
 		       CAST(dp.fee AS TEXT), CAST(dp.reserve0 AS TEXT), CAST(dp.reserve1 AS TEXT), CAST(dp.liquidity AS TEXT),
 		       CAST(dp.liquidity_usd AS TEXT), CAST(dp.volume_usd AS TEXT), CAST(dp.volume_usd_24h AS TEXT),
+		       CAST(dp.price_usd AS TEXT), CAST(dp.price_eth AS TEXT),
 		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_24h AS TEXT) ELSE CAST(v3.price_change_24h AS TEXT) END,
 		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_7d AS TEXT) ELSE CAST(v3.price_change_7d AS TEXT) END,
 		       dp.txn_count
@@ -282,7 +287,8 @@ func GetPair(ctx context.Context, pool *pgxpool.Pool, address string) (*PairDTO,
 		&p.Protocol, &p.Address, &p.Token0, &p.Token1,
 		&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name,
 		&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity,
-		&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount)
+		&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h,
+		&p.PriceUSD, &p.PriceETH, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount)
 	if err != nil {
 		return nil, fmt.Errorf("GetPair query failed: %w", err)
 	}
@@ -299,6 +305,7 @@ func GetPairsByAddresses(ctx context.Context, pool *pgxpool.Pool, addresses []st
 		       dp.token0_symbol, dp.token0_name, dp.token1_symbol, dp.token1_name,
 		       CAST(dp.fee AS TEXT), CAST(dp.reserve0 AS TEXT), CAST(dp.reserve1 AS TEXT), CAST(dp.liquidity AS TEXT),
 		       CAST(dp.liquidity_usd AS TEXT), CAST(dp.volume_usd AS TEXT), CAST(dp.volume_usd_24h AS TEXT),
+		       CAST(dp.price_usd AS TEXT), CAST(dp.price_eth AS TEXT),
 		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_24h AS TEXT) ELSE CAST(v3.price_change_24h AS TEXT) END,
 		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_7d AS TEXT) ELSE CAST(v3.price_change_7d AS TEXT) END,
 		       dp.txn_count
@@ -320,7 +327,8 @@ func GetPairsByAddresses(ctx context.Context, pool *pgxpool.Pool, addresses []st
 			&p.Protocol, &p.Address, &p.Token0, &p.Token1,
 			&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name,
 			&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity,
-			&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount)
+			&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h,
+			&p.PriceUSD, &p.PriceETH, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount)
 		if err != nil {
 			return nil, fmt.Errorf("GetPairsByAddresses scan failed: %w", err)
 		}
@@ -358,6 +366,7 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 		       dp.token0_symbol, dp.token0_name, dp.token1_symbol, dp.token1_name,
 		       CAST(dp.fee AS TEXT), CAST(dp.reserve0 AS TEXT), CAST(dp.reserve1 AS TEXT), CAST(dp.liquidity AS TEXT),
 		       CAST(dp.liquidity_usd AS TEXT), CAST(dp.volume_usd AS TEXT), CAST(dp.volume_usd_24h AS TEXT),
+		       CAST(dp.price_usd AS TEXT), CAST(dp.price_eth AS TEXT),
 		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_24h AS TEXT) ELSE CAST(v3.price_change_24h AS TEXT) END,
 		       CASE WHEN dp.protocol = 'uniswap_v2' THEN CAST(v2.price_change_7d AS TEXT) ELSE CAST(v3.price_change_7d AS TEXT) END,
 		       dp.txn_count
@@ -377,7 +386,11 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 	var out []PairDTO
 	for rows.Next() {
 		var p PairDTO
-		if err := rows.Scan(&p.Protocol, &p.Address, &p.Token0, &p.Token1, &p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name, &p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity, &p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount); err != nil {
+		if err := rows.Scan(&p.Protocol, &p.Address, &p.Token0, &p.Token1,
+			&p.Token0Symbol, &p.Token0Name, &p.Token1Symbol, &p.Token1Name,
+			&p.Fee, &p.Reserve0, &p.Reserve1, &p.Liquidity,
+			&p.LiquidityUSD, &p.VolumeUSD, &p.VolumeUSD24h,
+			&p.PriceUSD, &p.PriceETH, &p.PriceChange24h, &p.PriceChange7d, &p.TxnCount); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
