@@ -81,11 +81,13 @@ type PairEventDTO struct {
 }
 
 type StatsDTO struct {
-	TotalPairs      int64  `json:"total_pairs"`
-	TotalTokens     int64  `json:"total_tokens"`
-	TotalLiquidity  string `json:"total_liquidity_usd"`
-	TotalVolume24h  string `json:"total_volume_usd_24h"`
-	TotalVolumeAll  string `json:"total_volume_usd_all"`
+	TotalPairs        int64   `json:"total_pairs"`
+	TotalTokens       int64   `json:"total_tokens"`
+	TotalLiquidity    string  `json:"total_liquidity_usd"`
+	TotalVolume24h    string  `json:"total_volume_usd_24h"`
+	TotalVolumeAll    string  `json:"total_volume_usd_all"`
+	ZilPriceUSD       *string `json:"zil_price_usd,omitempty"`
+	ZilPriceChange24h *string `json:"zil_price_change_24h,omitempty"`
 }
 
 type BlockDTO struct {
@@ -499,6 +501,31 @@ func GetStats(ctx context.Context, pool *pgxpool.Pool) (*StatsDTO, error) {
 	err = pool.QueryRow(ctx, tokenQ).Scan(&stats.TotalTokens)
 	if err != nil {
 		return nil, fmt.Errorf("GetStats tokens query failed: %w", err)
+	}
+
+	// Get current ZIL price and 24h change
+	zilQ := `
+		WITH current_price AS (
+			SELECT price FROM prices_zil_usd_minute ORDER BY ts DESC LIMIT 1
+		),
+		price_24h_ago AS (
+			SELECT price FROM prices_zil_usd_minute 
+			WHERE ts <= NOW() - INTERVAL '24 hours' 
+			ORDER BY ts DESC LIMIT 1
+		)
+		SELECT 
+			c.price::text,
+			CASE WHEN p.price > 0 
+				THEN to_char(((c.price - p.price) / p.price) * 100, 'FM990.99')
+				ELSE NULL 
+			END
+		FROM current_price c
+		LEFT JOIN price_24h_ago p ON true
+	`
+	var zilPrice, zilChange24h *string
+	if err := pool.QueryRow(ctx, zilQ).Scan(&zilPrice, &zilChange24h); err == nil {
+		stats.ZilPriceUSD = zilPrice
+		stats.ZilPriceChange24h = zilChange24h
 	}
 
 	return &stats, nil
