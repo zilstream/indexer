@@ -532,36 +532,76 @@ func handleSync(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 			if ts == 0 { ts = module.getBlockTimestamp(ctx, event.BlockNumber) }
 			if ts > 0 {
 				minTime := time.Unix(ts, 0).UTC()
-				// Prefer ZIL shortcut: approx 2 * zil_reserve * price
+				// ZIL pair: update reserve_usd and derive token prices from reserves
 				if strings.ToLower(t0) == zilAddr {
-					if price, ok := module.priceProvider.PriceZILUSD(ctx, minTime); ok {
+					if zilPrice, ok := module.priceProvider.PriceZILUSD(ctx, minTime); ok {
 						_, _ = module.db.Pool().Exec(ctx, `
 							UPDATE uniswap_v2_pairs
 							SET reserve_usd = ( ($2::numeric) / 1e18::numeric ) * 2 * $3::numeric
-							WHERE address = $1`, strings.ToLower(event.Address.Hex()), reserve0.String(), price)
-						// update ZIL token price with single update (price_eth=1 + market cap)
+							WHERE address = $1`, strings.ToLower(event.Address.Hex()), reserve0.String(), zilPrice)
+						// update ZIL token price (price_eth=1 + market cap)
 						_, _ = module.db.Pool().Exec(ctx, `
 							UPDATE tokens
 							SET price_usd = $2,
 							    price_eth = 1,
 							    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
 							    updated_at = NOW()
-							WHERE address = $1`, zilAddr, price)
+							WHERE address = $1`, zilAddr, zilPrice)
+						// Derive and update the non-ZIL token (t1) price from reserves
+						// price(t1 in ZIL) = reserve0 / reserve1, adjusted for decimals
+						if reserve1.Sign() > 0 {
+							dec0 := module.tokenDecimals(ctx, t0)
+							dec1 := module.tokenDecimals(ctx, t1)
+							tokenPriceInZil := divBigIntByPow10Str(reserve0, dec0)
+							tokenPriceInZil = divStr(tokenPriceInZil, divBigIntByPow10Str(reserve1, dec1))
+							if tokenPriceInZil != "" {
+								tokenPriceUSD := mulStr(tokenPriceInZil, zilPrice)
+								if tokenPriceUSD != "" {
+									_, _ = module.db.Pool().Exec(ctx, `
+										UPDATE tokens
+										SET price_usd = $2,
+										    price_eth = $3,
+										    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+										    updated_at = NOW()
+										WHERE address = $1`, strings.ToLower(t1), tokenPriceUSD, tokenPriceInZil)
+								}
+							}
+						}
 					}
 				} else if strings.ToLower(t1) == zilAddr {
-					if price, ok := module.priceProvider.PriceZILUSD(ctx, minTime); ok {
+					if zilPrice, ok := module.priceProvider.PriceZILUSD(ctx, minTime); ok {
 						_, _ = module.db.Pool().Exec(ctx, `
 							UPDATE uniswap_v2_pairs
 							SET reserve_usd = ( ($2::numeric) / 1e18::numeric ) * 2 * $3::numeric
-							WHERE address = $1`, strings.ToLower(event.Address.Hex()), reserve1.String(), price)
-						// update ZIL token price with single update (price_eth=1 + market cap)
+							WHERE address = $1`, strings.ToLower(event.Address.Hex()), reserve1.String(), zilPrice)
+						// update ZIL token price (price_eth=1 + market cap)
 						_, _ = module.db.Pool().Exec(ctx, `
 							UPDATE tokens
 							SET price_usd = $2,
 							    price_eth = 1,
 							    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
 							    updated_at = NOW()
-							WHERE address = $1`, zilAddr, price)
+							WHERE address = $1`, zilAddr, zilPrice)
+						// Derive and update the non-ZIL token (t0) price from reserves
+						// price(t0 in ZIL) = reserve1 / reserve0, adjusted for decimals
+						if reserve0.Sign() > 0 {
+							dec0 := module.tokenDecimals(ctx, t0)
+							dec1 := module.tokenDecimals(ctx, t1)
+							tokenPriceInZil := divBigIntByPow10Str(reserve1, dec1)
+							tokenPriceInZil = divStr(tokenPriceInZil, divBigIntByPow10Str(reserve0, dec0))
+							if tokenPriceInZil != "" {
+								tokenPriceUSD := mulStr(tokenPriceInZil, zilPrice)
+								if tokenPriceUSD != "" {
+									_, _ = module.db.Pool().Exec(ctx, `
+										UPDATE tokens
+										SET price_usd = $2,
+										    price_eth = $3,
+										    market_cap_usd = CASE WHEN $2 IS NULL OR total_supply IS NULL THEN NULL ELSE ((total_supply / POWER(10::numeric, COALESCE(decimals,18))) * $2) END,
+										    updated_at = NOW()
+										WHERE address = $1`, strings.ToLower(t0), tokenPriceUSD, tokenPriceInZil)
+								}
+							}
+						}
 					}
 				} else if module.priceRouter != nil {
 					// General case: sum(reserve0*price0 + reserve1*price1) in USD
@@ -656,6 +696,14 @@ func mulStr(a, b string) string {
 	x := new(big.Rat); if _, ok := x.SetString(a); !ok { return "" }
 	y := new(big.Rat); if _, ok := y.SetString(b); !ok { return "" }
 	x.Mul(x, y)
+	return x.FloatString(18)
+}
+
+func divStr(a, b string) string {
+	x := new(big.Rat); if _, ok := x.SetString(a); !ok { return "" }
+	y := new(big.Rat); if _, ok := y.SetString(b); !ok { return "" }
+	if y.Sign() == 0 { return "" }
+	x.Quo(x, y)
 	return x.FloatString(18)
 }
 

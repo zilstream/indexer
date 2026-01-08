@@ -98,21 +98,23 @@ func (r *DBRouter) v2SpotToUSD(ctx context.Context, token string, ts time.Time) 
 	}
 	// Require minimum reserves in the counter token (WZIL or stablecoin)
 	// This prevents deriving prices from dust pools
-	minReserve := "100000000000000000" // 0.1 tokens (in wei, 18 decimals)
+	// Calculate minimum reserve based on counter token's decimals (0.1 tokens)
+	d0 := r.getDecimals(ctx, t0)
+	d1 := r.getDecimals(ctx, t1)
 	if strings.ToLower(t0) == strings.ToLower(token) {
-		// token is t0, counter is t1 - check r1
+		// token is t0, counter is t1 - check r1 using t1's decimals
+		minReserve := minReserveForDecimals(d1)
 		if lessThan(r1.String, minReserve) {
 			return "", false
 		}
 	} else {
-		// token is t1, counter is t0 - check r0
+		// token is t1, counter is t0 - check r0 using t0's decimals
+		minReserve := minReserveForDecimals(d0)
 		if lessThan(r0.String, minReserve) {
 			return "", false
 		}
 	}
 	// Adjust by decimals: price(token0 in token1) = (r1/10^d1) / (r0/10^d0) = (r1/r0) * 10^(d0-d1)
-	d0 := r.getDecimals(ctx, t0)
-	d1 := r.getDecimals(ctx, t1)
 	if strings.ToLower(t0) == strings.ToLower(token) {
 		pBase, ok := divStrings(r1.String, r0.String)
 		if !ok { return "", false }
@@ -150,23 +152,24 @@ func (r *DBRouter) v3SpotToUSD(ctx context.Context, token string, ts time.Time) 
 		return "", false
 	}
 	if !sp.Valid || !r0.Valid || !r1.Valid { return "", false }
-	// Require minimum reserves in counter token
-	minReserve := "100000000000000000" // 0.1 tokens (18 decimals)
+	// Require minimum reserves in counter token using its decimals
+	dec0 := r.getDecimals(ctx, t0)
+	dec1 := r.getDecimals(ctx, t1)
 	if strings.ToLower(t0) == strings.ToLower(token) {
-		// token is t0, counter is t1 - check r1
+		// token is t0, counter is t1 - check r1 using t1's decimals
+		minReserve := minReserveForDecimals(dec1)
 		if lessThan(r1.String, minReserve) {
 			return "", false
 		}
 	} else {
-		// token is t1, counter is t0 - check r0
+		// token is t1, counter is t0 - check r0 using t0's decimals
+		minReserve := minReserveForDecimals(dec0)
 		if lessThan(r0.String, minReserve) {
 			return "", false
 		}
 	}
 	sqrtStr := sp.String
 	// Convert sqrt_price_x96 to price0 and price1 with decimals
-	dec0 := r.getDecimals(ctx, t0)
-	dec1 := r.getDecimals(ctx, t1)
 	price0, price1, ok := pricesFromSqrtX96(sqrtStr, dec0, dec1)
 	if !ok { return "", false }
 	if strings.ToLower(t0) == strings.ToLower(token) {
@@ -276,6 +279,18 @@ func lessThan(a, b string) bool {
 	y := new(big.Rat)
 	if _, ok := y.SetString(b); !ok { return false }
 	return x.Cmp(y) < 0
+}
+
+// minReserveForDecimals returns minimum reserve (0.1 tokens) as a string for the given decimals.
+// E.g., for 18 decimals: 0.1 * 10^18 = 100000000000000000
+// For 6 decimals: 0.1 * 10^6 = 100000
+func minReserveForDecimals(decimals int) string {
+	// 0.1 tokens = 10^(decimals-1)
+	if decimals <= 0 {
+		return "0"
+	}
+	pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals-1)), nil)
+	return pow.String()
 }
 
 // sanitizePrice rejects prices that are unreasonably high (likely due to low liquidity)
