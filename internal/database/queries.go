@@ -781,12 +781,6 @@ func GetEventLogsByTransaction(ctx context.Context, pool *pgxpool.Pool, hash str
 
 // GetPairPriceChart returns 42 price points (every 4h) over 7 days for a pair/pool
 func GetPairPriceChart(ctx context.Context, pool *pgxpool.Pool, address string) (*PriceChartDTO, error) {
-	// First, get pair info to determine protocol
-	pair, err := GetPair(ctx, pool, address)
-	if err != nil {
-		return nil, fmt.Errorf("pair not found: %w", err)
-	}
-
 	// Get WZIL address
 	wzilAddr, err := getWZILAddress(ctx, pool)
 	if err != nil {
@@ -799,14 +793,26 @@ func GetPairPriceChart(ctx context.Context, pool *pgxpool.Pool, address string) 
 		return nil, fmt.Errorf("failed to get stablecoin addresses: %w", err)
 	}
 
-	var points []PricePoint
-	var token0Symbol string
-	var token0Decimals int32
+	// Query RAW token order from the database (not normalized)
+	var protocol, rawToken0, rawToken1 string
+	err = pool.QueryRow(ctx, `
+		SELECT 'uniswap_v2', token0, token1 FROM uniswap_v2_pairs WHERE address = $1
+		UNION ALL
+		SELECT 'uniswap_v3', token0, token1 FROM uniswap_v3_pools WHERE address = $1
+		LIMIT 1
+	`, address).Scan(&protocol, &rawToken0, &rawToken1)
+	if err != nil {
+		return nil, fmt.Errorf("pair not found: %w", err)
+	}
 
-	if pair.Protocol == "uniswap_v2" {
-		points, token0Symbol, token0Decimals, err = getPriceChartV2(ctx, pool, address, pair.Token0, pair.Token1, wzilAddr, stableAddrs)
+	var points []PricePoint
+	var baseTokenAddr, baseTokenSymbol string
+	var baseTokenDecimals int32
+
+	if protocol == "uniswap_v2" {
+		points, baseTokenAddr, baseTokenSymbol, baseTokenDecimals, err = getPriceChartV2(ctx, pool, address, rawToken0, rawToken1, wzilAddr, stableAddrs)
 	} else {
-		points, token0Symbol, token0Decimals, err = getPriceChartV3(ctx, pool, address, pair.Token0, pair.Token1, wzilAddr, stableAddrs)
+		points, baseTokenAddr, baseTokenSymbol, baseTokenDecimals, err = getPriceChartV3(ctx, pool, address, rawToken0, rawToken1, wzilAddr, stableAddrs)
 	}
 	if err != nil {
 		return nil, err
@@ -814,11 +820,11 @@ func GetPairPriceChart(ctx context.Context, pool *pgxpool.Pool, address string) 
 
 	return &PriceChartDTO{
 		Address:   address,
-		Protocol:  pair.Protocol,
+		Protocol:  protocol,
 		BaseToken: TokenBaseDTO{
-			Address:  pair.Token0,
-			Symbol:   token0Symbol,
-			Decimals: token0Decimals,
+			Address:  baseTokenAddr,
+			Symbol:   baseTokenSymbol,
+			Decimals: baseTokenDecimals,
 		},
 		Quote:     "USD",
 		Timeframe: "7d",
@@ -854,18 +860,20 @@ func getStablecoinAddresses(ctx context.Context, pool *pgxpool.Pool) ([]string, 
 	return addrs, nil
 }
 
-func getPriceChartV2(ctx context.Context, pool *pgxpool.Pool, pairAddr, token0, token1, wzil string, stables []string) ([]PricePoint, string, int32, error) {
+func getPriceChartV2(ctx context.Context, pool *pgxpool.Pool, pairAddr, token0, token1, wzil string, stables []string) ([]PricePoint, string, string, int32, error) {
+	// V2 price chart with proper handling of all token pair combinations
+	// Returns the price of the "interesting" token (non-WZIL, non-stablecoin) over time
 	q := `
 	WITH meta AS (
-		SELECT 
+		SELECT
 			t0.address AS token0, t1.address AS token1,
-			t0.symbol AS symbol0, t0.decimals AS dec0,
-			t1.decimals AS dec1
+			t0.symbol AS symbol0, t1.symbol AS symbol1,
+			t0.decimals AS dec0, t1.decimals AS dec1
 		FROM tokens t0, tokens t1
 		WHERE t0.address = $1 AND t1.address = $2
 	),
 	aligned AS (
-		SELECT date_trunc('hour', now() AT TIME ZONE 'UTC') 
+		SELECT date_trunc('hour', now() AT TIME ZONE 'UTC')
 		     - make_interval(hours := (EXTRACT(hour FROM now() AT TIME ZONE 'UTC')::int % 4)) AS end_ts
 	),
 	buckets AS (
@@ -876,9 +884,9 @@ func getPriceChartV2(ctx context.Context, pool *pgxpool.Pool, pairAddr, token0, 
 		) AS ts
 	),
 	snaps AS (
-		SELECT 
+		SELECT
 			b.ts,
-			s.reserve0, 
+			s.reserve0,
 			s.reserve1
 		FROM buckets b
 		LEFT JOIN LATERAL (
@@ -891,23 +899,33 @@ func getPriceChartV2(ctx context.Context, pool *pgxpool.Pool, pairAddr, token0, 
 		) s ON TRUE
 	),
 	zil_prices AS (
-		SELECT 
+		SELECT
 			b.ts,
 			(SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= b.ts ORDER BY ts DESC LIMIT 1) AS zil_usd
 		FROM buckets b
 	)
-	SELECT 
+	SELECT
 		to_char(b.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
 		ROUND(
 			(CASE
+				-- token0=WZIL, token1=stablecoin → show stablecoin price = (1/rate) * zil
+				WHEN LOWER($5) = LOWER(m.token0) AND LOWER(m.token1) = ANY($4::text[]) THEN
+					((s.reserve0::numeric / POWER(10, m.dec0)) / NULLIF(s.reserve1::numeric / POWER(10, m.dec1), 0)) * z.zil_usd
+				-- token0=WZIL → show token1 price = (1/rate) * zil
+				WHEN LOWER($5) = LOWER(m.token0) THEN
+					((s.reserve0::numeric / POWER(10, m.dec0)) / NULLIF(s.reserve1::numeric / POWER(10, m.dec1), 0)) * z.zil_usd
+				-- token0=stablecoin, token1=WZIL → show WZIL price = zil
+				WHEN LOWER(m.token0) = ANY($4::text[]) AND LOWER($5) = LOWER(m.token1) THEN
+					z.zil_usd
+				-- token0=stablecoin → show token1 price (via stablecoin)
+				WHEN LOWER(m.token0) = ANY($4::text[]) THEN
+					((s.reserve0::numeric / POWER(10, m.dec0)) / NULLIF(s.reserve1::numeric / POWER(10, m.dec1), 0))
+				-- token1=WZIL → show token0 price = rate * zil
 				WHEN LOWER($5) = LOWER(m.token1) THEN
 					((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
-				WHEN LOWER($5) = LOWER(m.token0) THEN
-					z.zil_usd
+				-- token1=stablecoin → show token0 price = rate * stablecoin
 				WHEN LOWER(m.token1) = ANY($4::text[]) THEN
 					((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0))
-				WHEN LOWER(m.token0) = ANY($4::text[]) THEN
-					1
 				ELSE NULL
 			END)::numeric, 8
 		)::text AS price,
@@ -916,8 +934,19 @@ func getPriceChartV2(ctx context.Context, pool *pgxpool.Pool, pairAddr, token0, 
 			WHEN LOWER(m.token1) = ANY($4::text[]) OR LOWER(m.token0) = ANY($4::text[]) THEN 'stable'
 			ELSE 'none'
 		END AS source,
-		m.symbol0,
-		m.dec0
+		-- Return the "interesting" token info (non-WZIL, non-stablecoin)
+		CASE
+			WHEN LOWER($5) = LOWER(m.token0) OR LOWER(m.token0) = ANY($4::text[]) THEN m.token1
+			ELSE m.token0
+		END AS base_addr,
+		CASE
+			WHEN LOWER($5) = LOWER(m.token0) OR LOWER(m.token0) = ANY($4::text[]) THEN m.symbol1
+			ELSE m.symbol0
+		END AS base_symbol,
+		CASE
+			WHEN LOWER($5) = LOWER(m.token0) OR LOWER(m.token0) = ANY($4::text[]) THEN m.dec1
+			ELSE m.dec0
+		END AS base_dec
 	FROM buckets b
 	CROSS JOIN meta m
 	LEFT JOIN snaps s ON s.ts = b.ts
@@ -926,36 +955,38 @@ func getPriceChartV2(ctx context.Context, pool *pgxpool.Pool, pairAddr, token0, 
 
 	rows, err := pool.Query(ctx, q, token0, token1, pairAddr, stables, wzil)
 	if err != nil {
-		return nil, "", 0, fmt.Errorf("V2 price chart query failed: %w", err)
+		return nil, "", "", 0, fmt.Errorf("V2 price chart query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var points []PricePoint
-	var symbol string
-	var decimals int32
+	var baseAddr, baseSymbol string
+	var baseDecimals int32
 	for rows.Next() {
 		var p PricePoint
-		if err := rows.Scan(&p.Timestamp, &p.Price, &p.Source, &symbol, &decimals); err != nil {
-			return nil, "", 0, err
+		if err := rows.Scan(&p.Timestamp, &p.Price, &p.Source, &baseAddr, &baseSymbol, &baseDecimals); err != nil {
+			return nil, "", "", 0, err
 		}
 		points = append(points, p)
 	}
 
-	return points, symbol, decimals, nil
+	return points, baseAddr, baseSymbol, baseDecimals, nil
 }
 
-func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, token1, wzil string, stables []string) ([]PricePoint, string, int32, error) {
+func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, token1, wzil string, stables []string) ([]PricePoint, string, string, int32, error) {
+	// V3 price chart with proper handling of all token pair combinations
+	// rate = (sqrt_price_x96^2 / 2^192) / 10^(dec1-dec0) = token0 price in token1
 	q := `
 	WITH meta AS (
-		SELECT 
+		SELECT
 			t0.address AS token0, t1.address AS token1,
-			t0.symbol AS symbol0, t0.decimals AS dec0,
-			t1.decimals AS dec1
+			t0.symbol AS symbol0, t1.symbol AS symbol1,
+			t0.decimals AS dec0, t1.decimals AS dec1
 		FROM tokens t0, tokens t1
 		WHERE t0.address = $1 AND t1.address = $2
 	),
 	aligned AS (
-		SELECT date_trunc('hour', now() AT TIME ZONE 'UTC') 
+		SELECT date_trunc('hour', now() AT TIME ZONE 'UTC')
 		     - make_interval(hours := (EXTRACT(hour FROM now() AT TIME ZONE 'UTC')::int % 4)) AS end_ts
 	),
 	buckets AS (
@@ -966,7 +997,7 @@ func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, 
 		) AS ts
 	),
 	snaps AS (
-		SELECT 
+		SELECT
 			b.ts,
 			s.sqrt_price_x96
 		FROM buckets b
@@ -980,26 +1011,39 @@ func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, 
 		) s ON TRUE
 	),
 	zil_prices AS (
-		SELECT 
+		SELECT
 			b.ts,
 			(SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= b.ts ORDER BY ts DESC LIMIT 1) AS zil_usd
 		FROM buckets b
 	)
-	SELECT 
+	SELECT
 		to_char(b.ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS timestamp,
 		ROUND(
 			(CASE
 				WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 OR s.sqrt_price_x96 < 1000000 OR s.sqrt_price_x96 > 1e38 THEN NULL
-				WHEN LOWER($5) = LOWER(m.token1) THEN
-					(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
-					/ POWER(10::numeric, m.dec0 - m.dec1) * z.zil_usd
+				-- token0=WZIL, token1=stablecoin → show stablecoin price = (1/rate) * zil
+				WHEN LOWER($5) = LOWER(m.token0) AND LOWER(m.token1) = ANY($4::text[]) THEN
+					(1.0 / NULLIF((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+					 POWER(10::numeric, m.dec1 - m.dec0), 0)) * z.zil_usd
+				-- token0=WZIL → show token1 price = (1/rate) * zil
 				WHEN LOWER($5) = LOWER(m.token0) THEN
+					(1.0 / NULLIF((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+					 POWER(10::numeric, m.dec1 - m.dec0), 0)) * z.zil_usd
+				-- token0=stablecoin, token1=WZIL → show WZIL price = zil
+				WHEN LOWER(m.token0) = ANY($4::text[]) AND LOWER($5) = LOWER(m.token1) THEN
 					z.zil_usd
-				WHEN LOWER(m.token1) = ANY($4::text[]) THEN
-					(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
-					/ POWER(10::numeric, m.dec0 - m.dec1)
+				-- token0=stablecoin → show token1 price (via stablecoin)
 				WHEN LOWER(m.token0) = ANY($4::text[]) THEN
-					1
+					(1.0 / NULLIF((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+					 POWER(10::numeric, m.dec1 - m.dec0), 0))
+				-- token1=WZIL → show token0 price = rate * zil
+				WHEN LOWER($5) = LOWER(m.token1) THEN
+					((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+					 POWER(10::numeric, m.dec1 - m.dec0)) * z.zil_usd
+				-- token1=stablecoin → show token0 price = rate * stablecoin
+				WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+					((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+					 POWER(10::numeric, m.dec1 - m.dec0))
 				ELSE NULL
 			END)::numeric, 8
 		)::text AS price,
@@ -1008,8 +1052,19 @@ func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, 
 			WHEN LOWER(m.token1) = ANY($4::text[]) OR LOWER(m.token0) = ANY($4::text[]) THEN 'stable'
 			ELSE 'none'
 		END AS source,
-		m.symbol0,
-		m.dec0
+		-- Return the "interesting" token info (non-WZIL, non-stablecoin)
+		CASE
+			WHEN LOWER($5) = LOWER(m.token0) OR LOWER(m.token0) = ANY($4::text[]) THEN m.token1
+			ELSE m.token0
+		END AS base_addr,
+		CASE
+			WHEN LOWER($5) = LOWER(m.token0) OR LOWER(m.token0) = ANY($4::text[]) THEN m.symbol1
+			ELSE m.symbol0
+		END AS base_symbol,
+		CASE
+			WHEN LOWER($5) = LOWER(m.token0) OR LOWER(m.token0) = ANY($4::text[]) THEN m.dec1
+			ELSE m.dec0
+		END AS base_dec
 	FROM buckets b
 	CROSS JOIN meta m
 	LEFT JOIN snaps s ON s.ts = b.ts
@@ -1018,22 +1073,22 @@ func getPriceChartV3(ctx context.Context, pool *pgxpool.Pool, poolAddr, token0, 
 
 	rows, err := pool.Query(ctx, q, token0, token1, poolAddr, stables, wzil)
 	if err != nil {
-		return nil, "", 0, fmt.Errorf("V3 price chart query failed: %w", err)
+		return nil, "", "", 0, fmt.Errorf("V3 price chart query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var points []PricePoint
-	var symbol string
-	var decimals int32
+	var baseAddr, baseSymbol string
+	var baseDecimals int32
 	for rows.Next() {
 		var p PricePoint
-		if err := rows.Scan(&p.Timestamp, &p.Price, &p.Source, &symbol, &decimals); err != nil {
-			return nil, "", 0, err
+		if err := rows.Scan(&p.Timestamp, &p.Price, &p.Source, &baseAddr, &baseSymbol, &baseDecimals); err != nil {
+			return nil, "", "", 0, err
 		}
 		points = append(points, p)
 	}
 
-	return points, symbol, decimals, nil
+	return points, baseAddr, baseSymbol, baseDecimals, nil
 }
 
 // GetTokenPriceChart returns a weighted price chart for a token aggregated from all pairs
@@ -1071,6 +1126,8 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 			dp.address AS pool,
 			dp.token0, dp.token1,
 			t0.decimals AS dec0, t1.decimals AS dec1,
+			COALESCE(t0.price_usd, 1) AS price0,
+			COALESCE(t1.price_usd, 1) AS price1,
 			(COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0))::numeric AS w,
 			(lower(dp.token0) = lower($1)) AS is_target0,
 			CASE
@@ -1111,18 +1168,26 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 					CASE
 						WHEN p.is_target0 THEN
 							CASE p.anchor
+								-- target=token0, anchor=WZIL in token1 → rate * zil_usd
 								WHEN 'wzil1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * z.zil_usd
+								-- target=token0=WZIL → zil_usd
 								WHEN 'wzil0' THEN z.zil_usd
-								WHEN 'stable1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0))
-								WHEN 'stable0' THEN 1::numeric
+								-- target=token0, anchor=stablecoin in token1 → rate * stablecoin_price
+								WHEN 'stable1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * p.price1
+								-- target=token0=stablecoin → use its known price
+								WHEN 'stable0' THEN p.price0
 								ELSE NULL
 							END
 						ELSE
 							CASE p.anchor
+								-- target=token1, anchor=WZIL in token0 → (1/rate) * zil_usd
 								WHEN 'wzil0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * z.zil_usd
+								-- target=token1=WZIL → zil_usd
 								WHEN 'wzil1' THEN z.zil_usd
-								WHEN 'stable0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0))
-								WHEN 'stable1' THEN 1::numeric
+								-- target=token1, anchor=stablecoin in token0 → (1/rate) * stablecoin_price
+								WHEN 'stable0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * p.price0
+								-- target=token1=stablecoin → use its known price
+								WHEN 'stable1' THEN p.price1
 								ELSE NULL
 							END
 					END
@@ -1150,18 +1215,27 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 					CASE
 						WHEN p.is_target0 THEN
 							CASE p.anchor
-								WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec0 - p.dec1)) * z.zil_usd
+								-- target=token0, anchor=WZIL in token1 → rate * zil_usd
+								-- V3 rate = (sqrt^2/2^192) / 10^(dec1-dec0) = token0 price in token1
+								WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec1 - p.dec0)) * z.zil_usd
+								-- target=token0=WZIL → zil_usd
 								WHEN 'wzil0' THEN z.zil_usd
-								WHEN 'stable1' THEN (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec0 - p.dec1)
-								WHEN 'stable0' THEN 1::numeric
+								-- target=token0, anchor=stablecoin in token1 → rate * stablecoin_price
+								WHEN 'stable1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec1 - p.dec0)) * p.price1
+								-- target=token0=stablecoin → use its known price
+								WHEN 'stable0' THEN p.price0
 								ELSE NULL
 							END
 						ELSE
 							CASE p.anchor
-								WHEN 'wzil0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec0 - p.dec1)),0)) * z.zil_usd
+								-- target=token1, anchor=WZIL in token0 → (1/rate) * zil_usd
+								WHEN 'wzil0' THEN (1.0 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec1 - p.dec0)),0)) * z.zil_usd
+								-- target=token1=WZIL → zil_usd
 								WHEN 'wzil1' THEN z.zil_usd
-								WHEN 'stable0' THEN 1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec0 - p.dec1)),0)
-								WHEN 'stable1' THEN 1::numeric
+								-- target=token1, anchor=stablecoin in token0 → (1/rate) * stablecoin_price
+								WHEN 'stable0' THEN (1.0 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec1 - p.dec0)),0)) * p.price0
+								-- target=token1=stablecoin → use its known price
+								WHEN 'stable1' THEN p.price1
 								ELSE NULL
 							END
 					END
@@ -1245,26 +1319,32 @@ func GetPairOHLCV(
 	from, to int64,
 	interval string, // e.g. "1 minute", "5 minutes", "1 day"
 ) ([]CandleDTO, error) {
-	// Lookup pair to get protocol, token0, token1
-	pair, err := GetPair(ctx, pool, address)
+	// Query RAW token order from the database (not normalized)
+	var protocol, rawToken0, rawToken1 string
+	err := pool.QueryRow(ctx, `
+		SELECT 'uniswap_v2', token0, token1 FROM uniswap_v2_pairs WHERE address = $1
+		UNION ALL
+		SELECT 'uniswap_v3', token0, token1 FROM uniswap_v3_pools WHERE address = $1
+		LIMIT 1
+	`, address).Scan(&protocol, &rawToken0, &rawToken1)
 	if err != nil {
 		return nil, fmt.Errorf("pair not found: %w", err)
 	}
-	if pair.Protocol == "uniswap_v2" {
-		return getPairOHLCVV2(ctx, pool, pair, address, from, to, interval)
+
+	if protocol == "uniswap_v2" {
+		return getPairOHLCVV2(ctx, pool, rawToken0, rawToken1, address, from, to, interval)
 	}
-	return getPairOHLCVV3(ctx, pool, pair, address, from, to, interval)
+	return getPairOHLCVV3(ctx, pool, rawToken0, rawToken1, address, from, to, interval)
 }
 
 func getPairOHLCVV2(
 	ctx context.Context,
 	pool *pgxpool.Pool,
-	pair *PairDTO,
+	token0, token1 string,
 	address string,
 	from, to int64,
 	interval string,
 ) ([]CandleDTO, error) {
-	// Reuse helpers already defined in queries.go
 	wzilAddr, err := getWZILAddress(ctx, pool)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get WZIL address: %w", err)
@@ -1274,10 +1354,11 @@ func getPairOHLCVV2(
 		return nil, fmt.Errorf("failed to get stablecoin addresses: %w", err)
 	}
 
+	// V2 OHLCV with proper price calculation matching dex_pools view
 	q := `
 		WITH meta AS (
-			SELECT 
-				t0.address  AS token0, 
+			SELECT
+				t0.address  AS token0,
 				t1.address  AS token1,
 				t0.decimals AS dec0,
 				t1.decimals AS dec1
@@ -1304,16 +1385,24 @@ func getPairOHLCVV2(
 			SELECT
 				to_timestamp(s.timestamp) AT TIME ZONE 'UTC' AS ts,
 				CASE
-					WHEN LOWER($5) = LOWER(m.token1) THEN
-						((s.reserve1::numeric / POWER(10, m.dec1))
-						 / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
+					-- token0=WZIL, token1=stablecoin → show stablecoin price
+					WHEN LOWER($5) = LOWER(m.token0) AND LOWER(m.token1) = ANY($4::text[]) THEN
+						((s.reserve0::numeric / POWER(10, m.dec0)) / NULLIF(s.reserve1::numeric / POWER(10, m.dec1), 0)) * z.zil_usd
+					-- token0=WZIL → show token1 price
 					WHEN LOWER($5) = LOWER(m.token0) THEN
+						((s.reserve0::numeric / POWER(10, m.dec0)) / NULLIF(s.reserve1::numeric / POWER(10, m.dec1), 0)) * z.zil_usd
+					-- token0=stablecoin, token1=WZIL → show WZIL price
+					WHEN LOWER(m.token0) = ANY($4::text[]) AND LOWER($5) = LOWER(m.token1) THEN
 						z.zil_usd
-					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
-						(s.reserve1::numeric / POWER(10, m.dec1))
-						/ NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)
+					-- token0=stablecoin → show token1 price
 					WHEN LOWER(m.token0) = ANY($4::text[]) THEN
-						1
+						((s.reserve0::numeric / POWER(10, m.dec0)) / NULLIF(s.reserve1::numeric / POWER(10, m.dec1), 0))
+					-- token1=WZIL → show token0 price
+					WHEN LOWER($5) = LOWER(m.token1) THEN
+						((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
+					-- token1=stablecoin → show token0 price
+					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+						((s.reserve1::numeric / POWER(10, m.dec1)) / NULLIF(s.reserve0::numeric / POWER(10, m.dec0), 0))
 					ELSE NULL
 				END AS price_usd
 			FROM uniswap_v2_syncs s
@@ -1331,41 +1420,8 @@ func getPairOHLCVV2(
 		swap_points AS (
 			SELECT
 				to_timestamp(sw.timestamp) AT TIME ZONE 'UTC' AS ts,
-				(
-					(COALESCE(sw.amount0_in, 0)::numeric +
-					 COALESCE(sw.amount0_out, 0)::numeric)
-					/ POWER(10, m.dec0)
-				) *
-				CASE
-					WHEN LOWER($5) = LOWER(m.token1) THEN
-						((sy.reserve1::numeric / POWER(10, m.dec1))
-						 / NULLIF(sy.reserve0::numeric / POWER(10, m.dec0), 0)) * z.zil_usd
-					WHEN LOWER($5) = LOWER(m.token0) THEN
-						z.zil_usd
-					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
-						(sy.reserve1::numeric / POWER(10, m.dec1))
-						/ NULLIF(sy.reserve0::numeric / POWER(10, m.dec0), 0)
-					WHEN LOWER(m.token0) = ANY($4::text[]) THEN
-						1
-					ELSE NULL
-				END AS volume_usd
+				ABS(sw.amount_usd) AS volume_usd
 			FROM uniswap_v2_swaps sw
-			CROSS JOIN meta m
-			LEFT JOIN LATERAL (
-				SELECT reserve0, reserve1
-				FROM uniswap_v2_syncs s2
-				WHERE s2.pair = $3
-				  AND s2.timestamp <= sw.timestamp
-				ORDER BY s2.timestamp DESC
-				LIMIT 1
-			) sy ON TRUE
-			LEFT JOIN LATERAL (
-				SELECT price::numeric AS zil_usd
-				FROM prices_zil_usd_minute p
-				WHERE p.ts <= to_timestamp(sw.timestamp) AT TIME ZONE 'UTC'
-				ORDER BY p.ts DESC
-				LIMIT 1
-			) z ON TRUE
 			WHERE sw.pair = $3
 			  AND sw.timestamp >= $6
 			  AND sw.timestamp <= $7
@@ -1422,8 +1478,8 @@ func getPairOHLCVV2(
 	rows, err := pool.Query(
 		ctx,
 		q,
-		pair.Token0,
-		pair.Token1,
+		token0,
+		token1,
 		address,
 		stableAddrs,
 		wzilAddr,
@@ -1460,7 +1516,7 @@ func getPairOHLCVV2(
 func getPairOHLCVV3(
 	ctx context.Context,
 	pool *pgxpool.Pool,
-	pair *PairDTO,
+	token0, token1 string,
 	address string,
 	from, to int64,
 	interval string,
@@ -1474,10 +1530,12 @@ func getPairOHLCVV3(
 		return nil, fmt.Errorf("failed to get stablecoin addresses: %w", err)
 	}
 
+	// V3 OHLCV with proper price calculation matching dex_pools view
+	// V3 rate = (sqrt_price_x96^2 / 2^192) / 10^(dec1-dec0) = token0 price in token1 (human units)
 	q := `
 		WITH meta AS (
-			SELECT 
-				t0.address  AS token0, 
+			SELECT
+				t0.address  AS token0,
 				t1.address  AS token1,
 				t0.decimals AS dec0,
 				t1.decimals AS dec1
@@ -1505,34 +1563,32 @@ func getPairOHLCVV3(
 				to_timestamp(s.timestamp) AT TIME ZONE 'UTC' AS ts,
 				CASE
 					WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
-					WHEN LOWER($5) = LOWER(m.token1) THEN
-						((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
-						/ POWER(10::numeric, m.dec0 - m.dec1)) * z.zil_usd
+					-- token0=WZIL, token1=stablecoin → show stablecoin price = (1/rate) * zil_price
+					WHEN LOWER($5) = LOWER(m.token0) AND LOWER(m.token1) = ANY($4::text[]) THEN
+						(1.0 / NULLIF((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+						 POWER(10::numeric, m.dec1 - m.dec0), 0)) * z.zil_usd
+					-- token0=WZIL → show token1 price = (1/rate) * zil_price
 					WHEN LOWER($5) = LOWER(m.token0) THEN
+						(1.0 / NULLIF((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+						 POWER(10::numeric, m.dec1 - m.dec0), 0)) * z.zil_usd
+					-- token0=stablecoin, token1=WZIL → show WZIL price
+					WHEN LOWER(m.token0) = ANY($4::text[]) AND LOWER($5) = LOWER(m.token1) THEN
 						z.zil_usd
-					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
-						(POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
-						/ POWER(10::numeric, m.dec0 - m.dec1)
+					-- token0=stablecoin → show token1 price = (1/rate) * stablecoin_price (assumed ~1)
 					WHEN LOWER(m.token0) = ANY($4::text[]) THEN
-						1
+						(1.0 / NULLIF((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+						 POWER(10::numeric, m.dec1 - m.dec0), 0))
+					-- token1=WZIL → show token0 price = rate * zil_price
+					WHEN LOWER($5) = LOWER(m.token1) THEN
+						((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+						 POWER(10::numeric, m.dec1 - m.dec0)) * z.zil_usd
+					-- token1=stablecoin → show token0 price = rate * stablecoin_price (assumed ~1)
+					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
+						((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) /
+						 POWER(10::numeric, m.dec1 - m.dec0))
 					ELSE NULL
 				END AS price_usd,
-				CASE
-					WHEN s.sqrt_price_x96 IS NULL OR s.sqrt_price_x96 = 0 THEN NULL
-					WHEN LOWER($5) = LOWER(m.token1) THEN
-						(ABS(s.amount0::numeric) / POWER(10::numeric, m.dec0)) * 
-						(((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
-						/ POWER(10::numeric, m.dec0 - m.dec1)) * z.zil_usd)
-					WHEN LOWER($5) = LOWER(m.token0) THEN
-						(ABS(s.amount0::numeric) / POWER(10::numeric, m.dec0)) * z.zil_usd
-					WHEN LOWER(m.token1) = ANY($4::text[]) THEN
-						(ABS(s.amount0::numeric) / POWER(10::numeric, m.dec0)) * 
-						((POWER(s.sqrt_price_x96::numeric, 2) / POWER(2::numeric, 192)) 
-						/ POWER(10::numeric, m.dec0 - m.dec1))
-					WHEN LOWER(m.token0) = ANY($4::text[]) THEN
-						(ABS(s.amount0::numeric) / POWER(10::numeric, m.dec0)) * 1
-					ELSE NULL
-				END AS volume_usd
+				ABS(s.amount_usd) AS volume_usd
 			FROM uniswap_v3_swaps s
 			CROSS JOIN meta m
 			LEFT JOIN LATERAL (
@@ -1543,7 +1599,7 @@ func getPairOHLCVV3(
 				LIMIT 1
 			) z ON TRUE
 			WHERE s.pool = $3
-			  AND s.timestamp <= $7 -- AND s.timestamp >= $6 - 86400 -- Look back a bit for open price if needed
+			  AND s.timestamp <= $7
 		),
 		agg AS (
 			SELECT
@@ -1597,8 +1653,8 @@ func getPairOHLCVV3(
 	rows, err := pool.Query(
 		ctx,
 		q,
-		pair.Token0,
-		pair.Token1,
+		token0,
+		token1,
 		address,
 		stableAddrs,
 		wzilAddr,
