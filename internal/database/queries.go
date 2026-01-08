@@ -113,9 +113,15 @@ type PairEventDTO struct {
 	Token0Address  *string `json:"token0_address,omitempty"`
 	Token0Symbol   *string `json:"token0_symbol,omitempty"`
 	Token0Decimals *int32  `json:"token0_decimals,omitempty"`
-	Token1Address  *string `json:"token1_address,omitempty"`
-	Token1Symbol   *string `json:"token1_symbol,omitempty"`
-	Token1Decimals *int32  `json:"token1_decimals,omitempty"`
+	Token1Address    *string `json:"token1_address,omitempty"`
+	Token1Symbol     *string `json:"token1_symbol,omitempty"`
+	Token1Decimals   *int32  `json:"token1_decimals,omitempty"`
+	TokenInAddress   *string `json:"token_in_address,omitempty"`
+	TokenInSymbol    *string `json:"token_in_symbol,omitempty"`
+	TokenInDecimals  *int32  `json:"token_in_decimals,omitempty"`
+	TokenOutAddress  *string `json:"token_out_address,omitempty"`
+	TokenOutSymbol   *string `json:"token_out_symbol,omitempty"`
+	TokenOutDecimals *int32  `json:"token_out_decimals,omitempty"`
 }
 
 type StatsDTO struct {
@@ -442,10 +448,10 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 // ListEventsByAddress returns all DEX events where address is sender, recipient, or to_address
 func ListEventsByAddress(ctx context.Context, pool *pgxpool.Pool, address string, eventType *string, protocol *string, limit, offset int) ([]PairEventDTO, error) {
 	q := `
-		SELECT 
+		SELECT
 			e.protocol, e.event_type, e.id, e.transaction_hash, e.log_index, e.block_number, e.timestamp,
 			e.address, e.sender, e.recipient, e.to_address,
-			CAST(e.amount0_in AS TEXT), CAST(e.amount1_in AS TEXT), 
+			CAST(e.amount0_in AS TEXT), CAST(e.amount1_in AS TEXT),
 			CAST(e.amount0_out AS TEXT), CAST(e.amount1_out AS TEXT),
 			CAST(e.liquidity AS TEXT), CAST(e.amount_usd AS TEXT),
 			COALESCE(pair.token0, pool.token0) AS token0_address,
@@ -454,7 +460,39 @@ func ListEventsByAddress(ctx context.Context, pool *pgxpool.Pool, address string
 			COALESCE(pair.token1, pool.token1) AS token1_address,
 			t1.symbol AS token1_symbol,
 			t1.decimals AS token1_decimals,
-			e.maker
+			e.maker,
+			-- token_in: the token being sold (where amount_in > 0)
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_in > 0 THEN COALESCE(pair.token0, pool.token0)
+				WHEN e.event_type = 'swap' AND e.amount1_in > 0 THEN COALESCE(pair.token1, pool.token1)
+				ELSE NULL
+			END AS token_in_address,
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_in > 0 THEN t0.symbol
+				WHEN e.event_type = 'swap' AND e.amount1_in > 0 THEN t1.symbol
+				ELSE NULL
+			END AS token_in_symbol,
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_in > 0 THEN t0.decimals
+				WHEN e.event_type = 'swap' AND e.amount1_in > 0 THEN t1.decimals
+				ELSE NULL
+			END AS token_in_decimals,
+			-- token_out: the token being bought (where amount_out > 0)
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_out > 0 THEN COALESCE(pair.token0, pool.token0)
+				WHEN e.event_type = 'swap' AND e.amount1_out > 0 THEN COALESCE(pair.token1, pool.token1)
+				ELSE NULL
+			END AS token_out_address,
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_out > 0 THEN t0.symbol
+				WHEN e.event_type = 'swap' AND e.amount1_out > 0 THEN t1.symbol
+				ELSE NULL
+			END AS token_out_symbol,
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_out > 0 THEN t0.decimals
+				WHEN e.event_type = 'swap' AND e.amount1_out > 0 THEN t1.decimals
+				ELSE NULL
+			END AS token_out_decimals
 		FROM dex_pair_events e
 		LEFT JOIN uniswap_v2_pairs pair ON e.protocol = 'uniswap_v2' AND e.address = pair.address
 		LEFT JOIN uniswap_v3_pools pool ON e.protocol = 'uniswap_v3' AND e.address = pool.address
@@ -477,7 +515,8 @@ func ListEventsByAddress(ctx context.Context, pool *pgxpool.Pool, address string
 		var e PairEventDTO
 		if err := rows.Scan(&e.Protocol, &e.EventType, &e.ID, &e.TransactionHash, &e.LogIndex, &e.BlockNumber, &e.Timestamp,
 			&e.Address, &e.Sender, &e.Recipient, &e.ToAddress, &e.Amount0In, &e.Amount1In, &e.Amount0Out, &e.Amount1Out, &e.Liquidity, &e.AmountUSD,
-			&e.Token0Address, &e.Token0Symbol, &e.Token0Decimals, &e.Token1Address, &e.Token1Symbol, &e.Token1Decimals, &e.Maker); err != nil {
+			&e.Token0Address, &e.Token0Symbol, &e.Token0Decimals, &e.Token1Address, &e.Token1Symbol, &e.Token1Decimals, &e.Maker,
+			&e.TokenInAddress, &e.TokenInSymbol, &e.TokenInDecimals, &e.TokenOutAddress, &e.TokenOutSymbol, &e.TokenOutDecimals); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -488,15 +527,53 @@ func ListEventsByAddress(ctx context.Context, pool *pgxpool.Pool, address string
 // ListPairEvents returns unified events for a pair/pool address, with optional filters
 func ListPairEvents(ctx context.Context, pool *pgxpool.Pool, address string, eventType *string, protocol *string, limit, offset int) ([]PairEventDTO, error) {
 	q := `
-		SELECT protocol, event_type, id, transaction_hash, log_index, block_number, timestamp,
-		       address, sender, recipient, to_address,
-		       CAST(amount0_in AS TEXT), CAST(amount1_in AS TEXT), CAST(amount0_out AS TEXT), CAST(amount1_out AS TEXT),
-		       CAST(liquidity AS TEXT), CAST(amount_usd AS TEXT), maker
-		FROM dex_pair_events
-		WHERE address = $1
-		  AND ($2::text IS NULL OR event_type = $2)
-		  AND ($3::text IS NULL OR protocol = $3)
-		ORDER BY timestamp DESC, log_index DESC
+		SELECT
+			e.protocol, e.event_type, e.id, e.transaction_hash, e.log_index, e.block_number, e.timestamp,
+			e.address, e.sender, e.recipient, e.to_address,
+			CAST(e.amount0_in AS TEXT), CAST(e.amount1_in AS TEXT),
+			CAST(e.amount0_out AS TEXT), CAST(e.amount1_out AS TEXT),
+			CAST(e.liquidity AS TEXT), CAST(e.amount_usd AS TEXT), e.maker,
+			-- token_in: the token being sold (where amount_in > 0)
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_in > 0 THEN COALESCE(pair.token0, pool.token0)
+				WHEN e.event_type = 'swap' AND e.amount1_in > 0 THEN COALESCE(pair.token1, pool.token1)
+				ELSE NULL
+			END AS token_in_address,
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_in > 0 THEN t0.symbol
+				WHEN e.event_type = 'swap' AND e.amount1_in > 0 THEN t1.symbol
+				ELSE NULL
+			END AS token_in_symbol,
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_in > 0 THEN t0.decimals
+				WHEN e.event_type = 'swap' AND e.amount1_in > 0 THEN t1.decimals
+				ELSE NULL
+			END AS token_in_decimals,
+			-- token_out: the token being bought (where amount_out > 0)
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_out > 0 THEN COALESCE(pair.token0, pool.token0)
+				WHEN e.event_type = 'swap' AND e.amount1_out > 0 THEN COALESCE(pair.token1, pool.token1)
+				ELSE NULL
+			END AS token_out_address,
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_out > 0 THEN t0.symbol
+				WHEN e.event_type = 'swap' AND e.amount1_out > 0 THEN t1.symbol
+				ELSE NULL
+			END AS token_out_symbol,
+			CASE
+				WHEN e.event_type = 'swap' AND e.amount0_out > 0 THEN t0.decimals
+				WHEN e.event_type = 'swap' AND e.amount1_out > 0 THEN t1.decimals
+				ELSE NULL
+			END AS token_out_decimals
+		FROM dex_pair_events e
+		LEFT JOIN uniswap_v2_pairs pair ON e.protocol = 'uniswap_v2' AND e.address = pair.address
+		LEFT JOIN uniswap_v3_pools pool ON e.protocol = 'uniswap_v3' AND e.address = pool.address
+		LEFT JOIN tokens t0 ON COALESCE(pair.token0, pool.token0) = t0.address
+		LEFT JOIN tokens t1 ON COALESCE(pair.token1, pool.token1) = t1.address
+		WHERE e.address = $1
+		  AND ($2::text IS NULL OR e.event_type = $2)
+		  AND ($3::text IS NULL OR e.protocol = $3)
+		ORDER BY e.timestamp DESC, e.log_index DESC
 		LIMIT $4 OFFSET $5`
 
 	rows, err := pool.Query(ctx, q, address, eventType, protocol, limit, offset)
@@ -509,7 +586,8 @@ func ListPairEvents(ctx context.Context, pool *pgxpool.Pool, address string, eve
 	for rows.Next() {
 		var e PairEventDTO
 		if err := rows.Scan(&e.Protocol, &e.EventType, &e.ID, &e.TransactionHash, &e.LogIndex, &e.BlockNumber, &e.Timestamp,
-			&e.Address, &e.Sender, &e.Recipient, &e.ToAddress, &e.Amount0In, &e.Amount1In, &e.Amount0Out, &e.Amount1Out, &e.Liquidity, &e.AmountUSD, &e.Maker); err != nil {
+			&e.Address, &e.Sender, &e.Recipient, &e.ToAddress, &e.Amount0In, &e.Amount1In, &e.Amount0Out, &e.Amount1Out, &e.Liquidity, &e.AmountUSD, &e.Maker,
+			&e.TokenInAddress, &e.TokenInSymbol, &e.TokenInDecimals, &e.TokenOutAddress, &e.TokenOutSymbol, &e.TokenOutDecimals); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
