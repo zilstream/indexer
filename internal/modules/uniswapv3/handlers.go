@@ -397,6 +397,36 @@ func handleSwap(ctx context.Context, module *UniswapV3Module, event *core.Parsed
 			"amount_usd":       usd,
 			"protocol":         "uniswap_v3",
 		}
+		// Add token_in/token_out for clarity on trade direction
+		// V3: positive amount = tokens into pool (sold), negative = tokens out of pool (bought)
+		var token0, token1, sym0, sym1 string
+		var dec0, dec1 int32
+		err := module.db.Pool().QueryRow(ctx, `
+			SELECT p.token0, p.token1, COALESCE(t0.symbol,''), COALESCE(t0.decimals,18), COALESCE(t1.symbol,''), COALESCE(t1.decimals,18)
+			FROM uniswap_v3_pools p
+			LEFT JOIN tokens t0 ON t0.address = p.token0
+			LEFT JOIN tokens t1 ON t1.address = p.token1
+			WHERE p.address = $1`, strings.ToLower(event.Address.Hex())).Scan(&token0, &token1, &sym0, &dec0, &sym1, &dec1)
+		if err == nil {
+			if amount0 != nil && amount0.Sign() > 0 {
+				payload["token_in_address"] = token0
+				payload["token_in_symbol"] = sym0
+				payload["token_in_decimals"] = dec0
+			} else if amount1 != nil && amount1.Sign() > 0 {
+				payload["token_in_address"] = token1
+				payload["token_in_symbol"] = sym1
+				payload["token_in_decimals"] = dec1
+			}
+			if amount0 != nil && amount0.Sign() < 0 {
+				payload["token_out_address"] = token0
+				payload["token_out_symbol"] = sym0
+				payload["token_out_decimals"] = dec0
+			} else if amount1 != nil && amount1.Sign() < 0 {
+				payload["token_out_address"] = token1
+				payload["token_out_symbol"] = sym1
+				payload["token_out_decimals"] = dec1
+			}
+		}
 		module.publisher.PublishEvent(strings.ToLower(event.Address.Hex()), "swap", payload)
 	}
 

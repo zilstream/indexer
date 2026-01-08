@@ -445,6 +445,35 @@ func handleSwap(ctx context.Context, module *UniswapV2Module, event *core.Parsed
 			"amount_usd":       swapUSD,
 			"protocol":         "uniswap_v2",
 		}
+		// Add token_in/token_out for clarity on trade direction
+		var token0, token1, sym0, sym1 string
+		var dec0, dec1 int32
+		err := module.db.Pool().QueryRow(ctx, `
+			SELECT p.token0, p.token1, COALESCE(t0.symbol,''), COALESCE(t0.decimals,18), COALESCE(t1.symbol,''), COALESCE(t1.decimals,18)
+			FROM uniswap_v2_pairs p
+			LEFT JOIN tokens t0 ON t0.address = p.token0
+			LEFT JOIN tokens t1 ON t1.address = p.token1
+			WHERE p.address = $1`, pairAddr).Scan(&token0, &token1, &sym0, &dec0, &sym1, &dec1)
+		if err == nil {
+			if amount0In.Sign() > 0 {
+				payload["token_in_address"] = token0
+				payload["token_in_symbol"] = sym0
+				payload["token_in_decimals"] = dec0
+			} else if amount1In.Sign() > 0 {
+				payload["token_in_address"] = token1
+				payload["token_in_symbol"] = sym1
+				payload["token_in_decimals"] = dec1
+			}
+			if amount0Out.Sign() > 0 {
+				payload["token_out_address"] = token0
+				payload["token_out_symbol"] = sym0
+				payload["token_out_decimals"] = dec0
+			} else if amount1Out.Sign() > 0 {
+				payload["token_out_address"] = token1
+				payload["token_out_symbol"] = sym1
+				payload["token_out_decimals"] = dec1
+			}
+		}
 		module.publisher.PublishEvent(pairAddr, "swap", payload)
 	}
 	
