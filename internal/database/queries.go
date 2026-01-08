@@ -53,6 +53,44 @@ type PairDTO struct {
 	TxnCount       *int64  `json:"txn_count,omitempty"`
 }
 
+// WZIL address (lowercase)
+const wzilAddress = "0x94e18ae7dd5ee57b55f30c4b63e2760c09efb192"
+
+// stablecoinSymbols contains symbols that should appear as the quote token (second)
+var stablecoinSymbols = map[string]bool{
+	"USDT": true, "USDC": true, "DAI": true, "BUSD": true,
+	"zUSDT": true, "ZUSDT": true, "ZUSD": true, "XSGD": true, "kUSD": true,
+}
+
+// normalizePairOrder swaps token0/token1 if token0 is WZIL or a stablecoin,
+// so the "interesting" token appears first in the pair display.
+func (p *PairDTO) normalizePairOrder() {
+	shouldSwap := false
+	// Check if token0 is WZIL
+	if strings.ToLower(p.Token0) == wzilAddress {
+		shouldSwap = true
+	}
+	// Check if token0 is a stablecoin (by symbol)
+	if !shouldSwap && p.Token0Symbol != nil && stablecoinSymbols[*p.Token0Symbol] {
+		shouldSwap = true
+	}
+	if shouldSwap {
+		// Swap all token0/token1 fields
+		p.Token0, p.Token1 = p.Token1, p.Token0
+		p.Token0Symbol, p.Token1Symbol = p.Token1Symbol, p.Token0Symbol
+		p.Token0Name, p.Token1Name = p.Token1Name, p.Token0Name
+		p.Reserve0, p.Reserve1 = p.Reserve1, p.Reserve0
+	}
+}
+
+// normalizePairsList applies normalizePairOrder to all pairs
+func normalizePairsList(pairs []PairDTO) []PairDTO {
+	for i := range pairs {
+		pairs[i].normalizePairOrder()
+	}
+	return pairs
+}
+
 type PairEventDTO struct {
 	Protocol     string  `json:"protocol"`
 	EventType    string  `json:"event_type"`
@@ -265,10 +303,10 @@ func ListPairsByToken(ctx context.Context, pool *pgxpool.Pool, tokenAddress stri
 		}
 		out = append(out, p)
 	}
-	return out, nil
+	return normalizePairsList(out), nil
 }
 
-// ListPairs reads from dex_pools view to be protocol-agnostic (V2+V3)
+// GetPair reads from dex_pools view to be protocol-agnostic (V2+V3)
 func GetPair(ctx context.Context, pool *pgxpool.Pool, address string) (*PairDTO, error) {
 	q := `
 		SELECT dp.protocol, dp.address, dp.token0, dp.token1,
@@ -294,6 +332,7 @@ func GetPair(ctx context.Context, pool *pgxpool.Pool, address string) (*PairDTO,
 	if err != nil {
 		return nil, fmt.Errorf("GetPair query failed: %w", err)
 	}
+	p.normalizePairOrder()
 	return &p, nil
 }
 
@@ -341,7 +380,7 @@ func GetPairsByAddresses(ctx context.Context, pool *pgxpool.Pool, addresses []st
 		return nil, fmt.Errorf("GetPairsByAddresses rows error: %w", err)
 	}
 
-	return pairs, nil
+	return normalizePairsList(pairs), nil
 }
 
 func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortBy, sortOrder string) ([]PairDTO, error) {
@@ -397,7 +436,7 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 		}
 		out = append(out, p)
 	}
-	return out, nil
+	return normalizePairsList(out), nil
 }
 
 // ListEventsByAddress returns all DEX events where address is sender, recipient, or to_address

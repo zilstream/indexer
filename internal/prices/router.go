@@ -53,9 +53,9 @@ func NewDBRouter(pool *pgxpool.Pool, zil Provider, wzil string, stablecoins []st
 
 func (r *DBRouter) PriceTokenUSD(ctx context.Context, token string, ts time.Time) (string, bool) {
 	addr := strings.ToLower(token)
-	// Stablecoin → $1
+	// Stablecoin → derive from WZIL pair (not hardcoded $1)
 	if r.stable[addr] {
-		return "1", true
+		return r.stablecoinPriceFromWZIL(ctx, addr, ts)
 	}
 	// WZIL → ZIL price
 	if addr == r.wzil {
@@ -180,9 +180,14 @@ func (r *DBRouter) v3SpotToUSD(ctx context.Context, token string, ts time.Time) 
 
 // toUSD converts a price in counter token units into USD if counter is WZIL or stablecoin
 func (r *DBRouter) toUSD(ctx context.Context, counter string, ts time.Time, priceInCounter string) (string, bool) {
-	// counter is stablecoin => USD directly
+	// counter is stablecoin => multiply by stablecoin's actual price (from WZIL pair)
 	if r.stable[counter] {
-		return priceInCounter, true
+		stableUsd, ok := r.stablecoinPriceFromWZIL(ctx, counter, ts)
+		if !ok {
+			return priceInCounter, true // fallback to $1 if no WZIL pair
+		}
+		prod, ok := mulStrings(priceInCounter, stableUsd)
+		return prod, ok
 	}
 	// counter is WZIL => multiply by ZIL price
 	if counter == r.wzil {
@@ -192,6 +197,94 @@ func (r *DBRouter) toUSD(ctx context.Context, counter string, ts time.Time, pric
 		return prod, ok
 	}
 	return "", false
+}
+
+// stablecoinPriceFromWZIL derives a stablecoin's USD price from its WZIL pair only.
+// This avoids circular dependencies from stablecoin/stablecoin pairs.
+func (r *DBRouter) stablecoinPriceFromWZIL(ctx context.Context, stablecoin string, ts time.Time) (string, bool) {
+	// First try V2 pair with WZIL
+	q := `
+		SELECT token0, token1, reserve0::numeric, reserve1::numeric
+		FROM uniswap_v2_pairs
+		WHERE (token0 = $1 AND token1 = $2)
+		   OR (token1 = $1 AND token0 = $2)
+		ORDER BY COALESCE(reserve_usd, 0) DESC
+		LIMIT 1`
+	var t0, t1 string
+	var r0, r1 sql.NullString
+	if err := r.pool.QueryRow(ctx, q, stablecoin, r.wzil).Scan(&t0, &t1, &r0, &r1); err == nil && r0.Valid && r1.Valid {
+		d0 := r.getDecimals(ctx, t0)
+		d1 := r.getDecimals(ctx, t1)
+		// Check minimum reserves
+		if strings.ToLower(t0) == stablecoin {
+			minReserve := minReserveForDecimals(d1)
+			if lessThan(r1.String, minReserve) {
+				goto tryV3
+			}
+			// stablecoin is t0, WZIL is t1: price = r1/r0 * 10^(d0-d1)
+			pBase, ok := divStrings(r1.String, r0.String)
+			if !ok { goto tryV3 }
+			scale := pow10BigRat(d0 - d1)
+			p := new(big.Rat)
+			if _, ok := p.SetString(pBase); !ok { goto tryV3 }
+			p.Mul(p, scale)
+			// Multiply by ZIL price
+			zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
+			if !ok { goto tryV3 }
+			prod, ok := mulStrings(p.FloatString(18), zilUsd)
+			if ok && sanitizePrice(prod) {
+				return prod, true
+			}
+		} else {
+			minReserve := minReserveForDecimals(d0)
+			if lessThan(r0.String, minReserve) {
+				goto tryV3
+			}
+			// stablecoin is t1, WZIL is t0: price = r0/r1 * 10^(d1-d0)
+			pBase, ok := divStrings(r0.String, r1.String)
+			if !ok { goto tryV3 }
+			scale := pow10BigRat(d1 - d0)
+			p := new(big.Rat)
+			if _, ok := p.SetString(pBase); !ok { goto tryV3 }
+			p.Mul(p, scale)
+			// Multiply by ZIL price
+			zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
+			if !ok { goto tryV3 }
+			prod, ok := mulStrings(p.FloatString(18), zilUsd)
+			if ok && sanitizePrice(prod) {
+				return prod, true
+			}
+		}
+	}
+tryV3:
+	// Try V3 pool with WZIL
+	q3 := `
+		SELECT token0, token1, sqrt_price_x96::numeric
+		FROM uniswap_v3_pools
+		WHERE (token0 = $1 AND token1 = $2)
+		   OR (token1 = $1 AND token0 = $2)
+		ORDER BY COALESCE(liquidity, 0) DESC
+		LIMIT 1`
+	var sp sql.NullString
+	if err := r.pool.QueryRow(ctx, q3, stablecoin, r.wzil).Scan(&t0, &t1, &sp); err == nil && sp.Valid {
+		dec0 := r.getDecimals(ctx, t0)
+		dec1 := r.getDecimals(ctx, t1)
+		price0, price1, ok := pricesFromSqrtX96(sp.String, dec0, dec1)
+		if !ok { return "1", true } // fallback
+		var priceInWZIL string
+		if strings.ToLower(t0) == stablecoin {
+			priceInWZIL = price0 // price of stablecoin in WZIL terms
+		} else {
+			priceInWZIL = price1
+		}
+		zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
+		if !ok { return "1", true } // fallback
+		prod, ok := mulStrings(priceInWZIL, zilUsd)
+		if ok && sanitizePrice(prod) {
+			return prod, true
+		}
+	}
+	return "1", true // fallback to $1 if no WZIL pair found
 }
 
 func (r *DBRouter) stableList() []string {
