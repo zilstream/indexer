@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -62,6 +63,19 @@ var stablecoinSymbols = map[string]bool{
 	"zUSDT": true, "ZUSDT": true, "ZUSD": true, "XSGD": true, "kUSD": true,
 }
 
+// negateStringFloat parses a string float, negates it, and returns the result as a string.
+func negateStringFloat(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	val, err := strconv.ParseFloat(*s, 64)
+	if err != nil {
+		return s
+	}
+	negated := strconv.FormatFloat(-val, 'f', -1, 64)
+	return &negated
+}
+
 // normalizePairOrder swaps token0/token1 if token0 is WZIL or a stablecoin,
 // so the "interesting" token appears first in the pair display.
 func (p *PairDTO) normalizePairOrder() {
@@ -80,6 +94,9 @@ func (p *PairDTO) normalizePairOrder() {
 		p.Token0Symbol, p.Token1Symbol = p.Token1Symbol, p.Token0Symbol
 		p.Token0Name, p.Token1Name = p.Token1Name, p.Token0Name
 		p.Reserve0, p.Reserve1 = p.Reserve1, p.Reserve0
+		// Negate price changes since the pair direction is inverted
+		p.PriceChange24h = negateStringFloat(p.PriceChange24h)
+		p.PriceChange7d = negateStringFloat(p.PriceChange7d)
 	}
 }
 
