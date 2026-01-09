@@ -621,7 +621,7 @@ func GetStats(ctx context.Context, pool *pgxpool.Pool) (*StatsDTO, error) {
 			COALESCE(to_char(SUM(volume_usd_24h), 'FM999999999999999999999990.99'), '0') AS total_volume_24h,
 			COALESCE(to_char(SUM(volume_usd), 'FM999999999999999999999990.99'), '0') AS total_volume_all
 		FROM dex_pools
-		WHERE liquidity_usd > 0 AND liquidity_usd < 1e15
+		WHERE liquidity_usd > 0 AND liquidity_usd < 1e8
 	`
 	
 	var stats StatsDTO

@@ -568,12 +568,15 @@ func (m *UniswapV2Module) updatePairStatistics(ctx context.Context, tx pgx.Tx, s
 			SET reserve_usd = COALESCE(
 				CASE
 					WHEN t0.price_usd IS NOT NULL AND t1.price_usd IS NOT NULL THEN
-						((p.reserve0::numeric / POWER(10, COALESCE(t0.decimals, 18))) * t0.price_usd) +
-						((p.reserve1::numeric / POWER(10, COALESCE(t1.decimals, 18))) * t1.price_usd)
+						LEAST(
+							((p.reserve0::numeric / POWER(10, COALESCE(t0.decimals, 18))) * t0.price_usd) +
+							((p.reserve1::numeric / POWER(10, COALESCE(t1.decimals, 18))) * t1.price_usd),
+							1e8
+						)
 					WHEN t0.price_usd IS NOT NULL THEN
-						2 * ((p.reserve0::numeric / POWER(10, COALESCE(t0.decimals, 18))) * t0.price_usd)
+						LEAST(2 * ((p.reserve0::numeric / POWER(10, COALESCE(t0.decimals, 18))) * t0.price_usd), 1e8)
 					WHEN t1.price_usd IS NOT NULL THEN
-						2 * ((p.reserve1::numeric / POWER(10, COALESCE(t1.decimals, 18))) * t1.price_usd)
+						LEAST(2 * ((p.reserve1::numeric / POWER(10, COALESCE(t1.decimals, 18))) * t1.price_usd), 1e8)
 					ELSE reserve_usd
 				END, reserve_usd)
 			FROM tokens t0, tokens t1
