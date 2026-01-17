@@ -278,6 +278,14 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 				(COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0))::numeric AS w,
 				(lower(dp.token0) = lower($1)) AS is_target0,
 				CASE
+				  WHEN lower(dp.token0) = ANY(SELECT unnest(stables) FROM anchors) THEN lower(dp.token0)
+				  ELSE NULL
+				END AS stable0_addr,
+				CASE
+				  WHEN lower(dp.token1) = ANY(SELECT unnest(stables) FROM anchors) THEN lower(dp.token1)
+				  ELSE NULL
+				END AS stable1_addr,
+				CASE
 				  WHEN lower(dp.token0) = (SELECT wzil FROM anchors) THEN 'wzil0'
 				  WHEN lower(dp.token1) = (SELECT wzil FROM anchors) THEN 'wzil1'
 				  WHEN lower(dp.token0) = ANY(SELECT unnest(stables) FROM anchors) THEN 'stable0'
@@ -293,8 +301,164 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 		zil_24h AS (
 			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_24h FROM times) ORDER BY ts DESC LIMIT 1) AS usd
 		),
+		stable_v2_24h AS (
+			SELECT
+				s.addr AS stable,
+				CASE
+				  WHEN lower(p.token0) = s.addr THEN
+					(sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18))) /
+					NULLIF((sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18))), 0)
+				  ELSE
+					(sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18))) /
+					NULLIF((sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18))), 0)
+				END AS price_in_wzil,
+				CASE
+				  WHEN lower(p.token0) = s.addr THEN
+					(sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18)))
+				  ELSE
+					(sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18)))
+				END AS wzil_reserve
+			FROM (SELECT unnest(stables) AS addr FROM anchors) s
+			JOIN uniswap_v2_pairs p
+			  ON (lower(p.token0) = s.addr AND lower(p.token1) = (SELECT wzil FROM anchors))
+			  OR (lower(p.token1) = s.addr AND lower(p.token0) = (SELECT wzil FROM anchors))
+			JOIN tokens t0 ON lower(t0.address) = lower(p.token0)
+			JOIN tokens t1 ON lower(t1.address) = lower(p.token1)
+			LEFT JOIN LATERAL (
+				SELECT reserve0, reserve1
+				FROM uniswap_v2_syncs sv
+				WHERE sv.pair = p.address
+				  AND sv.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_24h FROM times))
+				ORDER BY sv.timestamp DESC
+				LIMIT 1
+			) sv ON TRUE
+			WHERE sv.reserve0 IS NOT NULL AND sv.reserve1 IS NOT NULL
+			  AND sv.reserve0 > 0 AND sv.reserve1 > 0
+		),
+		stable_v3_24h AS (
+			SELECT
+				s.addr AS stable,
+				CASE
+				  WHEN lower(p.token0) = s.addr THEN
+					((POWER(sv.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, COALESCE(t0.decimals, 18) - COALESCE(t1.decimals, 18)))
+				  ELSE
+					1 / NULLIF(((POWER(sv.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, COALESCE(t0.decimals, 18) - COALESCE(t1.decimals, 18))), 0)
+				END AS price_in_wzil,
+				CASE
+				  WHEN lower(p.token0) = (SELECT wzil FROM anchors) THEN
+					(p.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18)))
+				  ELSE
+					(p.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18)))
+				END AS wzil_reserve
+			FROM (SELECT unnest(stables) AS addr FROM anchors) s
+			JOIN uniswap_v3_pools p
+			  ON (lower(p.token0) = s.addr AND lower(p.token1) = (SELECT wzil FROM anchors))
+			  OR (lower(p.token1) = s.addr AND lower(p.token0) = (SELECT wzil FROM anchors))
+			JOIN tokens t0 ON lower(t0.address) = lower(p.token0)
+			JOIN tokens t1 ON lower(t1.address) = lower(p.token1)
+			LEFT JOIN LATERAL (
+				SELECT sqrt_price_x96
+				FROM uniswap_v3_swaps sv
+				WHERE sv.pool = p.address
+				  AND sv.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_24h FROM times))
+				ORDER BY sv.timestamp DESC
+				LIMIT 1
+			) sv ON TRUE
+			WHERE sv.sqrt_price_x96 IS NOT NULL AND sv.sqrt_price_x96 > 0
+			  AND p.reserve0 > 0 AND p.reserve1 > 0
+		),
+		stable_prices_24h AS (
+			SELECT DISTINCT ON (stable)
+				stable,
+				(price_in_wzil * (SELECT usd FROM zil_24h)) AS price_usd
+			FROM (
+				SELECT * FROM stable_v2_24h
+				UNION ALL
+				SELECT * FROM stable_v3_24h
+			) s
+			WHERE price_in_wzil IS NOT NULL AND wzil_reserve IS NOT NULL AND wzil_reserve > 0
+			ORDER BY stable, wzil_reserve DESC
+		),
 		zil_7d AS (
 			SELECT (SELECT price::numeric FROM prices_zil_usd_minute WHERE ts <= (SELECT ts_7d FROM times) ORDER BY ts DESC LIMIT 1) AS usd
+		),
+		stable_v2_7d AS (
+			SELECT
+				s.addr AS stable,
+				CASE
+				  WHEN lower(p.token0) = s.addr THEN
+					(sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18))) /
+					NULLIF((sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18))), 0)
+				  ELSE
+					(sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18))) /
+					NULLIF((sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18))), 0)
+				END AS price_in_wzil,
+				CASE
+				  WHEN lower(p.token0) = s.addr THEN
+					(sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18)))
+				  ELSE
+					(sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18)))
+				END AS wzil_reserve
+			FROM (SELECT unnest(stables) AS addr FROM anchors) s
+			JOIN uniswap_v2_pairs p
+			  ON (lower(p.token0) = s.addr AND lower(p.token1) = (SELECT wzil FROM anchors))
+			  OR (lower(p.token1) = s.addr AND lower(p.token0) = (SELECT wzil FROM anchors))
+			JOIN tokens t0 ON lower(t0.address) = lower(p.token0)
+			JOIN tokens t1 ON lower(t1.address) = lower(p.token1)
+			LEFT JOIN LATERAL (
+				SELECT reserve0, reserve1
+				FROM uniswap_v2_syncs sv
+				WHERE sv.pair = p.address
+				  AND sv.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_7d FROM times))
+				ORDER BY sv.timestamp DESC
+				LIMIT 1
+			) sv ON TRUE
+			WHERE sv.reserve0 IS NOT NULL AND sv.reserve1 IS NOT NULL
+			  AND sv.reserve0 > 0 AND sv.reserve1 > 0
+		),
+		stable_v3_7d AS (
+			SELECT
+				s.addr AS stable,
+				CASE
+				  WHEN lower(p.token0) = s.addr THEN
+					((POWER(sv.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, COALESCE(t0.decimals, 18) - COALESCE(t1.decimals, 18)))
+				  ELSE
+					1 / NULLIF(((POWER(sv.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, COALESCE(t0.decimals, 18) - COALESCE(t1.decimals, 18))), 0)
+				END AS price_in_wzil,
+				CASE
+				  WHEN lower(p.token0) = (SELECT wzil FROM anchors) THEN
+					(p.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18)))
+				  ELSE
+					(p.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18)))
+				END AS wzil_reserve
+			FROM (SELECT unnest(stables) AS addr FROM anchors) s
+			JOIN uniswap_v3_pools p
+			  ON (lower(p.token0) = s.addr AND lower(p.token1) = (SELECT wzil FROM anchors))
+			  OR (lower(p.token1) = s.addr AND lower(p.token0) = (SELECT wzil FROM anchors))
+			JOIN tokens t0 ON lower(t0.address) = lower(p.token0)
+			JOIN tokens t1 ON lower(t1.address) = lower(p.token1)
+			LEFT JOIN LATERAL (
+				SELECT sqrt_price_x96
+				FROM uniswap_v3_swaps sv
+				WHERE sv.pool = p.address
+				  AND sv.timestamp <= EXTRACT(EPOCH FROM (SELECT ts_7d FROM times))
+				ORDER BY sv.timestamp DESC
+				LIMIT 1
+			) sv ON TRUE
+			WHERE sv.sqrt_price_x96 IS NOT NULL AND sv.sqrt_price_x96 > 0
+			  AND p.reserve0 > 0 AND p.reserve1 > 0
+		),
+		stable_prices_7d AS (
+			SELECT DISTINCT ON (stable)
+				stable,
+				(price_in_wzil * (SELECT usd FROM zil_7d)) AS price_usd
+			FROM (
+				SELECT * FROM stable_v2_7d
+				UNION ALL
+				SELECT * FROM stable_v3_7d
+			) s
+			WHERE price_in_wzil IS NOT NULL AND wzil_reserve IS NOT NULL AND wzil_reserve > 0
+			ORDER BY stable, wzil_reserve DESC
 		),
 		v2_24h AS (
 			SELECT
@@ -306,16 +470,16 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 					  CASE p.anchor
 						WHEN 'wzil1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * (SELECT usd FROM zil_24h)
 						WHEN 'wzil0' THEN (SELECT usd FROM zil_24h)
-						WHEN 'stable1' THEN (s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
-						WHEN 'stable0' THEN 1::numeric
+						WHEN 'stable1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * sp1.price_usd
+						WHEN 'stable0' THEN sp0.price_usd
 						ELSE NULL
 					  END
 					ELSE
 					  CASE p.anchor
 						WHEN 'wzil0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * (SELECT usd FROM zil_24h)
 						WHEN 'wzil1' THEN (SELECT usd FROM zil_24h)
-						WHEN 'stable0' THEN NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)
-						WHEN 'stable1' THEN 1::numeric
+						WHEN 'stable0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * sp0.price_usd
+						WHEN 'stable1' THEN sp1.price_usd
 						ELSE NULL
 					  END
 					END
@@ -329,6 +493,8 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 				ORDER BY s.timestamp DESC
 				LIMIT 1
 			) s ON TRUE
+			LEFT JOIN stable_prices_24h sp0 ON sp0.stable = p.stable0_addr
+			LEFT JOIN stable_prices_24h sp1 ON sp1.stable = p.stable1_addr
 		),
 		v3_24h AS (
 			SELECT
@@ -340,16 +506,16 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 					  CASE p.anchor
 						WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)) * (SELECT usd FROM zil_24h)
 						WHEN 'wzil0' THEN (SELECT usd FROM zil_24h)
-						WHEN 'stable1' THEN (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
-						WHEN 'stable0' THEN 1::numeric
+						WHEN 'stable1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)) * sp1.price_usd
+						WHEN 'stable0' THEN sp0.price_usd
 						ELSE NULL
 					  END
 					ELSE
 					  CASE p.anchor
 						WHEN 'wzil0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)) * (SELECT usd FROM zil_24h)
 						WHEN 'wzil1' THEN (SELECT usd FROM zil_24h)
-						WHEN 'stable0' THEN 1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)
-						WHEN 'stable1' THEN 1::numeric
+						WHEN 'stable0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)) * sp0.price_usd
+						WHEN 'stable1' THEN sp1.price_usd
 						ELSE NULL
 					  END
 					END
@@ -363,6 +529,8 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 				ORDER BY s.timestamp DESC
 				LIMIT 1
 			) s ON TRUE
+			LEFT JOIN stable_prices_24h sp0 ON sp0.stable = p.stable0_addr
+			LEFT JOIN stable_prices_24h sp1 ON sp1.stable = p.stable1_addr
 		),
 		agg_24h AS (
 			SELECT
@@ -384,16 +552,16 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 					  CASE p.anchor
 						WHEN 'wzil1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * (SELECT usd FROM zil_7d)
 						WHEN 'wzil0' THEN (SELECT usd FROM zil_7d)
-						WHEN 'stable1' THEN (s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)
-						WHEN 'stable0' THEN 1::numeric
+						WHEN 'stable1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * sp1.price_usd
+						WHEN 'stable0' THEN sp0.price_usd
 						ELSE NULL
 					  END
 					ELSE
 					  CASE p.anchor
 						WHEN 'wzil0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * (SELECT usd FROM zil_7d)
 						WHEN 'wzil1' THEN (SELECT usd FROM zil_7d)
-						WHEN 'stable0' THEN NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)
-						WHEN 'stable1' THEN 1::numeric
+						WHEN 'stable0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * sp0.price_usd
+						WHEN 'stable1' THEN sp1.price_usd
 						ELSE NULL
 					  END
 					END
@@ -407,6 +575,8 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 				ORDER BY s.timestamp DESC
 				LIMIT 1
 			) s ON TRUE
+			LEFT JOIN stable_prices_7d sp0 ON sp0.stable = p.stable0_addr
+			LEFT JOIN stable_prices_7d sp1 ON sp1.stable = p.stable1_addr
 		),
 		v3_7d AS (
 			SELECT
@@ -418,16 +588,16 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 					  CASE p.anchor
 						WHEN 'wzil1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)) * (SELECT usd FROM zil_7d)
 						WHEN 'wzil0' THEN (SELECT usd FROM zil_7d)
-						WHEN 'stable1' THEN (POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)
-						WHEN 'stable0' THEN 1::numeric
+						WHEN 'stable1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)) * sp1.price_usd
+						WHEN 'stable0' THEN sp0.price_usd
 						ELSE NULL
 					  END
 					ELSE
 					  CASE p.anchor
 						WHEN 'wzil0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)) * (SELECT usd FROM zil_7d)
 						WHEN 'wzil1' THEN (SELECT usd FROM zil_7d)
-						WHEN 'stable0' THEN 1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)
-						WHEN 'stable1' THEN 1::numeric
+						WHEN 'stable0' THEN (1 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) * POWER(10::numeric, p.dec0 - p.dec1)),0)) * sp0.price_usd
+						WHEN 'stable1' THEN sp1.price_usd
 						ELSE NULL
 					  END
 					END
@@ -441,6 +611,8 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 				ORDER BY s.timestamp DESC
 				LIMIT 1
 			) s ON TRUE
+			LEFT JOIN stable_prices_7d sp0 ON sp0.stable = p.stable0_addr
+			LEFT JOIN stable_prices_7d sp1 ON sp1.stable = p.stable1_addr
 		),
 		agg_7d AS (
 			SELECT
@@ -484,12 +656,12 @@ func UpdateTokenMetrics(ctx context.Context, pool *pgxpool.Pool, tokenAddress st
 		  updated_at = NOW()
 		WHERE lower(t.address) = lower($1)
 	`
-	
+
 	_, err = pool.Exec(ctx, query, tokenAddress, wzilAddr)
 	if err != nil {
 		return fmt.Errorf("failed to update token metrics for %s: %w", tokenAddress, err)
 	}
-	
+
 	return nil
 }
 

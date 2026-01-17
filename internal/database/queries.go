@@ -11,24 +11,24 @@ import (
 
 // DTOs for API responses (lightweight, no ORM tags)
 type TokenDTO struct {
-	Address            string   `json:"address"`
-	Symbol             *string  `json:"symbol,omitempty"`
-	Name               *string  `json:"name,omitempty"`
-	Decimals           *int32   `json:"decimals,omitempty"`
-	TotalSupply        *string  `json:"total_supply,omitempty"`
-	PriceUSD           *string  `json:"price_usd,omitempty"`
-	PriceETH           *string  `json:"price_eth,omitempty"`
-	MarketCapUSD       *string  `json:"market_cap_usd,omitempty"`
-	LiquidityUSD       *string  `json:"liquidity_usd"`
-	Volume24hUSD       *string  `json:"volume_24h_usd"`
-	TotalVolumeUSD     *string  `json:"total_volume_usd,omitempty"`
-	PriceChange24h     *string  `json:"price_change_24h"`
-	PriceChange7d      *string  `json:"price_change_7d"`
-	LogoURI            *string  `json:"logo_uri,omitempty"`
-	Website            *string  `json:"website,omitempty"`
-	Description        *string  `json:"description,omitempty"`
-	FirstSeenBlock     *int64   `json:"first_seen_block,omitempty"`
-	FirstSeenTimestamp *int64   `json:"first_seen_timestamp,omitempty"`
+	Address            string  `json:"address"`
+	Symbol             *string `json:"symbol,omitempty"`
+	Name               *string `json:"name,omitempty"`
+	Decimals           *int32  `json:"decimals,omitempty"`
+	TotalSupply        *string `json:"total_supply,omitempty"`
+	PriceUSD           *string `json:"price_usd,omitempty"`
+	PriceETH           *string `json:"price_eth,omitempty"`
+	MarketCapUSD       *string `json:"market_cap_usd,omitempty"`
+	LiquidityUSD       *string `json:"liquidity_usd"`
+	Volume24hUSD       *string `json:"volume_24h_usd"`
+	TotalVolumeUSD     *string `json:"total_volume_usd,omitempty"`
+	PriceChange24h     *string `json:"price_change_24h"`
+	PriceChange7d      *string `json:"price_change_7d"`
+	LogoURI            *string `json:"logo_uri,omitempty"`
+	Website            *string `json:"website,omitempty"`
+	Description        *string `json:"description,omitempty"`
+	FirstSeenBlock     *int64  `json:"first_seen_block,omitempty"`
+	FirstSeenTimestamp *int64  `json:"first_seen_timestamp,omitempty"`
 }
 
 type PairDTO struct {
@@ -109,27 +109,27 @@ func normalizePairsList(pairs []PairDTO) []PairDTO {
 }
 
 type PairEventDTO struct {
-	Protocol     string  `json:"protocol"`
-	EventType    string  `json:"event_type"`
-	ID           string  `json:"id"`
-	TransactionHash string `json:"transaction_hash"`
-	LogIndex     int32   `json:"log_index"`
-	BlockNumber  int64   `json:"block_number"`
-	Timestamp    int64   `json:"timestamp"`
-	Address      string  `json:"address"`
-	Sender       *string `json:"sender,omitempty"`
-	Maker        *string `json:"maker,omitempty"`
-	Recipient    *string `json:"recipient,omitempty"`
-	ToAddress    *string `json:"to_address,omitempty"`
-	Amount0In    *string `json:"amount0_in,omitempty"`
-	Amount1In    *string `json:"amount1_in,omitempty"`
-	Amount0Out   *string `json:"amount0_out,omitempty"`
-	Amount1Out   *string `json:"amount1_out,omitempty"`
-	Liquidity    *string `json:"liquidity,omitempty"`
-	AmountUSD    *string `json:"amount_usd,omitempty"`
-	Token0Address  *string `json:"token0_address,omitempty"`
-	Token0Symbol   *string `json:"token0_symbol,omitempty"`
-	Token0Decimals *int32  `json:"token0_decimals,omitempty"`
+	Protocol         string  `json:"protocol"`
+	EventType        string  `json:"event_type"`
+	ID               string  `json:"id"`
+	TransactionHash  string  `json:"transaction_hash"`
+	LogIndex         int32   `json:"log_index"`
+	BlockNumber      int64   `json:"block_number"`
+	Timestamp        int64   `json:"timestamp"`
+	Address          string  `json:"address"`
+	Sender           *string `json:"sender,omitempty"`
+	Maker            *string `json:"maker,omitempty"`
+	Recipient        *string `json:"recipient,omitempty"`
+	ToAddress        *string `json:"to_address,omitempty"`
+	Amount0In        *string `json:"amount0_in,omitempty"`
+	Amount1In        *string `json:"amount1_in,omitempty"`
+	Amount0Out       *string `json:"amount0_out,omitempty"`
+	Amount1Out       *string `json:"amount1_out,omitempty"`
+	Liquidity        *string `json:"liquidity,omitempty"`
+	AmountUSD        *string `json:"amount_usd,omitempty"`
+	Token0Address    *string `json:"token0_address,omitempty"`
+	Token0Symbol     *string `json:"token0_symbol,omitempty"`
+	Token0Decimals   *int32  `json:"token0_decimals,omitempty"`
 	Token1Address    *string `json:"token1_address,omitempty"`
 	Token1Symbol     *string `json:"token1_symbol,omitempty"`
 	Token1Decimals   *int32  `json:"token1_decimals,omitempty"`
@@ -164,26 +164,26 @@ type BlockDTO struct {
 }
 
 type TransactionDTO struct {
-	Hash                  string        `json:"hash"`
-	BlockNumber           int64         `json:"block_number"`
-	TransactionIndex      int           `json:"transaction_index"`
-	FromAddress           string        `json:"from_address"`
-	ToAddress             *string       `json:"to_address,omitempty"`
-	Value                 string        `json:"value"`
-	GasPrice              *string       `json:"gas_price,omitempty"`
-	GasLimit              *int64        `json:"gas_limit,omitempty"`
-	GasUsed               *int64        `json:"gas_used,omitempty"`
-	Nonce                 *int64        `json:"nonce,omitempty"`
-	Status                *int          `json:"status,omitempty"`
-	TransactionType       int           `json:"transaction_type"`
-	OriginalTypeHex       *string       `json:"original_type_hex,omitempty"`
-	MaxFeePerGas          *string       `json:"max_fee_per_gas,omitempty"`
-	MaxPriorityFeePerGas  *string       `json:"max_priority_fee_per_gas,omitempty"`
-	EffectiveGasPrice     *string       `json:"effective_gas_price,omitempty"`
-	ContractAddress       *string       `json:"contract_address,omitempty"`
-	CumulativeGasUsed     *int64        `json:"cumulative_gas_used,omitempty"`
-	Timestamp             int64         `json:"timestamp"`
-	Events                []EventLogDTO `json:"events,omitempty"`
+	Hash                 string        `json:"hash"`
+	BlockNumber          int64         `json:"block_number"`
+	TransactionIndex     int           `json:"transaction_index"`
+	FromAddress          string        `json:"from_address"`
+	ToAddress            *string       `json:"to_address,omitempty"`
+	Value                string        `json:"value"`
+	GasPrice             *string       `json:"gas_price,omitempty"`
+	GasLimit             *int64        `json:"gas_limit,omitempty"`
+	GasUsed              *int64        `json:"gas_used,omitempty"`
+	Nonce                *int64        `json:"nonce,omitempty"`
+	Status               *int          `json:"status,omitempty"`
+	TransactionType      int           `json:"transaction_type"`
+	OriginalTypeHex      *string       `json:"original_type_hex,omitempty"`
+	MaxFeePerGas         *string       `json:"max_fee_per_gas,omitempty"`
+	MaxPriorityFeePerGas *string       `json:"max_priority_fee_per_gas,omitempty"`
+	EffectiveGasPrice    *string       `json:"effective_gas_price,omitempty"`
+	ContractAddress      *string       `json:"contract_address,omitempty"`
+	CumulativeGasUsed    *int64        `json:"cumulative_gas_used,omitempty"`
+	Timestamp            int64         `json:"timestamp"`
+	Events               []EventLogDTO `json:"events,omitempty"`
 }
 
 type EventLogDTO struct {
@@ -202,13 +202,13 @@ type PricePoint struct {
 }
 
 type PriceChartDTO struct {
-	Address    string       `json:"address"`
-	Protocol   string       `json:"protocol"`
-	BaseToken  TokenBaseDTO `json:"base_token"`
-	Quote      string       `json:"quote"`
-	Timeframe  string       `json:"timeframe"`
-	Interval   string       `json:"interval"`
-	Points     []PricePoint `json:"points"`
+	Address   string       `json:"address"`
+	Protocol  string       `json:"protocol"`
+	BaseToken TokenBaseDTO `json:"base_token"`
+	Quote     string       `json:"quote"`
+	Timeframe string       `json:"timeframe"`
+	Interval  string       `json:"interval"`
+	Points    []PricePoint `json:"points"`
 }
 
 type CandleDTO struct {
@@ -245,8 +245,8 @@ func GetToken(ctx context.Context, pool *pgxpool.Pool, address string) (*TokenDT
 		WHERE address = $1`
 
 	var t TokenDTO
-	err := pool.QueryRow(ctx, q, address).Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals, 
-		&t.TotalSupply, &t.PriceUSD, &t.PriceETH, &t.MarketCapUSD, &t.LiquidityUSD, 
+	err := pool.QueryRow(ctx, q, address).Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals,
+		&t.TotalSupply, &t.PriceUSD, &t.PriceETH, &t.MarketCapUSD, &t.LiquidityUSD,
 		&t.Volume24hUSD, &t.TotalVolumeUSD, &t.PriceChange24h, &t.PriceChange7d,
 		&t.LogoURI, &t.Website, &t.Description, &t.FirstSeenBlock, &t.FirstSeenTimestamp)
 	if err != nil {
@@ -283,8 +283,8 @@ func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sear
 	var out []TokenDTO
 	for rows.Next() {
 		var t TokenDTO
-		if err := rows.Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals, 
-			&t.TotalSupply, &t.PriceUSD, &t.PriceETH, &t.MarketCapUSD, &t.LiquidityUSD, 
+		if err := rows.Scan(&t.Address, &t.Symbol, &t.Name, &t.Decimals,
+			&t.TotalSupply, &t.PriceUSD, &t.PriceETH, &t.MarketCapUSD, &t.LiquidityUSD,
 			&t.Volume24hUSD, &t.TotalVolumeUSD, &t.PriceChange24h, &t.PriceChange7d,
 			&t.LogoURI, &t.Website, &t.Description, &t.FirstSeenBlock, &t.FirstSeenTimestamp); err != nil {
 			return nil, err
@@ -623,7 +623,7 @@ func GetStats(ctx context.Context, pool *pgxpool.Pool) (*StatsDTO, error) {
 		FROM dex_pools
 		WHERE liquidity_usd > 0 AND liquidity_usd < 1e8
 	`
-	
+
 	var stats StatsDTO
 	err := pool.QueryRow(ctx, q).Scan(&stats.TotalPairs, &stats.TotalLiquidity, &stats.TotalVolume24h, &stats.TotalVolumeAll)
 	if err != nil {
@@ -704,13 +704,13 @@ func GetBlock(ctx context.Context, pool *pgxpool.Pool, number int64) (*BlockDTO,
 	if err != nil {
 		return nil, fmt.Errorf("GetBlock query failed: %w", err)
 	}
-	
+
 	transactions, err := ListTransactionsByBlock(ctx, pool, number)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch block transactions: %w", err)
 	}
 	b.Transactions = transactions
-	
+
 	return &b, nil
 }
 
@@ -914,8 +914,8 @@ func GetPairPriceChart(ctx context.Context, pool *pgxpool.Pool, address string) 
 	}
 
 	return &PriceChartDTO{
-		Address:   address,
-		Protocol:  protocol,
+		Address:  address,
+		Protocol: protocol,
 		BaseToken: TokenBaseDTO{
 			Address:  baseTokenAddr,
 			Symbol:   baseTokenSymbol,
@@ -1221,10 +1221,16 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 			dp.address AS pool,
 			dp.token0, dp.token1,
 			t0.decimals AS dec0, t1.decimals AS dec1,
-			COALESCE(t0.price_usd, 1) AS price0,
-			COALESCE(t1.price_usd, 1) AS price1,
 			(COALESCE(dp.liquidity_usd,0) + COALESCE(dp.volume_usd_24h,0))::numeric AS w,
 			(lower(dp.token0) = lower($1)) AS is_target0,
+			CASE
+				WHEN lower(dp.token0) = ANY($2::text[]) THEN lower(dp.token0)
+				ELSE NULL
+			END AS stable0_addr,
+			CASE
+				WHEN lower(dp.token1) = ANY($2::text[]) THEN lower(dp.token1)
+				ELSE NULL
+			END AS stable1_addr,
 			CASE
 				WHEN lower(dp.token0) = lower($3) THEN 'wzil0'
 				WHEN lower(dp.token1) = lower($3) THEN 'wzil1'
@@ -1252,6 +1258,97 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 			 LIMIT 1) AS zil_usd
 		FROM buckets b
 	),
+	stables AS (
+		SELECT unnest($2::text[]) AS addr
+	),
+	stable_v2_prices AS (
+		SELECT
+			b.ts,
+			s.addr AS stable,
+			CASE
+				WHEN lower(p.token0) = s.addr THEN
+					(sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18))) /
+					NULLIF((sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18))), 0)
+				ELSE
+					(sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18))) /
+					NULLIF((sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18))), 0)
+			END AS price_in_wzil,
+			CASE
+				WHEN lower(p.token0) = s.addr THEN
+					(sv.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18)))
+				ELSE
+					(sv.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18)))
+			END AS wzil_reserve
+		FROM buckets b
+		JOIN stables s ON TRUE
+		JOIN uniswap_v2_pairs p
+		  ON (lower(p.token0) = s.addr AND lower(p.token1) = lower($3))
+		  OR (lower(p.token1) = s.addr AND lower(p.token0) = lower($3))
+		JOIN tokens t0 ON t0.address = p.token0
+		JOIN tokens t1 ON t1.address = p.token1
+		LEFT JOIN LATERAL (
+			SELECT reserve0, reserve1
+			FROM uniswap_v2_syncs sv
+			WHERE sv.pair = p.address
+			  AND sv.timestamp <= EXTRACT(EPOCH FROM b.ts)
+			ORDER BY sv.timestamp DESC
+			LIMIT 1
+		) sv ON TRUE
+		WHERE sv.reserve0 IS NOT NULL AND sv.reserve1 IS NOT NULL
+		  AND sv.reserve0 > 0 AND sv.reserve1 > 0
+	),
+	stable_v3_prices AS (
+		SELECT
+			b.ts,
+			s.addr AS stable,
+			CASE
+				WHEN lower(p.token0) = s.addr THEN
+					((POWER(sv.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, COALESCE(t1.decimals, 18) - COALESCE(t0.decimals, 18)))
+				ELSE
+					1 / NULLIF(((POWER(sv.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, COALESCE(t1.decimals, 18) - COALESCE(t0.decimals, 18))), 0)
+			END AS price_in_wzil,
+			CASE
+				WHEN lower(p.token0) = lower($3) THEN
+					(p.reserve0::numeric / POWER(10::numeric, COALESCE(t0.decimals, 18)))
+				ELSE
+					(p.reserve1::numeric / POWER(10::numeric, COALESCE(t1.decimals, 18)))
+			END AS wzil_reserve
+		FROM buckets b
+		JOIN stables s ON TRUE
+		JOIN uniswap_v3_pools p
+		  ON (lower(p.token0) = s.addr AND lower(p.token1) = lower($3))
+		  OR (lower(p.token1) = s.addr AND lower(p.token0) = lower($3))
+		JOIN tokens t0 ON t0.address = p.token0
+		JOIN tokens t1 ON t1.address = p.token1
+		LEFT JOIN LATERAL (
+			SELECT sqrt_price_x96
+			FROM uniswap_v3_swaps sv
+			WHERE sv.pool = p.address
+			  AND sv.timestamp <= EXTRACT(EPOCH FROM b.ts)
+			ORDER BY sv.timestamp DESC
+			LIMIT 1
+		) sv ON TRUE
+		WHERE sv.sqrt_price_x96 IS NOT NULL AND sv.sqrt_price_x96 > 0
+		  AND p.reserve0 > 0 AND p.reserve1 > 0
+	),
+	stable_best AS (
+		SELECT DISTINCT ON (ts, stable)
+			ts,
+			stable,
+			price_in_wzil
+		FROM (
+			SELECT * FROM stable_v2_prices
+			UNION ALL
+			SELECT * FROM stable_v3_prices
+		) s
+		WHERE price_in_wzil IS NOT NULL AND wzil_reserve IS NOT NULL AND wzil_reserve > 0
+		ORDER BY ts, stable, wzil_reserve DESC
+	),
+	stable_prices AS (
+		SELECT sb.ts, sb.stable, sb.price_in_wzil * z.zil_usd AS price_usd
+		FROM stable_best sb
+		LEFT JOIN zil_prices z ON z.ts = sb.ts
+	),
 	v2_prices AS (
 		SELECT
 			b.ts,
@@ -1268,9 +1365,9 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 								-- target=token0=WZIL → zil_usd
 								WHEN 'wzil0' THEN z.zil_usd
 								-- target=token0, anchor=stablecoin in token1 → rate * stablecoin_price
-								WHEN 'stable1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * p.price1
+								WHEN 'stable1' THEN ((s.reserve1::numeric / POWER(10::numeric, p.dec1)) / NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0)) * sp1.price_usd
 								-- target=token0=stablecoin → use its known price
-								WHEN 'stable0' THEN p.price0
+								WHEN 'stable0' THEN sp0.price_usd
 								ELSE NULL
 							END
 						ELSE
@@ -1280,9 +1377,9 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 								-- target=token1=WZIL → zil_usd
 								WHEN 'wzil1' THEN z.zil_usd
 								-- target=token1, anchor=stablecoin in token0 → (1/rate) * stablecoin_price
-								WHEN 'stable0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * p.price0
+								WHEN 'stable0' THEN (NULLIF((s.reserve0::numeric / POWER(10::numeric, p.dec0)),0) / NULLIF((s.reserve1::numeric / POWER(10::numeric, p.dec1)),0)) * sp0.price_usd
 								-- target=token1=stablecoin → use its known price
-								WHEN 'stable1' THEN p.price1
+								WHEN 'stable1' THEN sp1.price_usd
 								ELSE NULL
 							END
 					END
@@ -1298,6 +1395,8 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 			LIMIT 1
 		) s ON TRUE
 		LEFT JOIN zil_prices z ON z.ts = b.ts
+		LEFT JOIN stable_prices sp0 ON sp0.ts = b.ts AND sp0.stable = p.stable0_addr
+		LEFT JOIN stable_prices sp1 ON sp1.ts = b.ts AND sp1.stable = p.stable1_addr
 	),
 	v3_prices AS (
 		SELECT
@@ -1316,9 +1415,9 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 								-- target=token0=WZIL → zil_usd
 								WHEN 'wzil0' THEN z.zil_usd
 								-- target=token0, anchor=stablecoin in token1 → rate * stablecoin_price
-								WHEN 'stable1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec1 - p.dec0)) * p.price1
+								WHEN 'stable1' THEN ((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec1 - p.dec0)) * sp1.price_usd
 								-- target=token0=stablecoin → use its known price
-								WHEN 'stable0' THEN p.price0
+								WHEN 'stable0' THEN sp0.price_usd
 								ELSE NULL
 							END
 						ELSE
@@ -1328,9 +1427,9 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 								-- target=token1=WZIL → zil_usd
 								WHEN 'wzil1' THEN z.zil_usd
 								-- target=token1, anchor=stablecoin in token0 → (1/rate) * stablecoin_price
-								WHEN 'stable0' THEN (1.0 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec1 - p.dec0)),0)) * p.price0
+								WHEN 'stable0' THEN (1.0 / NULLIF(((POWER(s.sqrt_price_x96::numeric,2) / POWER(2::numeric,192)) / POWER(10::numeric, p.dec1 - p.dec0)),0)) * sp0.price_usd
 								-- target=token1=stablecoin → use its known price
-								WHEN 'stable1' THEN p.price1
+								WHEN 'stable1' THEN sp1.price_usd
 								ELSE NULL
 							END
 					END
@@ -1346,6 +1445,8 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 			LIMIT 1
 		) s ON TRUE
 		LEFT JOIN zil_prices z ON z.ts = b.ts
+		LEFT JOIN stable_prices sp0 ON sp0.ts = b.ts AND sp0.stable = p.stable0_addr
+		LEFT JOIN stable_prices sp1 ON sp1.ts = b.ts AND sp1.stable = p.stable1_addr
 	),
 	all_prices AS (
 		SELECT ts, pool, w, price_usd FROM v2_prices
@@ -1393,7 +1494,7 @@ func GetTokenPriceChart(ctx context.Context, pool *pgxpool.Pool, address string)
 	}
 
 	return &PriceChartDTO{
-		Address: address,
+		Address:  address,
 		Protocol: "aggregated",
 		BaseToken: TokenBaseDTO{
 			Address:  address,
