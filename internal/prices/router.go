@@ -21,17 +21,18 @@ type TokenRouter interface {
 
 // DBRouter is a Postgres-backed implementation.
 // Notes:
-// - stablecoins are treated as $1.00 (normalized by token decimals)
+// - stablecoins are priced via WZIL pools (ZIL-anchored)
 // - wzil is routed via PriceZILUSD
 // - one-hop attempts:
-//   * V2: reserve-based spot to WZIL or stablecoin
-//   * V3: sqrt_price_x96 spot from uniswap_v3_pools to WZIL or stablecoin
+//   - V2: reserve-based spot to WZIL or stablecoin
+//   - V3: sqrt_price_x96 spot from uniswap_v3_pools to WZIL or stablecoin
+//
 // The implementation aims to be simple and safe; it requires non-zero liquidity.
 type DBRouter struct {
-	pool         *pgxpool.Pool
-	zilProvider  Provider
-	wzil         string          // lowercase hex
-	stable       map[string]bool // lowercase hex
+	pool        *pgxpool.Pool
+	zilProvider Provider
+	wzil        string          // lowercase hex
+	stable      map[string]bool // lowercase hex
 
 	muDecimals sync.RWMutex
 	decimals   map[string]int // token -> decimals cache
@@ -55,25 +56,239 @@ func (r *DBRouter) PriceTokenUSD(ctx context.Context, token string, ts time.Time
 	addr := strings.ToLower(token)
 	// Stablecoin → derive from WZIL pair (not hardcoded $1)
 	if r.stable[addr] {
-		return r.stablecoinPriceFromWZIL(ctx, addr, ts)
+		if p, ok := r.stablecoinPriceFromWZIL(ctx, addr, ts); ok {
+			return p, true
+		}
+		return "", false
 	}
 	// WZIL → ZIL price
 	if addr == r.wzil {
 		return r.zilProvider.PriceZILUSD(ctx, ts)
 	}
-	// Try direct to WZIL via V2 reserves
-	if p, ok := r.v2SpotToUSD(ctx, addr, ts); ok {
-		if sanitizePrice(p) {
-			return p, true
+	return r.bestSpotToUSD(ctx, addr, ts)
+}
+
+func (r *DBRouter) bestSpotToUSD(ctx context.Context, token string, ts time.Time) (string, bool) {
+	addr := strings.ToLower(token)
+	wzilAddr := strings.ToLower(r.wzil)
+	wzilDecimals := r.getDecimals(ctx, wzilAddr)
+	zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
+	if !ok {
+		return "", false
+	}
+
+	type candidate struct {
+		priceUSD       string
+		liquidityWZIL  string
+		counterAddress string
+	}
+	best := candidate{}
+	found := false
+
+	consider := func(priceUSD, liquidityWZIL, counter string) {
+		if priceUSD == "" || liquidityWZIL == "" {
+			return
+		}
+		if !sanitizePrice(priceUSD) {
+			return
+		}
+		if !found || greaterThan(liquidityWZIL, best.liquidityWZIL) {
+			best = candidate{priceUSD: priceUSD, liquidityWZIL: liquidityWZIL, counterAddress: counter}
+			found = true
 		}
 	}
-	// Try direct to WZIL/stable via V3 sqrt price
-	if p, ok := r.v3SpotToUSD(ctx, addr, ts); ok {
-		if sanitizePrice(p) {
-			return p, true
+
+	// V2 candidates (token with WZIL or stablecoin)
+	q := `
+		SELECT token0, token1, reserve0::numeric, reserve1::numeric
+		FROM uniswap_v2_pairs
+		WHERE (token0 = $1 AND (token1 = $2 OR token1 = ANY($3)))
+		   OR (token1 = $1 AND (token0 = $2 OR token0 = ANY($3)))`
+	if rows, err := r.pool.Query(ctx, q, addr, wzilAddr, r.stableList()); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var t0, t1 string
+			var r0, r1 sql.NullString
+			if err := rows.Scan(&t0, &t1, &r0, &r1); err != nil {
+				continue
+			}
+			if !r0.Valid || !r1.Valid {
+				continue
+			}
+			t0 = strings.ToLower(t0)
+			t1 = strings.ToLower(t1)
+			if t0 != addr && t1 != addr {
+				continue
+			}
+			dec0 := r.getDecimals(ctx, t0)
+			dec1 := r.getDecimals(ctx, t1)
+			var priceInCounter, counterReserve string
+			var counterDecimals int
+			var counter string
+			if t0 == addr {
+				counter = t1
+				counterReserve = r1.String
+				counterDecimals = dec1
+				pBase, ok := divStrings(r1.String, r0.String)
+				if !ok {
+					continue
+				}
+				scale := pow10BigRat(dec0 - dec1)
+				p := new(big.Rat)
+				if _, ok := p.SetString(pBase); !ok {
+					continue
+				}
+				p.Mul(p, scale)
+				priceInCounter = p.FloatString(18)
+			} else {
+				counter = t0
+				counterReserve = r0.String
+				counterDecimals = dec0
+				pBase, ok := divStrings(r0.String, r1.String)
+				if !ok {
+					continue
+				}
+				scale := pow10BigRat(dec1 - dec0)
+				p := new(big.Rat)
+				if _, ok := p.SetString(pBase); !ok {
+					continue
+				}
+				p.Mul(p, scale)
+				priceInCounter = p.FloatString(18)
+			}
+			minReserve := minReserveForDecimals(counterDecimals)
+			if lessThan(counterReserve, minReserve) {
+				continue
+			}
+			if counter == wzilAddr {
+				liq, ok := baseToHuman(counterReserve, wzilDecimals)
+				if !ok {
+					continue
+				}
+				priceUSD, ok := mulStrings(priceInCounter, zilUsd)
+				if !ok {
+					continue
+				}
+				consider(priceUSD, liq, counter)
+				continue
+			}
+			if r.stable[counter] {
+				priceInWZIL, _, ok := r.stablecoinPriceInWZIL(ctx, counter)
+				if !ok {
+					continue
+				}
+				stableUSD, ok := mulStrings(priceInWZIL, zilUsd)
+				if !ok {
+					continue
+				}
+				priceUSD, ok := mulStrings(priceInCounter, stableUSD)
+				if !ok {
+					continue
+				}
+				stableResHuman, ok := baseToHuman(counterReserve, counterDecimals)
+				if !ok {
+					continue
+				}
+				liqWZIL, ok := mulStrings(stableResHuman, priceInWZIL)
+				if !ok {
+					continue
+				}
+				consider(priceUSD, liqWZIL, counter)
+			}
 		}
 	}
-	return "", false
+
+	// V3 candidates (token with WZIL or stablecoin)
+	q3 := `
+		SELECT token0, token1, sqrt_price_x96::numeric, reserve0::numeric, reserve1::numeric
+		FROM uniswap_v3_pools
+		WHERE (token0 = $1 AND (token1 = $2 OR token1 = ANY($3)))
+		   OR (token1 = $1 AND (token0 = $2 OR token0 = ANY($3)))`
+	if rows, err := r.pool.Query(ctx, q3, addr, wzilAddr, r.stableList()); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var t0, t1 string
+			var sp, r0, r1 sql.NullString
+			if err := rows.Scan(&t0, &t1, &sp, &r0, &r1); err != nil {
+				continue
+			}
+			if !sp.Valid || !r0.Valid || !r1.Valid {
+				continue
+			}
+			if !validSqrtX96(sp.String) {
+				continue
+			}
+			t0 = strings.ToLower(t0)
+			t1 = strings.ToLower(t1)
+			if t0 != addr && t1 != addr {
+				continue
+			}
+			dec0 := r.getDecimals(ctx, t0)
+			dec1 := r.getDecimals(ctx, t1)
+			price0, price1, ok := pricesFromSqrtX96(sp.String, dec0, dec1)
+			if !ok {
+				continue
+			}
+			var priceInCounter, counterReserve string
+			var counterDecimals int
+			var counter string
+			if t0 == addr {
+				counter = t1
+				counterReserve = r1.String
+				counterDecimals = dec1
+				priceInCounter = price0
+			} else {
+				counter = t0
+				counterReserve = r0.String
+				counterDecimals = dec0
+				priceInCounter = price1
+			}
+			minReserve := minReserveForDecimals(counterDecimals)
+			if lessThan(counterReserve, minReserve) {
+				continue
+			}
+			if counter == wzilAddr {
+				liq, ok := baseToHuman(counterReserve, wzilDecimals)
+				if !ok {
+					continue
+				}
+				priceUSD, ok := mulStrings(priceInCounter, zilUsd)
+				if !ok {
+					continue
+				}
+				consider(priceUSD, liq, counter)
+				continue
+			}
+			if r.stable[counter] {
+				priceInWZIL, _, ok := r.stablecoinPriceInWZIL(ctx, counter)
+				if !ok {
+					continue
+				}
+				stableUSD, ok := mulStrings(priceInWZIL, zilUsd)
+				if !ok {
+					continue
+				}
+				priceUSD, ok := mulStrings(priceInCounter, stableUSD)
+				if !ok {
+					continue
+				}
+				stableResHuman, ok := baseToHuman(counterReserve, counterDecimals)
+				if !ok {
+					continue
+				}
+				liqWZIL, ok := mulStrings(stableResHuman, priceInWZIL)
+				if !ok {
+					continue
+				}
+				consider(priceUSD, liqWZIL, counter)
+			}
+		}
+	}
+
+	if !found {
+		return "", false
+	}
+	return best.priceUSD, true
 }
 
 // v2SpotToUSD tries to find a Uniswap V2 pair with WZIL or a stablecoin and derive USD.
@@ -117,20 +332,28 @@ func (r *DBRouter) v2SpotToUSD(ctx context.Context, token string, ts time.Time) 
 	// Adjust by decimals: price(token0 in token1) = (r1/10^d1) / (r0/10^d0) = (r1/r0) * 10^(d0-d1)
 	if strings.ToLower(t0) == strings.ToLower(token) {
 		pBase, ok := divStrings(r1.String, r0.String)
-		if !ok { return "", false }
+		if !ok {
+			return "", false
+		}
 		// scale by 10^(d0-d1)
 		scale := pow10BigRat(d0 - d1)
 		p := new(big.Rat)
-		if _, ok := p.SetString(pBase); !ok { return "", false }
+		if _, ok := p.SetString(pBase); !ok {
+			return "", false
+		}
 		p.Mul(p, scale)
 		return r.toUSD(ctx, strings.ToLower(t1), ts, p.FloatString(18))
 	}
 	// token is token1: price(token1 in token0) = (r0/r1) * 10^(d1-d0)
 	pBase, ok := divStrings(r0.String, r1.String)
-	if !ok { return "", false }
+	if !ok {
+		return "", false
+	}
 	scale := pow10BigRat(d1 - d0)
 	p := new(big.Rat)
-	if _, ok := p.SetString(pBase); !ok { return "", false }
+	if _, ok := p.SetString(pBase); !ok {
+		return "", false
+	}
 	p.Mul(p, scale)
 	return r.toUSD(ctx, strings.ToLower(t0), ts, p.FloatString(18))
 }
@@ -151,7 +374,9 @@ func (r *DBRouter) v3SpotToUSD(ctx context.Context, token string, ts time.Time) 
 	if err := r.pool.QueryRow(ctx, q, token, r.wzil, stableList).Scan(&t0, &t1, &sp, &r0, &r1); err != nil {
 		return "", false
 	}
-	if !sp.Valid || !r0.Valid || !r1.Valid { return "", false }
+	if !sp.Valid || !r0.Valid || !r1.Valid {
+		return "", false
+	}
 	// Require minimum reserves in counter token using its decimals
 	dec0 := r.getDecimals(ctx, t0)
 	dec1 := r.getDecimals(ctx, t1)
@@ -171,7 +396,9 @@ func (r *DBRouter) v3SpotToUSD(ctx context.Context, token string, ts time.Time) 
 	sqrtStr := sp.String
 	// Convert sqrt_price_x96 to price0 and price1 with decimals
 	price0, price1, ok := pricesFromSqrtX96(sqrtStr, dec0, dec1)
-	if !ok { return "", false }
+	if !ok {
+		return "", false
+	}
 	if strings.ToLower(t0) == strings.ToLower(token) {
 		return r.toUSD(ctx, strings.ToLower(t1), ts, price0)
 	}
@@ -184,7 +411,7 @@ func (r *DBRouter) toUSD(ctx context.Context, counter string, ts time.Time, pric
 	if r.stable[counter] {
 		stableUsd, ok := r.stablecoinPriceFromWZIL(ctx, counter, ts)
 		if !ok {
-			return priceInCounter, true // fallback to $1 if no WZIL pair
+			return "", false
 		}
 		prod, ok := mulStrings(priceInCounter, stableUsd)
 		return prod, ok
@@ -192,7 +419,9 @@ func (r *DBRouter) toUSD(ctx context.Context, counter string, ts time.Time, pric
 	// counter is WZIL => multiply by ZIL price
 	if counter == r.wzil {
 		zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
-		if !ok { return "", false }
+		if !ok {
+			return "", false
+		}
 		prod, ok := mulStrings(priceInCounter, zilUsd)
 		return prod, ok
 	}
@@ -202,106 +431,185 @@ func (r *DBRouter) toUSD(ctx context.Context, counter string, ts time.Time, pric
 // stablecoinPriceFromWZIL derives a stablecoin's USD price from its WZIL pair only.
 // This avoids circular dependencies from stablecoin/stablecoin pairs.
 func (r *DBRouter) stablecoinPriceFromWZIL(ctx context.Context, stablecoin string, ts time.Time) (string, bool) {
-	// First try V2 pair with WZIL
+	priceInWZIL, _, ok := r.stablecoinPriceInWZIL(ctx, stablecoin)
+	if !ok {
+		return "", false
+	}
+	zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
+	if !ok {
+		return "", false
+	}
+	prod, ok := mulStrings(priceInWZIL, zilUsd)
+	if ok && sanitizePrice(prod) {
+		return prod, true
+	}
+	return "", false
+}
+
+func (r *DBRouter) stablecoinPriceInWZIL(ctx context.Context, stablecoin string) (string, string, bool) {
+	type candidate struct {
+		priceInWZIL string
+		wzilReserve string
+	}
+	best := candidate{}
+	found := false
+	stableAddr := strings.ToLower(stablecoin)
+	wzilAddr := strings.ToLower(r.wzil)
+
+	// Consider all V2 pairs with WZIL
 	q := `
 		SELECT token0, token1, reserve0::numeric, reserve1::numeric
 		FROM uniswap_v2_pairs
 		WHERE (token0 = $1 AND token1 = $2)
-		   OR (token1 = $1 AND token0 = $2)
-		ORDER BY COALESCE(reserve_usd, 0) DESC
-		LIMIT 1`
-	var t0, t1 string
-	var r0, r1 sql.NullString
-	if err := r.pool.QueryRow(ctx, q, stablecoin, r.wzil).Scan(&t0, &t1, &r0, &r1); err == nil && r0.Valid && r1.Valid {
-		d0 := r.getDecimals(ctx, t0)
-		d1 := r.getDecimals(ctx, t1)
-		// Check minimum reserves
-		if strings.ToLower(t0) == stablecoin {
-			minReserve := minReserveForDecimals(d1)
-			if lessThan(r1.String, minReserve) {
-				goto tryV3
+		   OR (token1 = $1 AND token0 = $2)`
+	if rows, err := r.pool.Query(ctx, q, stableAddr, wzilAddr); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var t0, t1 string
+			var r0, r1 sql.NullString
+			if err := rows.Scan(&t0, &t1, &r0, &r1); err != nil {
+				continue
 			}
-			// stablecoin is t0, WZIL is t1: price = r1/r0 * 10^(d0-d1)
-			pBase, ok := divStrings(r1.String, r0.String)
-			if !ok { goto tryV3 }
-			scale := pow10BigRat(d0 - d1)
-			p := new(big.Rat)
-			if _, ok := p.SetString(pBase); !ok { goto tryV3 }
-			p.Mul(p, scale)
-			// Multiply by ZIL price
-			zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
-			if !ok { goto tryV3 }
-			prod, ok := mulStrings(p.FloatString(18), zilUsd)
-			if ok && sanitizePrice(prod) {
-				return prod, true
+			if !r0.Valid || !r1.Valid {
+				continue
 			}
-		} else {
-			minReserve := minReserveForDecimals(d0)
-			if lessThan(r0.String, minReserve) {
-				goto tryV3
+			priceInWZIL, wzilReserve, ok := r.v2StablePriceInWZIL(ctx, stableAddr, wzilAddr, t0, t1, r0.String, r1.String)
+			if !ok {
+				continue
 			}
-			// stablecoin is t1, WZIL is t0: price = r0/r1 * 10^(d1-d0)
-			pBase, ok := divStrings(r0.String, r1.String)
-			if !ok { goto tryV3 }
-			scale := pow10BigRat(d1 - d0)
-			p := new(big.Rat)
-			if _, ok := p.SetString(pBase); !ok { goto tryV3 }
-			p.Mul(p, scale)
-			// Multiply by ZIL price
-			zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
-			if !ok { goto tryV3 }
-			prod, ok := mulStrings(p.FloatString(18), zilUsd)
-			if ok && sanitizePrice(prod) {
-				return prod, true
+			if !found || greaterThan(wzilReserve, best.wzilReserve) {
+				best = candidate{priceInWZIL: priceInWZIL, wzilReserve: wzilReserve}
+				found = true
 			}
 		}
 	}
-tryV3:
-	// Try V3 pool with WZIL
+
+	// Consider all V3 pools with WZIL
 	q3 := `
-		SELECT token0, token1, sqrt_price_x96::numeric
+		SELECT token0, token1, sqrt_price_x96::numeric, reserve0::numeric, reserve1::numeric
 		FROM uniswap_v3_pools
 		WHERE (token0 = $1 AND token1 = $2)
-		   OR (token1 = $1 AND token0 = $2)
-		ORDER BY COALESCE(liquidity, 0) DESC
-		LIMIT 1`
-	var sp sql.NullString
-	if err := r.pool.QueryRow(ctx, q3, stablecoin, r.wzil).Scan(&t0, &t1, &sp); err == nil && sp.Valid {
-		dec0 := r.getDecimals(ctx, t0)
-		dec1 := r.getDecimals(ctx, t1)
-		price0, price1, ok := pricesFromSqrtX96(sp.String, dec0, dec1)
-		if !ok { return "1", true } // fallback
-		var priceInWZIL string
-		if strings.ToLower(t0) == stablecoin {
-			priceInWZIL = price0 // price of stablecoin in WZIL terms
-		} else {
-			priceInWZIL = price1
-		}
-		zilUsd, ok := r.zilProvider.PriceZILUSD(ctx, ts)
-		if !ok { return "1", true } // fallback
-		prod, ok := mulStrings(priceInWZIL, zilUsd)
-		if ok && sanitizePrice(prod) {
-			return prod, true
+		   OR (token1 = $1 AND token0 = $2)`
+	if rows, err := r.pool.Query(ctx, q3, stableAddr, wzilAddr); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var t0, t1 string
+			var sp, r0, r1 sql.NullString
+			if err := rows.Scan(&t0, &t1, &sp, &r0, &r1); err != nil {
+				continue
+			}
+			if !sp.Valid || !r0.Valid || !r1.Valid {
+				continue
+			}
+			priceInWZIL, wzilReserve, ok := r.v3StablePriceInWZIL(ctx, stableAddr, wzilAddr, t0, t1, sp.String, r0.String, r1.String)
+			if !ok {
+				continue
+			}
+			if !found || greaterThan(wzilReserve, best.wzilReserve) {
+				best = candidate{priceInWZIL: priceInWZIL, wzilReserve: wzilReserve}
+				found = true
+			}
 		}
 	}
-	return "1", true // fallback to $1 if no WZIL pair found
+
+	if !found {
+		return "", "", false
+	}
+	return best.priceInWZIL, best.wzilReserve, true
+}
+
+func (r *DBRouter) v2StablePriceInWZIL(ctx context.Context, stable, wzil, t0, t1, r0, r1 string) (string, string, bool) {
+	stable = strings.ToLower(stable)
+	t0 = strings.ToLower(t0)
+	t1 = strings.ToLower(t1)
+	if t0 != stable && t1 != stable {
+		return "", "", false
+	}
+	if t0 != wzil && t1 != wzil {
+		return "", "", false
+	}
+	var rStable, rWZIL string
+	var dStable, dWZIL int
+	if t0 == stable {
+		rStable = r0
+		rWZIL = r1
+		dStable = r.getDecimals(ctx, t0)
+		dWZIL = r.getDecimals(ctx, t1)
+	} else {
+		rStable = r1
+		rWZIL = r0
+		dStable = r.getDecimals(ctx, t1)
+		dWZIL = r.getDecimals(ctx, t0)
+	}
+	if lessThan(rStable, "1") || lessThan(rWZIL, "1") {
+		return "", "", false
+	}
+	pBase, ok := divStrings(rWZIL, rStable)
+	if !ok {
+		return "", "", false
+	}
+	scale := pow10BigRat(dStable - dWZIL)
+	p := new(big.Rat)
+	if _, ok := p.SetString(pBase); !ok {
+		return "", "", false
+	}
+	p.Mul(p, scale)
+	return p.FloatString(18), rWZIL, true
+}
+
+func (r *DBRouter) v3StablePriceInWZIL(ctx context.Context, stable, wzil, t0, t1, sqrtPrice, r0, r1 string) (string, string, bool) {
+	if !validSqrtX96(sqrtPrice) {
+		return "", "", false
+	}
+	stable = strings.ToLower(stable)
+	t0 = strings.ToLower(t0)
+	t1 = strings.ToLower(t1)
+	if t0 != stable && t1 != stable {
+		return "", "", false
+	}
+	if t0 != wzil && t1 != wzil {
+		return "", "", false
+	}
+	if t0 == stable && lessThan(r1, "1") {
+		return "", "", false
+	}
+	if t1 == stable && lessThan(r0, "1") {
+		return "", "", false
+	}
+	dec0 := r.getDecimals(ctx, t0)
+	dec1 := r.getDecimals(ctx, t1)
+	price0, price1, ok := pricesFromSqrtX96(sqrtPrice, dec0, dec1)
+	if !ok {
+		return "", "", false
+	}
+	if t0 == stable {
+		return price0, r1, true
+	}
+	return price1, r0, true
 }
 
 func (r *DBRouter) stableList() []string {
 	lst := make([]string, 0, len(r.stable))
-	for a := range r.stable { lst = append(lst, a) }
+	for a := range r.stable {
+		lst = append(lst, a)
+	}
 	return lst
 }
 
 func (r *DBRouter) getDecimals(ctx context.Context, token string) int {
 	addr := strings.ToLower(token)
 	r.muDecimals.RLock()
-	if d, ok := r.decimals[addr]; ok { r.muDecimals.RUnlock(); return d }
+	if d, ok := r.decimals[addr]; ok {
+		r.muDecimals.RUnlock()
+		return d
+	}
 	r.muDecimals.RUnlock()
 	var d sql.NullInt32
 	_ = r.pool.QueryRow(ctx, `SELECT decimals FROM tokens WHERE address = $1`, addr).Scan(&d)
 	val := 18
-	if d.Valid { val = int(d.Int32) }
+	if d.Valid {
+		val = int(d.Int32)
+	}
 	r.muDecimals.Lock()
 	r.decimals[addr] = val
 	r.muDecimals.Unlock()
@@ -314,16 +622,20 @@ func pricesFromSqrtX96(sqrtStr string, dec0, dec1 int) (price0, price1 string, o
 	// Using big.Rat for precision
 	sqrt := new(big.Int)
 	_, ok = sqrt.SetString(sqrtStr, 10)
-	if !ok { return "","", false }
-	num := new(big.Int).Mul(sqrt, sqrt)              // sqrt^2
-	den := new(big.Int).Lsh(big.NewInt(1), 192)     // 2^192
+	if !ok {
+		return "", "", false
+	}
+	num := new(big.Int).Mul(sqrt, sqrt)         // sqrt^2
+	den := new(big.Int).Lsh(big.NewInt(1), 192) // 2^192
 	ratio := new(big.Rat).SetFrac(num, den)
 	// scale by decimals (normalize to human units)
 	pow10 := pow10BigRat(dec0 - dec1)
 	ratio.Mul(ratio, pow10)
 	price0 = ratio.FloatString(18)
 	// price1 is inverse adjusted: 1/price0
-	if ratio.Sign() == 0 { return "","", false }
+	if ratio.Sign() == 0 {
+		return "", "", false
+	}
 	inv := new(big.Rat).Inv(ratio)
 	price1 = inv.FloatString(18)
 	return price0, price1, true
@@ -349,29 +661,88 @@ func pow10BigRat(n int) *big.Rat {
 
 func divStrings(a, b string) (string, bool) {
 	x := new(big.Rat)
-	if _, ok := x.SetString(a); !ok { return "", false }
+	if _, ok := x.SetString(a); !ok {
+		return "", false
+	}
 	y := new(big.Rat)
-	if _, ok := y.SetString(b); !ok { return "", false }
-	if y.Sign() == 0 { return "", false }
+	if _, ok := y.SetString(b); !ok {
+		return "", false
+	}
+	if y.Sign() == 0 {
+		return "", false
+	}
 	x.Quo(x, y)
 	return x.FloatString(18), true
 }
 
 func mulStrings(a, b string) (string, bool) {
 	x := new(big.Rat)
-	if _, ok := x.SetString(a); !ok { return "", false }
+	if _, ok := x.SetString(a); !ok {
+		return "", false
+	}
 	y := new(big.Rat)
-	if _, ok := y.SetString(b); !ok { return "", false }
+	if _, ok := y.SetString(b); !ok {
+		return "", false
+	}
 	x.Mul(x, y)
+	return x.FloatString(18), true
+}
+
+func baseToHuman(val string, decimals int) (string, bool) {
+	x := new(big.Rat)
+	if _, ok := x.SetString(val); !ok {
+		return "", false
+	}
+	scale := pow10BigRat(decimals)
+	if scale.Sign() == 0 {
+		return "", false
+	}
+	x.Quo(x, scale)
 	return x.FloatString(18), true
 }
 
 func lessThan(a, b string) bool {
 	x := new(big.Rat)
-	if _, ok := x.SetString(a); !ok { return false }
+	if _, ok := x.SetString(a); !ok {
+		return false
+	}
 	y := new(big.Rat)
-	if _, ok := y.SetString(b); !ok { return false }
+	if _, ok := y.SetString(b); !ok {
+		return false
+	}
 	return x.Cmp(y) < 0
+}
+
+func greaterThan(a, b string) bool {
+	x := new(big.Rat)
+	if _, ok := x.SetString(a); !ok {
+		return false
+	}
+	y := new(big.Rat)
+	if _, ok := y.SetString(b); !ok {
+		return false
+	}
+	return x.Cmp(y) > 0
+}
+
+func validSqrtX96(s string) bool {
+	v := new(big.Int)
+	if _, ok := v.SetString(s, 10); !ok {
+		return false
+	}
+	if v.Sign() <= 0 {
+		return false
+	}
+	min := big.NewInt(1_000_000)
+	max := new(big.Int)
+	_, _ = max.SetString("100000000000000000000000000000000000000", 10) // 1e38
+	if v.Cmp(min) < 0 {
+		return false
+	}
+	if v.Cmp(max) > 0 {
+		return false
+	}
+	return true
 }
 
 // minReserveForDecimals returns minimum reserve (0.1 tokens) as a string for the given decimals.
@@ -391,8 +762,12 @@ func minReserveForDecimals(decimals int) string {
 func sanitizePrice(price string) bool {
 	maxPrice := "10000000" // $10M per token
 	p := new(big.Rat)
-	if _, ok := p.SetString(price); !ok { return false }
+	if _, ok := p.SetString(price); !ok {
+		return false
+	}
 	max := new(big.Rat)
-	if _, ok := max.SetString(maxPrice); !ok { return false }
+	if _, ok := max.SetString(maxPrice); !ok {
+		return false
+	}
 	return p.Cmp(max) <= 0 && p.Sign() >= 0
 }
