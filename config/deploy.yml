@@ -49,8 +49,9 @@ builder:
 env:
   clear:
     # The app runs on the "kamal" bridge (172.18.0.0/16). Point to its gateway so the container can reach
-    # Postgres on the host. Change this if your host uses a different bridge or you prefer the host's LAN IP.
+    # services on the host. Change this if your host uses a different bridge or you prefer the host's LAN IP.
     INDEXER_DATABASE_HOST: 172.18.0.1
+    INDEXER_CHAIN_RPC_ENDPOINT: http://172.18.0.1:4202
     INDEXER_DATABASE_NAME: zilstream
     INDEXER_DATABASE_PORT: 5432
     INDEXER_DATABASE_USER: postgres
