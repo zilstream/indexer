@@ -140,6 +140,7 @@ func (i *Indexer) Start(ctx context.Context) error {
 	}
 
 	// Start initial sync if needed
+	i.logger.Info().Msg("Starting initial sync")
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -150,6 +151,7 @@ func (i *Indexer) Start(ctx context.Context) error {
 			i.logger.Error().Err(err).Msg("Initial sync failed")
 		}
 	}()
+	i.logger.Info().Msg("Initial sync completed, starting continuous sync")
 
 	// Start continuous sync
 	go i.continuousSync(ctx)
@@ -200,6 +202,11 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 		return fmt.Errorf("failed to get latest block: %w", err)
 	}
 
+	i.logger.Info().
+		Uint64("last_block", lastBlock).
+		Uint64("latest_block", latestBlock).
+		Msg("syncOnce state")
+
 	// Determine start block
 	startBlock := lastBlock + 1
 	if lastBlock == 0 && i.config.Chain.StartBlock > 0 {
@@ -217,6 +224,10 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 
 	// Calculate how far behind we are
 	if latestBlock < startBlock {
+		i.logger.Info().
+			Uint64("latest_block", latestBlock).
+			Uint64("start_block", startBlock).
+			Msg("Already caught up, skipping sync")
 		return nil // Already caught up
 	}
 
