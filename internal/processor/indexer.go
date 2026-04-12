@@ -140,9 +140,16 @@ func (i *Indexer) Start(ctx context.Context) error {
 	}
 
 	// Start initial sync if needed
-	if err := i.syncOnce(ctx); err != nil {
-		i.logger.Error().Err(err).Msg("Initial sync failed")
-	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				i.logger.Error().Interface("panic", r).Msg("PANIC in initial syncOnce")
+			}
+		}()
+		if err := i.syncOnce(ctx); err != nil {
+			i.logger.Error().Err(err).Msg("Initial sync failed")
+		}
+	}()
 
 	// Start continuous sync
 	go i.continuousSync(ctx)
@@ -155,6 +162,13 @@ func (i *Indexer) Start(ctx context.Context) error {
 
 // continuousSync runs the continuous sync loop
 func (i *Indexer) continuousSync(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			i.logger.Error().Interface("panic", r).Msg("PANIC in continuousSync — restarting sync loop")
+			go i.continuousSync(ctx)
+		}
+	}()
+
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -202,7 +216,7 @@ func (i *Indexer) syncOnce(ctx context.Context) error {
 	}
 
 	// Calculate how far behind we are
-	if latestBlock <= startBlock {
+	if latestBlock < startBlock {
 		return nil // Already caught up
 	}
 
