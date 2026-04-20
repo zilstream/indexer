@@ -255,13 +255,40 @@ func GetToken(ctx context.Context, pool *pgxpool.Pool, address string) (*TokenDT
 	return &t, nil
 }
 
-func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, search *string) ([]TokenDTO, error) {
-	q := `
+func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, search *string, sortBy, sortOrder string) ([]TokenDTO, error) {
+	sortColumn := "volume_24h_usd"
+	switch sortBy {
+	case "price":
+		sortColumn = "price_usd"
+	case "market_cap":
+		sortColumn = "market_cap_usd"
+	case "volume_24h":
+		sortColumn = "volume_24h_usd"
+	case "liquidity":
+		sortColumn = "total_liquidity_usd"
+	case "price_change_24h":
+		sortColumn = "price_change_24h"
+	case "price_change_7d":
+		sortColumn = "price_change_7d"
+	case "created", "newest", "oldest":
+		sortColumn = "first_seen_timestamp"
+	}
+
+	if sortOrder != "asc" && sortOrder != "desc" {
+		sortOrder = "desc"
+	}
+	if sortBy == "oldest" {
+		sortOrder = "asc"
+	} else if sortBy == "newest" {
+		sortOrder = "desc"
+	}
+
+	q := fmt.Sprintf(`
 		SELECT address, symbol, name, decimals,
 		       CAST(total_supply AS TEXT),
 		       CAST(price_usd AS TEXT),
 		       CAST(price_eth AS TEXT),
-		       CAST(market_cap_usd AS TEXT), 
+		       CAST(market_cap_usd AS TEXT),
 		       CAST(total_liquidity_usd AS TEXT),
 		       CAST(volume_24h_usd AS TEXT),
 		       CAST(total_volume_usd AS TEXT),
@@ -270,9 +297,9 @@ func ListTokens(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sear
 		       logo_uri, website, description,
 		       first_seen_block, first_seen_timestamp
 		FROM tokens
-		WHERE ($3::text IS NULL OR symbol ILIKE '%' || $3 || '%' OR name ILIKE '%' || $3 || '%')
-		ORDER BY CAST(market_cap_usd AS NUMERIC) DESC NULLS LAST
-		LIMIT $1 OFFSET $2`
+		WHERE ($3::text IS NULL OR symbol ILIKE '%%' || $3 || '%%' OR name ILIKE '%%' || $3 || '%%')
+		ORDER BY CAST(%s AS NUMERIC) %s NULLS LAST
+		LIMIT $1 OFFSET $2`, sortColumn, strings.ToUpper(sortOrder))
 
 	rows, err := pool.Query(ctx, q, limit, offset, search)
 	if err != nil {
@@ -406,7 +433,7 @@ func GetPairsByAddresses(ctx context.Context, pool *pgxpool.Pool, addresses []st
 	return normalizePairsList(pairs), nil
 }
 
-func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortBy, sortOrder string) ([]PairDTO, error) {
+func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortBy, sortOrder string, search *string) ([]PairDTO, error) {
 	// Map user-friendly sort options to column names
 	sortColumn := "volume_usd_24h"
 	switch sortBy {
@@ -438,10 +465,15 @@ func ListPairs(ctx context.Context, pool *pgxpool.Pool, limit, offset int, sortB
 		LEFT JOIN uniswap_v2_pairs v2 ON dp.protocol = 'uniswap_v2' AND v2.address = dp.address
 		LEFT JOIN uniswap_v3_pools v3 ON dp.protocol = 'uniswap_v3' AND v3.address = dp.address
 		WHERE dp.liquidity_usd > 0
+		  AND ($3::text IS NULL
+		       OR dp.token0_symbol ILIKE '%%' || $3 || '%%'
+		       OR dp.token1_symbol ILIKE '%%' || $3 || '%%'
+		       OR dp.token0_name ILIKE '%%' || $3 || '%%'
+		       OR dp.token1_name ILIKE '%%' || $3 || '%%')
 		ORDER BY CAST(%s AS NUMERIC) %s NULLS LAST, CAST(dp.liquidity_usd AS NUMERIC) DESC NULLS LAST
 		LIMIT $1 OFFSET $2`, sortColumn, strings.ToUpper(sortOrder))
 
-	rows, err := pool.Query(ctx, q, limit, offset)
+	rows, err := pool.Query(ctx, q, limit, offset, search)
 	if err != nil {
 		return nil, fmt.Errorf("ListPairs query failed: %w", err)
 	}

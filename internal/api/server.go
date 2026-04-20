@@ -156,7 +156,15 @@ func (s *APIServer) handleTokens(w http.ResponseWriter, r *http.Request) {
 	limit, offset, page, perPage := parsePagination(r)
 	var search *string
 	if v := r.URL.Query().Get("search"); v != "" { search = &v }
-	items, err := database.ListTokens(ctx, s.db, limit, offset, search)
+	sortBy := r.URL.Query().Get("sort_by")
+	if sortBy == "" {
+		sortBy = "volume_24h" // default
+	}
+	sortOrder := r.URL.Query().Get("sort_order")
+	if sortOrder == "" {
+		sortOrder = "desc" // default
+	}
+	items, err := database.ListTokens(ctx, s.db, limit, offset, search, sortBy, sortOrder)
 	if err != nil { Error(w, http.StatusInternalServerError, err.Error()); return }
 	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
 	JSON(w, http.StatusOK, items, pg)
@@ -173,7 +181,9 @@ func (s *APIServer) handlePairs(w http.ResponseWriter, r *http.Request) {
 	if sortOrder == "" {
 		sortOrder = "desc" // default
 	}
-	items, err := database.ListPairs(ctx, s.db, limit, offset, sortBy, sortOrder)
+	var search *string
+	if v := r.URL.Query().Get("search"); v != "" { search = &v }
+	items, err := database.ListPairs(ctx, s.db, limit, offset, sortBy, sortOrder, search)
 	if err != nil { Error(w, http.StatusInternalServerError, err.Error()); return }
 	pg := &Pagination{Page: page, PerPage: perPage, HasNext: len(items) == perPage}
 	JSON(w, http.StatusOK, items, pg)
